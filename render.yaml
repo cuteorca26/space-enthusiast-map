@@ -21,6 +21,8 @@ services:
         value: "64"
       - key: CLOUD_DATASET_CACHE_MAX_ITEMS
         value: "1"
+      - key: LAUNCH_LIBRARY_PAGE_SIZE
+        value: "100"
       - key: FAA_NOTAM_FIR_CONCURRENCY
         value: "4"
       - key: FAA_NOTAM_BROWSER_CONCURRENCY

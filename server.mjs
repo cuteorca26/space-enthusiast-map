@@ -22,14 +22,12 @@ import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import h5wasm from "h5wasm/node";
 import nrlmsiseModule from "nrlmsise-00";
 import { PNG } from "pngjs";
 import { chromium } from "playwright-core";
 import { SatelliteCatalogService } from "./satellite-catalog.mjs";
 import { SatelliteHistoryService } from "./satellite-history.mjs";
-import { buildGmgsiInvalidMask } from "./cloud-quality.mjs";
-import { readCloudNavigation } from "./cloud-navigation.mjs";
+import { readCloudDataset } from "./cloud-dataset.mjs";
 import { SavedRegionStore, handleSavedRegionsApi } from "./saved-regions.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -6355,17 +6353,18 @@ async function fetchFaaNotamFirs(firs, gateway = null) {
       };
     }
 
-    const recoveryResults = await fetchFaaNotamFirsViaPowerShell(failedAfterAdaptiveFirs);
+    const recoveryResults = await recoverFaaNotamFirs(failedAfterAdaptiveFirs);
     results = mergeFaaBatchRecoveryResults(results, recoveryResults);
     const recoveryFailedFirs = countFaaResultFirs(results.filter(faaFirResultNeedsRecovery));
     return {
       results,
-      transport: "fetch+adaptive+powerShell-recovery",
+      transport: process.platform === "win32" ? "fetch+adaptive+powerShell-recovery" : "fetch+adaptive+single-recovery",
       diagnostics: {
         primary: "fetch",
         primaryFailedFirs: failedPrimaryFirs.length,
         adaptiveRecoveredFirs,
-        powershellRequestedFirs: failedAfterAdaptiveFirs.length,
+        powershellRequestedFirs: process.platform === "win32" ? failedAfterAdaptiveFirs.length : 0,
+        singleRequestedFirs: process.platform === "win32" ? 0 : failedAfterAdaptiveFirs.length,
         recoveredFirs: Math.max(0, failedPrimaryFirs.length - recoveryFailedFirs),
         recoveryFailedFirs,
         adaptiveError,
@@ -6373,10 +6372,10 @@ async function fetchFaaNotamFirs(firs, gateway = null) {
     };
   } catch (error) {
     if (FAA_NOTAM_TRANSPORT !== "auto") throw error;
-    const results = await fetchFaaNotamFirsViaPowerShell(firs);
+    const results = await recoverFaaNotamFirs(firs);
     return {
       results,
-      transport: "powershell-fallback",
+      transport: process.platform === "win32" ? "powershell-fallback" : "fetch-single-fallback",
       diagnostics: {
         primary: "fetch",
         primaryFailedFirs: firs.length,
@@ -6901,7 +6900,13 @@ function findFaaBrowserExecutable() {
   return candidates.find((candidate) => existsSync(candidate)) || "";
 }
 
+async function recoverFaaNotamFirs(firs, osPlatform = process.platform) {
+  if (osPlatform === "win32") return fetchFaaNotamFirsViaPowerShell(firs);
+  return fetchFaaNotamFirsViaFetch(firs, { batchSize: 1, concurrency: 2, retryConcurrency: 1 });
+}
+
 async function fetchFaaNotamFirsViaPowerShell(firs) {
+  if (process.platform !== "win32") throw new Error("FAA PowerShell transport is only available on Windows; use auto, fetch or browser.");
   if (!firs.length) return [];
   const workerCount = Math.min(FAA_NOTAM_POWERSHELL_CONCURRENCY, firs.length);
   const batches = splitRoundRobin(firs, workerCount);
@@ -7253,10 +7258,10 @@ async function fetchFaaLocs(terms, gateway = null) {
   if (FAA_NOTAM_TRANSPORT === "powershell") return fetchFaaLocsViaPowerShell(terms);
   try {
     const entries = await fetchFaaLocsViaFetch(terms);
-    if (FAA_NOTAM_TRANSPORT === "auto" && !entries.length) return fetchFaaLocsViaPowerShell(terms);
+    if (FAA_NOTAM_TRANSPORT === "auto" && !entries.length && process.platform === "win32") return fetchFaaLocsViaPowerShell(terms);
     return entries;
   } catch (error) {
-    if (FAA_NOTAM_TRANSPORT !== "auto") throw error;
+    if (FAA_NOTAM_TRANSPORT !== "auto" || process.platform !== "win32") throw error;
     return fetchFaaLocsViaPowerShell(terms);
   }
 }
@@ -10150,6 +10155,9 @@ async function loadGmgsiDatasetUncached(item) {
   const filePath = gmgsiCacheFilePath(item);
   await ensureGmgsiFile(item, filePath);
 
+  // Evict older frames before allocating the next decoder on small instances.
+  trimMapToSize(cloudDatasetCache, clampIntegerEnv("CLOUD_DATASET_CACHE_MAX_ITEMS", 3, 1, 3) - 1);
+
   let dataset = null;
   try {
     dataset = await readGmgsiDatasetFile(item, filePath);
@@ -10179,64 +10187,10 @@ async function loadGmgsiDatasetUncached(item) {
 }
 
 async function readGmgsiDatasetFile(item, filePath) {
-
-  await h5wasm.ready;
-  const file = new h5wasm.File(realpathSync(filePath), "r");
-  try {
-    const dataNode = file.get("data");
-    const dataShape = Array.from(dataNode.shape || []).map(Number);
-    const height = dataShape[dataShape.length - 2];
-    const width = dataShape[dataShape.length - 1];
-    if (
-      !Number.isInteger(width) ||
-      !Number.isInteger(height) ||
-      width < NOAA_GMGSI_MIN_SOURCE_WIDTH ||
-      height < NOAA_GMGSI_MIN_SOURCE_HEIGHT
-    ) {
-      throw new Error(`unexpected data dimensions ${dataShape.join("x") || "unknown"}`);
-    }
-
-    const data = dataNode.value;
-    if (!data || data.length !== width * height) {
-      throw new Error(`data length ${data?.length || 0} does not match ${width}x${height}`);
-    }
-    const timeValue = Number(file.get("time").value?.[0]);
-    const { latRows, lonColumns } = readCloudNavigation(file, width, height);
-    if (lonColumns.length > 1 && lonColumns[0] > lonColumns[1]) lonColumns[0] -= 360;
-    for (let column = 1; column < lonColumns.length; column += 1) {
-      if (!Number.isFinite(lonColumns[column]) || lonColumns[column] <= lonColumns[column - 1]) {
-        throw new Error(`longitude navigation is not strictly increasing at column ${column}`);
-      }
-    }
-
-    const sourceDate = Number.isFinite(timeValue) ? new Date(timeValue * 1000).toISOString() : item.timeUtc;
-    const sourceMs = Date.parse(sourceDate);
-    const requestedMs = Date.parse(item.timeUtc || "");
-    if (Number.isFinite(sourceMs) && Number.isFinite(requestedMs) && Math.abs(sourceMs - requestedMs) > 30 * 60 * 1000) {
-      throw new Error(`source time ${sourceDate} does not match requested hour ${item.hourId}`);
-    }
-    const dataFillValue = Number(dataNode.attrs?._FillValue?.value?.[0]);
-    const quality = buildGmgsiInvalidMask(data, width, height);
-    const dataset = {
-      hourId: item.hourId,
-      sourceDate,
-      fetchedAt: new Date().toISOString(),
-      width,
-      height,
-      north: latRows[0] || NOAA_GMGSI_LAT_NORTH,
-      south: latRows[latRows.length - 1] || NOAA_GMGSI_LAT_SOUTH,
-      latRows,
-      lonColumns,
-      data,
-      dataFillValue,
-      invalidMask: quality.mask,
-      invalidPixels: quality.invalidPixels,
-      invalidRegions: quality.regions,
-    };
-    return dataset;
-  } finally {
-    file.close();
-  }
+  return readCloudDataset(item, filePath, {
+    minimumWidth: NOAA_GMGSI_MIN_SOURCE_WIDTH,
+    minimumHeight: NOAA_GMGSI_MIN_SOURCE_HEIGHT,
+  });
 }
 
 function gmgsiCacheFilePath(item) {
@@ -11038,6 +10992,7 @@ function toDeg(value) {
 }
 
 export {
+  recoverFaaNotamFirs,
   extractCoordinateSections,
   hasUnsupportedBoundaryInstruction,
   hasUnsupportedNaturalBoundaryInstruction,

@@ -27,7 +27,7 @@ GitHub Pages 不运行 Node.js 后台。把 `frontend/index.html` 直接上传�
 5. 部署完成后，打开 Render 提供的 `https://…onrender.com` 地址。
 6. 初次运行没有数据缓存，在“数据更新”中手动刷新需要的数据源。
 
-Docker 镜像包含 Linux Chromium，供 FAA 的浏览器模式使用，以及卫星目录下载需要的 curl；云图文件使用 Node.js 下载，不依赖 Windows PowerShell。Node.js 版本固定为 24 系列，依赖版本由锁文件固定。
+Docker 镜像包含 Linux Chromium，供 FAA 的浏览器模式使用，以及卫星目录下载需要的 curl；FAA 自动恢复在 Linux 使用逐个 FIR 的完整分页查询。云图文件使用 Node.js 下载，解码在临时工作线程中串行执行，完成后释放 HDF5 内存，不依赖 Windows PowerShell。发射预告每页读取 100 条，以减少公开数据源的请求次数。Node.js 版本固定为 24 系列，依赖版本由锁文件固定。
 
 ### 3. 启用 GitHub 在线访问入口
 
@@ -80,6 +80,6 @@ npm test
 npm run build:pages
 ```
 
-测试覆盖云端启动、地图依赖和后台接口、HTTPS 同源写入、禁止公开源代码/私人数据目录、浏览器区域保存与恢复、云图下载失败保留已有文件、云图导航的节省内存读取。GitHub Actions 还会构建 Docker 镜像并检查 Linux 容器启动。
+测试覆盖云端启动、地图依赖和后台接口、HTTPS 同源写入、禁止公开源代码/私人数据目录、浏览器区域保存与恢复、云图下载失败保留已有文件、云图导航读取与解码、Linux FAA 恢复的完整分页检查。GitHub Actions 还会构建 Docker 镜像并检查 Linux 容器启动。
 
 保留原作者署名。项目许可未在原发布包中明确提供，此副本不自行添加开源许可证。

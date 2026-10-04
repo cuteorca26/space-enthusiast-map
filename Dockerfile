@@ -2,7 +2,7 @@ FROM node:24-bookworm-slim
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=10000 DATA_DIR=/app/data \
     NODE_OPTIONS=--max-old-space-size=320 \
     FAA_NOTAM_BROWSER_EXECUTABLE=/usr/bin/chromium \
-    BALLISTIC_WORKERS=1 CLOUD_TILE_CACHE_MAX_ITEMS=64 CLOUD_DATASET_CACHE_MAX_ITEMS=1
+    BALLISTIC_WORKERS=1 CLOUD_TILE_CACHE_MAX_ITEMS=64 CLOUD_DATASET_CACHE_MAX_ITEMS=1 LAUNCH_LIBRARY_PAGE_SIZE=100
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium ca-certificates curl pciutils && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
