@@ -1,0 +1,29 @@
+{
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "build:pages": "node scripts/build-pages.mjs"
+  },
+  "dependencies": {
+    "geographiclib-geodesic": "^2.2.0",
+    "h5wasm": "^0.10.3",
+    "jszip": "^3.10.1",
+    "nrlmsise-00": "^1.0.10",
+    "playwright-core": "^1.62.1",
+    "pngjs": "^7.0.0",
+    "proj4": "^2.19.10",
+    "satellite.js": "^7.0.0",
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "^0.9.10",
+    "fake-indexeddb": "6.2.5"
+  },
+  "name": "space-enthusiast-map",
+  "version": "1.0.0",
+  "private": true,
+  "description": "航天爱好者地图 — interactive maps, satellite orbits and aerospace visualization",
+  "engines": {
+    "node": ">=24 <25"
+  }
+}

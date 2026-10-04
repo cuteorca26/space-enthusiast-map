@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>航天爱好者地图（@CuteORCA）</title>
+    <link rel="icon" type="image/png" href="/frontend/assets/space-enthusiast-orca-icon-v2.png?v=orca-2" />
+    <link rel="stylesheet" href="/frontend/styles.css?v=faa-map-213" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark"><img src="/frontend/assets/space-enthusiast-orca-icon-v2.png?v=orca-2" alt="" /></span>
+          <div class="brand-copy">
+            <h1>航天爱好者地图（@CuteORCA）</h1>
+            <div class="brand-status-row">
+              <span class="topbar-map-status" id="mapStatus" aria-live="polite">缩放 3</span>
+              <p id="sourceLine">正在连接 FAA 官方数据源</p>
+            </div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div class="map-layer-toggle" role="group" aria-label="底图">
+            <button class="active" type="button" data-layer="osm">OSM</button>
+            <button type="button" data-layer="earth">地球</button>
+            <button type="button" data-layer="satellite">卫星</button>
+          </div>
+          <label class="cloud-layer-toggle">
+            <input id="cloudOverlayToggle" type="checkbox" />
+            <span id="cloudOverlayLabel">卫星云图 40%</span>
+          </label>
+          <label class="place-label-toggle sunlight-layer-toggle" title="按当前或模拟时刻显示真实太阳直射区、晨昏带与夜侧">
+            <input id="sunlightToggle" type="checkbox" />
+            <span>太阳昼夜</span>
+          </label>
+          <label class="place-label-toggle" title="仅叠加在地球和卫星底图上">
+            <input id="placeLabelsToggle" type="checkbox" checked />
+            <span>地名标注</span>
+          </label>
+          <div class="language-toggle" role="group" aria-label="界面语言">
+            <button class="active" type="button" data-app-language="zh" aria-pressed="true" data-i18n-static>中文</button>
+            <button type="button" data-app-language="en" aria-pressed="false">EN</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="panel filters-panel">
+          <button id="leftPanelToggle" class="panel-collapse-toggle" type="button" aria-label="收起左侧菜单" aria-expanded="true">‹</button>
+          <nav class="panel-view-tabs panel-view-tabs-left" aria-label="左侧工具分区">
+            <button class="active" type="button" data-panel-nav="left" data-panel-view-target="layers" aria-selected="true">图层</button>
+            <button type="button" data-panel-nav="left" data-panel-view-target="regions" aria-selected="false">区域</button>
+            <button type="button" data-panel-nav="left" data-panel-view-target="trajectory" aria-selected="false">轨迹</button>
+            <button type="button" data-panel-nav="left" data-panel-view-target="coordinates" aria-selected="false">坐标</button>
+          </nav>
+          <section class="panel-section panel-view-section active" data-panel-view="layers">
+            <div class="section-title">
+              <h2>显示</h2>
+              <span id="visibleCount">0</span>
+            </div>
+            <div class="segmented" role="group" aria-label="display mode">
+              <button class="active" type="button" data-mode="all">全部叠加</button>
+              <button type="button" data-mode="selected">按区域</button>
+            </div>
+            <label class="search-box">
+              <span>搜索</span>
+              <input id="searchInput" type="search" placeholder="NOTAM、FIR、州/地区、类型" />
+            </label>
+            <div class="toggle-row">
+              <label><input id="newOnlyToggle" type="checkbox" /> 新发布</label>
+              <label><input id="withGeometryToggle" type="checkbox" /> 有图形</label>
+              <label><input id="highlightOnlyToggle" type="checkbox" /> 仅显示高亮</label>
+            </div>
+            <div class="source-toggle-grid" aria-label="绘制图层">
+              <button id="notamToggle" class="source-toggle" type="button" aria-pressed="false">绘制 NOTAM</button>
+              <button id="hydropacToggle" class="source-toggle" type="button" aria-pressed="false">绘制 HYDROPAC</button>
+              <button id="msaToggle" class="source-toggle" type="button" aria-pressed="false">绘制中国航警</button>
+              <button id="navareaToggle" class="source-toggle" type="button" aria-pressed="false">绘制 NAVAREA</button>
+            </div>
+            <p class="control-note">四类区域可独立显示。搜索和“新发布”“有图形”会共同筛选当前内容；“仅显示高亮”只保留 Shift 选中的区域。</p>
+          </section>
+
+          <section class="panel-section saved-regions-panel panel-view-section active" data-panel-view="layers">
+            <div class="section-title">
+              <h2>已保存区域</h2>
+              <span id="savedRegionCount">0 / 0</span>
+            </div>
+            <div class="saved-region-actions">
+              <button id="saveHighlightedRegionsButton" type="button" disabled><span>保存高亮区域</span> <span id="saveHighlightedRegionsCount">0</span></button>
+              <button id="clearSavedRegionSelectionButton" type="button" disabled title="取消保存区域的显示">取消显示</button>
+              <button id="reloadSavedRegionsButton" type="button" title="重新读取本地保存区域" aria-label="重新读取本地保存区域">↻</button>
+            </div>
+            <p id="savedRegionStatus" class="saved-region-status" role="status" aria-live="polite"></p>
+            <div id="savedRegionList" class="saved-region-list" aria-label="已保存区域"></div>
+          </section>
+
+          <section class="panel-section refresh-history-card panel-view-section active" data-panel-view="layers">
+            <div class="section-title">
+              <h2>刷新历史</h2>
+              <span id="refreshHistoryCount">0</span>
+            </div>
+            <div class="segmented refresh-history-tabs" role="group" aria-label="刷新历史数据源">
+              <button class="active" type="button" data-history-source="notam">NOTAM</button>
+              <button type="button" data-history-source="hydropac">HYDROPAC</button>
+              <button type="button" data-history-source="msa">中国航警</button>
+              <button type="button" data-history-source="navarea">NAVAREA</button>
+              <button type="button" data-history-source="satellite">卫星轨道</button>
+            </div>
+            <div id="refreshHistoryList" class="refresh-history-list"></div>
+            <p class="control-note">先选择数据源，再点击一个时间快照回放当时保存的内容。删除按钮只移除对应的本地快照，不会触发联网刷新。</p>
+          </section>
+
+          <section class="panel-section panel-view-section" data-panel-view="regions" hidden>
+            <div class="section-title">
+              <h2>国家、地区与海域</h2>
+              <button id="clearCountriesButton" type="button">清除</button>
+            </div>
+            <div id="countryFilters" class="check-list"></div>
+          </section>
+
+          <section class="panel-section panel-view-section" data-panel-view="regions" hidden>
+            <div class="section-title">
+              <h2>FIR / ARTCC</h2>
+              <button id="clearRegionsButton" type="button">清除</button>
+            </div>
+            <div id="regionFilters" class="check-list dense"></div>
+          </section>
+
+          <section class="panel-section landmark-panel panel-view-section active" data-panel-view="layers">
+            <div class="section-title">
+              <h2>发射/着陆/靶场</h2>
+              <span id="landmarkCount">0/0</span>
+            </div>
+            <div class="landmark-actions">
+              <button id="showAllLandmarksButton" type="button">全部显示</button>
+              <button id="hideAllLandmarksButton" type="button">全部隐藏</button>
+            </div>
+            <div class="landmark-toggle-list">
+              <label class="toggle-line landmark-label-toggle">
+                <input id="landmarkLabelsToggle" type="checkbox" checked />
+                <span>中文标签</span>
+              </label>
+              <label class="toggle-line landmark-label-toggle">
+                <input id="launchRingsToggle" type="checkbox" checked />
+                <span>发射预告圆环</span>
+              </label>
+            </div>
+            <div id="landmarkFilters" class="check-list dense landmark-list"></div>
+            <p class="control-note">三角标志、中文名称和发射预告圆环可以分别控制。隐藏地标时，对应圆环和数字也会一并隐藏。</p>
+          </section>
+
+          <section class="panel-section trajectory-panel panel-view-section" data-panel-view="trajectory" hidden>
+            <div class="section-title">
+              <h2>轨迹连线</h2>
+              <span id="trajectoryCount">关闭</span>
+            </div>
+            <label class="toggle-line">
+              <input id="trajectoryToggle" type="checkbox" />
+              <span>轨迹绘制总开关</span>
+            </label>
+            <label class="toggle-line">
+              <input id="trajectoryGroundTrackToggle" type="checkbox" checked />
+              <span>显示星下点轨迹线</span>
+            </label>
+            <div class="ground-track-source-panel">
+              <div class="ground-track-source-heading"><span>星下点来源（可多选）</span><em id="trajectoryGroundTrackSourceCount">0</em></div>
+              <div id="trajectoryGroundTrackSourceList" class="ground-track-source-list"></div>
+            </div>
+            <div class="trajectory-edit-lock">
+              <button id="trajectoryLockButton" type="button" aria-pressed="false">固定当前星下点线</button>
+              <span id="trajectoryLockStatus">编辑中，点击地图可继续加点</span>
+            </div>
+            <label class="toggle-line">
+              <input id="trajectoryAreaPickToggle" type="checkbox" />
+              <span>点击 NOTAM/HYDROPAC 区域作为轨迹点</span>
+            </label>
+            <label class="toggle-line">
+              <input id="trajectoryAreaHighlightToggle" type="checkbox" />
+              <span>高亮已选 NOTAM/HYDROPAC 区域</span>
+            </label>
+            <label class="field-box">
+              <span>当前轨迹</span>
+              <select id="trajectoryTrackSelect"></select>
+            </label>
+            <label class="field-box">
+              <span>星下点颜色</span>
+              <input id="trajectoryColorInput" type="color" value="#ffe08a" />
+            </label>
+            <label class="field-box range-field">
+              <span>星下点粗细 <em id="trajectoryWidthValue">4 px</em></span>
+              <input id="trajectoryWidthInput" type="range" min="2" max="12" step="0.5" value="4" />
+            </label>
+            <label class="field-box range-field">
+              <span>星下点外发光 <em id="trajectoryGlowValue">10 px</em></span>
+              <input id="trajectoryGlowInput" type="range" min="0" max="30" step="1" value="10" />
+            </label>
+            <label class="field-box range-field">
+              <span>虚线密度 <em id="trajectoryDashValue">中等</em></span>
+              <input id="trajectoryDashInput" type="range" min="0" max="100" step="1" value="45" />
+            </label>
+            <label class="toggle-line">
+              <input id="trajectoryLengthToggle" type="checkbox" />
+              <span>显示轨迹地表长度</span>
+            </label>
+            <label class="toggle-line">
+              <input id="trajectoryInclinationToggle" type="checkbox" />
+              <span>显示轨迹倾角</span>
+            </label>
+            <label class="toggle-line">
+              <input id="trajectoryGeodesicToggle" type="checkbox" />
+              <span>当前轨迹使用椭球最短测地线</span>
+            </label>
+            <div class="trajectory-actions">
+              <button id="newTrajectoryButton" type="button">新建星下点线</button>
+              <button id="deleteTrajectoryButton" type="button">删除当前线</button>
+              <button id="undoTrajectoryPointButton" type="button">撤回</button>
+              <button id="redoTrajectoryPointButton" type="button">重做</button>
+              <button id="clearTrajectoryButton" type="button">删除全部点</button>
+            </div>
+            <div id="trajectoryPlanList" class="trajectory-plan"></div>
+            <p class="control-note">打开总开关后，点击地图添加轨迹点；固定当前线后，地图点击不再改变它。按住 Shift 点击区域可多选高亮，再次点击取消；按住 Ctrl 点击区域可用黄色虚线查找同一北京时间窗口的跨数据源通告。</p>
+          </section>
+
+          <section class="panel-section custom-coordinate-panel panel-view-section" data-panel-view="coordinates" hidden>
+            <div class="section-title">
+              <h2>自定义坐标</h2>
+              <span id="customCoordinateCount">0</span>
+            </div>
+            <label class="toggle-line">
+              <input id="customCoordinateToggle" type="checkbox" checked />
+              <span>显示自定义坐标图层</span>
+            </label>
+            <label class="toggle-line">
+              <input id="customMapAddToggle" type="checkbox" />
+              <span>点击地图添加坐标</span>
+            </label>
+            <label class="field-box">
+              <span>名称</span>
+              <input id="customCoordinateName" type="text" placeholder="例如 观测点 A" />
+            </label>
+            <label class="field-box">
+              <span>坐标</span>
+              <input id="customCoordinateValue" type="text" placeholder="39.014375, 102.007433 或 39°0'51.75&quot;北, 102°0'26.76&quot;东" />
+            </label>
+            <div class="trajectory-actions">
+              <button id="addCustomCoordinateButton" type="button">添加点</button>
+              <button id="fitCustomCoordinatesButton" type="button">定位自定义</button>
+            </div>
+            <div id="customCoordinateList" class="custom-coordinate-list" aria-label="&#x81EA;&#x5B9A;&#x4E49;&#x5750;&#x6807;&#x5217;&#x8868;"></div>
+            <div id="selectedCustomCoordinateBox" class="custom-edit-box" hidden>
+              <strong>选中坐标</strong>
+              <label class="field-box">
+                <span>名称</span>
+                <input id="selectedCustomCoordinateName" type="text" />
+              </label>
+              <label id="selectedCustomCoordinateValueBox" class="field-box">
+                <span>&#x5750;&#x6807;</span>
+                <input id="selectedCustomCoordinateValue" type="text" placeholder="39.014375, 102.007433" />
+              </label>
+              <label class="field-box">
+                <span>备注</span>
+                <textarea id="selectedCustomCoordinateDescription" rows="3" placeholder="可填写用途、来源、时间等备注"></textarea>
+              </label>
+              <div class="trajectory-actions">
+                <button id="updateCustomCoordinateButton" type="button">保存修改</button>
+                <button id="deleteCustomCoordinateButton" type="button">删除选中</button>
+              </div>
+            </div>
+            <label class="field-box">
+              <span>批量坐标</span>
+              <textarea id="customCoordinateBatch" rows="5" placeholder="每行一个点：名称, 纬度, 经度&#10;也支持：纬度, 经度, 名称"></textarea>
+            </label>
+            <div class="trajectory-actions">
+              <button id="importBatchCoordinatesButton" type="button">批量导入</button>
+              <button id="clearCustomCoordinatesButton" type="button">清空自定义</button>
+            </div>
+            <label class="file-box">
+              <span>KML / KMZ</span>
+              <input id="customKmlFileInput" type="file" accept=".kml,.kmz,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz" />
+            </label>
+            <div class="trajectory-actions">
+              <button id="exportCustomKmlButton" type="button">导出 KML</button>
+              <button id="exportCustomKmzButton" type="button">导出 KMZ</button>
+            </div>
+            <p id="customCoordinateStatus" class="control-note">支持点、线、面 KML/KMZ；批量粘贴支持十进制度和度分秒。</p>
+          </section>
+        </aside>
+
+        <section class="map-stage">
+          <canvas id="baseMapCanvas" aria-hidden="true"></canvas>
+          <canvas id="globeCanvas" aria-hidden="true"></canvas>
+          <canvas id="restrictionGpuCanvas" aria-hidden="true"></canvas>
+          <canvas id="mapCanvas"></canvas>
+          <canvas id="globeSurfaceCanvas" aria-hidden="true"></canvas>
+          <canvas id="satelliteCoverageCanvas" aria-hidden="true"></canvas>
+          <canvas id="satelliteOrbitCanvas" aria-hidden="true"></canvas>
+          <canvas id="satelliteCanvas" aria-hidden="true"></canvas>
+          <canvas id="ballisticGpuCanvas" aria-hidden="true"></canvas>
+          <canvas id="animationCanvas" aria-hidden="true"></canvas>
+          <div id="earthNavigation" class="earth-navigation" hidden>
+            <button id="resetNorthButton" class="earth-compass-button" type="button" title="恢复正北朝上" aria-label="恢复正北朝上">
+              <span class="earth-compass-needle" aria-hidden="true"><b>N</b><i></i></span>
+            </button>
+            <div class="earth-zoom-controls">
+              <button id="earthZoomInButton" type="button" title="放大" aria-label="放大">+</button>
+              <button id="earthResetTiltButton" type="button" title="恢复俯视" aria-label="恢复俯视">2D</button>
+              <button id="earthZoomOutButton" type="button" title="缩小" aria-label="缩小">−</button>
+            </div>
+          </div>
+          <div id="satelliteDualClock" class="satellite-dual-clock" hidden aria-live="off">
+            <div><span>北京时间</span><strong id="satelliteBeijingClock">----/--/-- --:--:--</strong></div>
+            <div><span>UTC</span><strong id="satelliteUtcClock">----/--/-- --:--:--</strong></div>
+          </div>
+          <div class="map-legend" id="legend"></div>
+          <div class="map-attribution" id="mapAttribution">© OpenStreetMap contributors</div>
+        </section>
+
+        <aside class="panel details-panel">
+          <button id="rightPanelToggle" class="panel-collapse-toggle" type="button" aria-label="收起右侧菜单" aria-expanded="true">›</button>
+          <nav class="panel-view-tabs panel-view-tabs-right" aria-label="右侧工作区">
+            <button class="active" type="button" data-panel-nav="right" data-panel-view-target="browse" aria-selected="true">内容浏览</button>
+            <button type="button" data-panel-nav="right" data-panel-view-target="sources" aria-selected="false">数据更新</button>
+          </nav>
+          <section class="panel-section source-card panel-view-section" data-panel-view="sources" hidden>
+            <div class="section-title">
+              <h2>数据源</h2>
+              <span id="updatedAt">--</span>
+            </div>
+            <div class="source-action-grid">
+              <button id="notamSourceRefreshButton" class="source-refresh-button" type="button">刷新 NOTAM</button>
+              <button id="hydropacFetchButton" class="hydropac-fetch-button" type="button">刷新 HYDROPAC</button>
+              <button id="msaFetchButton" class="hydropac-fetch-button" type="button">刷新中国航警</button>
+              <button id="navareaFetchButton" class="hydropac-fetch-button" type="button">刷新 NAVAREA</button>
+              <button id="launchFetchButton" class="launch-fetch-button" type="button">刷新发射预告</button>
+              <button id="satelliteFetchButton" class="satellite-fetch-button" type="button">刷新卫星轨道</button>
+            </div>
+            <p class="control-note">各数据源独立刷新，并在成功后保存本地快照。刷新期间可以继续缩放地图、筛选内容和播放既有动画；失败时仍保留上一次可用缓存。</p>
+            <div id="refreshProgress" class="refresh-progress idle">
+              <span class="spinner" aria-hidden="true"></span>
+              <strong>数据就绪</strong>
+              <em>版本：--</em>
+            </div>
+            <div id="hydropacProgress" class="hydropac-progress idle">
+              <span class="mini-spinner" aria-hidden="true"></span>
+              <strong>NGA MSI HYDROPAC 未获取</strong>
+              <em>独立航海/水文警告源</em>
+            </div>
+            <div id="msaProgress" class="msa-progress idle">
+              <span class="mini-spinner" aria-hidden="true"></span>
+              <strong>中国航警未获取</strong>
+              <em>中国海事局航行警告</em>
+            </div>
+            <div id="navareaProgress" class="navarea-progress idle">
+              <span class="mini-spinner" aria-hidden="true"></span>
+              <strong>NAVAREA 未获取</strong>
+              <em>I / II / IV / VIII / XI / XII / XIII 航行警告</em>
+            </div>
+            <div id="cloudProgress" class="cloud-progress idle">
+              <span class="mini-spinner" aria-hidden="true"></span>
+              <strong>卫星云图未获取</strong>
+              <em>NOAA GMGSI 全球小时云图，透明度可调</em>
+            </div>
+            <div class="cloud-controls">
+              <label class="cloud-opacity-control">
+                <span>云图透明度</span>
+                <input id="cloudOpacityInput" type="range" min="0" max="100" step="5" value="40" />
+                <output id="cloudOpacityValue">40%</output>
+              </label>
+              <div class="cloud-time-control">
+                <div class="cloud-date-time-selectors" aria-label="卫星云图北京时间选择">
+                  <label><span>年</span><select id="cloudYearSelect"></select></label>
+                  <label><span>月</span><select id="cloudMonthSelect"></select></label>
+                  <label><span>日</span><select id="cloudDaySelect"></select></label>
+                  <label><span>小时</span><select id="cloudHourSelect"></select></label>
+                  <div class="cloud-date-time-actions">
+                    <button id="cloudTimeApplyButton" type="button">应用时间</button>
+                    <button id="cloudLatestRefreshButton" type="button">刷新最新</button>
+                  </div>
+                </div>
+                <label class="cloud-time-slider-control">
+                  <span>最近 48 小时</span>
+                  <input id="cloudTimeSlider" type="range" min="0" max="29" step="1" value="0" list="cloudTimeTicks" />
+                  <output id="cloudTimeValue">最新可用小时</output>
+                </label>
+                <datalist id="cloudTimeTicks"></datalist>
+                <div id="cloudTimelineLabels" class="cloud-timeline-labels"></div>
+              </div>
+            </div>
+            <div id="launchProgress" class="launch-progress idle">
+              <span class="mini-spinner" aria-hidden="true"></span>
+              <strong>火箭发射预告未获取</strong>
+              <em>Launch Library 2</em>
+            </div>
+            <div id="satelliteProgress" class="refresh-progress satellite-progress idle" role="status" aria-live="polite">
+              <span class="spinner" aria-hidden="true"></span>
+              <strong>卫星轨道目录未载入</strong>
+              <em>CelesTrak OMM + SATCAT + 全量在轨根数 · SGP4/SDP4</em>
+            </div>
+            <div id="performanceProfile" class="performance-profile" role="status" aria-live="polite">
+              <div><strong>硬件自适应</strong><span>识别中</span></div>
+              <p>正在读取 CPU、GPU 与图形能力</p>
+              <small>画质会按实际帧耗时自动调节</small>
+            </div>
+            <div id="sourceStatus" class="source-status"></div>
+          </section>
+
+          <section class="panel-section panel-view-section active" data-panel-view="browse">
+            <div class="section-title">
+              <h2 id="detailSectionTitle">NOTAM 列表</h2>
+              <span id="resultSummary">0 条</span>
+            </div>
+            <div class="segmented detail-mode-toggle" role="group" aria-label="数据列表">
+              <button class="active" type="button" data-detail-mode="notam">NOTAM</button>
+              <button type="button" data-detail-mode="hydropac">HYDROPAC</button>
+              <button type="button" data-detail-mode="msa">中国航警</button>
+              <button type="button" data-detail-mode="navarea">NAVAREA</button>
+              <button type="button" data-detail-mode="launch">发射预告</button>
+              <button type="button" data-detail-mode="satellite">卫星轨道</button>
+            </div>
+            <label class="search-box detail-search">
+              <span id="detailSearchLabel">按 NOTAM 编号搜索全部数据</span>
+              <input id="notamIdSearchInput" type="search" placeholder="例如 A1234/26、M2523/26" />
+            </label>
+            <div id="notamIdSearchResults" class="notam-search-results"></div>
+            <div id="satelliteControls" class="satellite-controls" hidden>
+              <div class="satellite-workspace-head">
+                <div>
+                  <strong>卫星轨道显示</strong>
+                  <small id="satelliteSelectionStatus">已选 0 颗 · 等待轨道目录</small>
+                </div>
+                <button id="satelliteLayerToggle" class="active" type="button" aria-pressed="true">显示轨道层</button>
+              </div>
+
+              <details class="satellite-control-section" open>
+                <summary><span>显示与样式</span><small>按需控制轨道、名称与覆盖层</small></summary>
+                <div class="satellite-control-body">
+                  <div class="satellite-layer-row">
+                    <button id="satelliteOrbitLinesToggle" class="active" type="button" aria-pressed="true">轨道线</button>
+                    <button id="satelliteLabelsToggle" class="active" type="button" aria-pressed="true" data-i18n-en="Names">名称</button>
+                    <button id="satelliteAllLabelsToggle" type="button" aria-pressed="false">全部名称</button>
+                  </div>
+                  <div class="satellite-coverage-row">
+                    <button id="satelliteCoverageToggle" class="active" type="button" aria-pressed="true" title="成像幅宽与通信范围的总开关" data-i18n-en="Coverage">覆盖总开关</button>
+                    <button id="satelliteImagingToggle" class="active" type="button" aria-pressed="true">成像幅宽</button>
+                    <button id="satelliteCommunicationToggle" class="active" type="button" aria-pressed="true" title="通信范围" data-i18n-en="Comms footprint">通信范围</button>
+                  </div>
+                  <div class="satellite-style-grid">
+                    <label class="satellite-opacity-control">
+                      <span>轨道线粗细</span>
+                      <input id="satelliteOrbitWidthInput" type="range" min="0.5" max="5" step="0.25" value="1.5" />
+                      <output id="satelliteOrbitWidthValue">1.5 px</output>
+                    </label>
+                    <label class="satellite-opacity-control">
+                      <span>卫星点大小</span>
+                      <input id="satellitePointSizeInput" type="range" min="3" max="28" step="0.5" value="7" />
+                      <output id="satellitePointSizeValue">7 px</output>
+                    </label>
+                    <label class="satellite-opacity-control">
+                      <span>名称大小</span>
+                      <input id="satelliteLabelSizeInput" type="range" min="9" max="32" step="1" value="12" />
+                      <output id="satelliteLabelSizeValue">12 px</output>
+                    </label>
+                    <label class="satellite-opacity-control">
+                      <span>成像幅宽强度</span>
+                      <input id="satelliteImagingOpacityInput" type="range" min="5" max="100" step="5" value="45" />
+                      <output id="satelliteImagingOpacityValue">45%</output>
+                    </label>
+                    <label class="satellite-opacity-control">
+                      <span>通信单圈强度</span>
+                      <input id="satelliteCommunicationOpacityInput" type="range" min="5" max="100" step="5" value="45" />
+                      <output id="satelliteCommunicationOpacityValue">45%</output>
+                    </label>
+                  </div>
+                  <p class="satellite-density-note">通信覆盖采用累积显色：重叠 2 层、3 层及以上会逐级加深。</p>
+                  <p class="control-note">卫星数量较多时，可先关闭全部名称、成像幅宽或通信范围，再逐项开启观察。线宽、点大小、字号和覆盖强度均可独立调节。</p>
+                </div>
+              </details>
+
+              <details class="satellite-control-section" open>
+                <summary><span>幅宽侧摆规划</span><small>选择遥感卫星后规划地面成像区</small></summary>
+                <div class="satellite-control-body satellite-swath-planner">
+                  <div class="satellite-layer-row">
+                    <button id="satelliteSwathEditToggle" type="button" aria-pressed="false">拖动幅宽</button>
+                    <button id="satelliteSwathResetButton" type="button">恢复天底</button>
+                  </div>
+                  <div class="satellite-swath-mode-row segmented" role="group" aria-label="幅宽跟随方式">
+                    <button class="active" type="button" data-satellite-swath-mode="ground-fixed" aria-pressed="true">固定地面区域</button>
+                    <button type="button" data-satellite-swath-mode="angle-fixed" aria-pressed="false">固定侧摆角</button>
+                  </div>
+                  <div class="satellite-swath-angle-control">
+                    <label for="satelliteSwathRollInput">
+                      <span>侧摆角</span>
+                      <input id="satelliteSwathRollInput" type="range" min="-45" max="45" step="0.1" value="0" />
+                    </label>
+                    <label class="satellite-swath-angle-number" for="satelliteSwathRollNumber">
+                      <input id="satelliteSwathRollNumber" type="number" min="-45" max="45" step="0.1" value="0.0" inputmode="decimal" />
+                      <span>°</span>
+                    </label>
+                  </div>
+                  <div id="satelliteSwathStatus" class="satellite-swath-status" data-state="idle">
+                    <strong>未选择成像卫星</strong>
+                    <span>幅宽 -- · 长度 --</span>
+                    <span>侧摆 -- · 离轴 --</span>
+                    <span>地表偏移 --</span>
+                  </div>
+                  <p class="control-note">“固定地面区域”保持目标方框不动并连续反算指向；“固定侧摆角”保持设定角度，方框随卫星移动。侧摆角可按 0.1° 调节，范围为 −45° 至 +45°。</p>
+                </div>
+              </details>
+
+              <details class="satellite-control-section" open>
+                <summary><span>筛选与批量选择</span><small>范围和类型用于批量载入，搜索始终覆盖完整目录</small></summary>
+                <div class="satellite-control-body">
+                  <span class="satellite-control-label">轨道范围</span>
+                  <div class="satellite-category-row" role="group" aria-label="卫星轨道分类">
+                    <button class="active" type="button" data-satellite-orbit="LEO" aria-pressed="true">LEO <span id="satelliteLeoCount">0</span></button>
+                    <button class="active" type="button" data-satellite-orbit="MEO" aria-pressed="true">MEO <span id="satelliteMeoCount">0</span></button>
+                    <button class="active" type="button" data-satellite-orbit="GEO" aria-pressed="true">GEO <span id="satelliteGeoCount">0</span></button>
+                    <button class="active" type="button" data-satellite-orbit="HEO" aria-pressed="true">HEO <span id="satelliteHeoCount">0</span></button>
+                  </div>
+                  <span class="satellite-control-label">对象类型</span>
+                  <div class="satellite-object-row satellite-category-row" role="group" aria-label="空间对象分类">
+                    <button class="active" type="button" data-satellite-object="ACTIVE_PAYLOAD" aria-pressed="true">在役卫星 <span id="satelliteActiveCount">0</span></button>
+                    <button type="button" data-satellite-object="RETIRED_PAYLOAD" aria-pressed="false">退役卫星 <span id="satelliteInactiveCount">0</span></button>
+                    <button type="button" data-satellite-object="ROCKET_BODY" aria-pressed="false">火箭体 <span id="satelliteRocketBodyCount">0</span></button>
+                    <button type="button" data-satellite-object="DEBRIS" aria-pressed="false">在轨残骸 <span id="satelliteDebrisCount">0</span></button>
+                    <button type="button" data-satellite-object="UNKNOWN" aria-pressed="false">未知对象 <span id="satelliteUnknownCount">0</span></button>
+                  </div>
+                  <div class="satellite-bulk-row">
+                    <label><span>批量载入</span><select id="satelliteBulkSelectionSelect">
+                      <option value="DEFAULTS">代表卫星（仅显示代表样本）</option>
+                      <option value="FILTERS">当前轨道范围 + 对象类型</option>
+                      <option value="ACTIVE_PAYLOAD">全部在役卫星</option>
+                      <option value="RETIRED_PAYLOAD">全部退役卫星</option>
+                      <option value="ROCKET_BODY">全部火箭体</option>
+                      <option value="DEBRIS">全部在轨残骸</option>
+                      <option value="ALL">完整空间对象目录</option>
+                    </select></label>
+                    <button id="satelliteBulkSelectionApplyButton" type="button">载入</button>
+                  </div>
+                  <div class="satellite-selection-row">
+                    <button id="satelliteSelectFilteredButton" type="button">加入搜索结果</button>
+                    <button id="satelliteFitSelectedButton" type="button">查看全轨道</button>
+                    <button id="satelliteClearSelectionButton" type="button">清空选择</button>
+                  </div>
+                </div>
+              </details>
+
+              <details class="satellite-control-section satellite-element-section">
+                <summary><span>自定义轨道数据</span><small>TLE / GP OMM</small></summary>
+                <div class="satellite-control-body satellite-element-panel">
+                  <label class="satellite-element-format">
+                    <span>输入格式</span>
+                    <select id="satelliteElementFormatSelect">
+                      <option value="auto">自动识别</option>
+                      <option value="tle">TLE / 2LE / 3LE</option>
+                      <option value="json">GP JSON</option>
+                      <option value="csv">GP CSV</option>
+                      <option value="kvn">OMM KVN</option>
+                      <option value="xml">OMM XML</option>
+                    </select>
+                  </label>
+                  <textarea id="satelliteElementInput" rows="8" spellcheck="false" placeholder="粘贴一颗或多颗卫星的 TLE，或 GP/OMM JSON、CSV、KVN、XML"></textarea>
+                  <div class="satellite-element-actions">
+                    <button id="satelliteElementApplyButton" type="button">加入并绘制</button>
+                    <button id="satelliteElementFileButton" type="button">读取文件</button>
+                    <button id="satelliteElementClearButton" type="button">全部清除</button>
+                    <input id="satelliteElementFileInput" type="file" accept=".txt,.tle,.2le,.3le,.json,.csv,.kvn,.xml,.omm,text/plain,application/json,text/csv,application/xml,text/xml" hidden />
+                  </div>
+                  <div id="satelliteElementStatus" class="satellite-element-status" data-state="idle">
+                    <strong>尚未添加自定义轨道</strong>
+                    <span>0 颗卫星 · 0 组历元</span>
+                  </div>
+                  <div id="satelliteElementList" class="satellite-element-list"></div>
+                </div>
+              </details>
+
+              <details class="satellite-control-section">
+                <summary><span>星座批量选择</span><small>Shift 多选 / 反选</small></summary>
+                <div class="satellite-control-body satellite-preset-panel">
+                <div class="satellite-constellation-grid" role="group" aria-label="按国家和用途管理卫星系列">
+                  <details class="satellite-series-country" open>
+                    <summary><strong>美国</strong><span>军用、民用与商业星座</span></summary>
+                    <div class="satellite-series-country-body">
+                      <div class="satellite-constellation-heading">战役战术、预警与作战支援</div>
+                      <button type="button" data-satellite-constellation="PWSA"><strong>PWSA / SDA</strong><span data-satellite-constellation-count="PWSA">0</span></button>
+                      <button type="button" data-satellite-constellation="US_MISSILE_WARNING"><strong>红外导弹预警</strong><span data-satellite-constellation-count="US_MISSILE_WARNING">0</span></button>
+                      <button type="button" data-satellite-constellation="US_SPACE_AWARENESS"><strong>空间态势感知</strong><span data-satellite-constellation-count="US_SPACE_AWARENESS">0</span></button>
+                      <button type="button" data-satellite-constellation="US_MIL_WEATHER"><strong>军用气象</strong><span data-satellite-constellation-count="US_MIL_WEATHER">0</span></button>
+                      <button type="button" data-satellite-constellation="US_TACSAT"><strong>TacSat 战术通信</strong><span data-satellite-constellation-count="US_TACSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="US_TACTICAL_EXPERIMENTS"><strong>战术空间试验</strong><span data-satellite-constellation-count="US_TACTICAL_EXPERIMENTS">0</span></button>
+                      <div class="satellite-constellation-heading">军用通信</div>
+                      <button type="button" data-satellite-constellation="WGS"><strong>WGS 宽带通信</strong><span data-satellite-constellation-count="WGS">0</span></button>
+                      <button type="button" data-satellite-constellation="AEHF"><strong>AEHF 抗干扰通信</strong><span data-satellite-constellation-count="AEHF">0</span></button>
+                      <button type="button" data-satellite-constellation="MILSTAR"><strong>Milstar</strong><span data-satellite-constellation-count="MILSTAR">0</span></button>
+                      <button type="button" data-satellite-constellation="DSCS"><strong>DSCS III</strong><span data-satellite-constellation-count="DSCS">0</span></button>
+                      <button type="button" data-satellite-constellation="MUOS"><strong>MUOS 移动通信</strong><span data-satellite-constellation-count="MUOS">0</span></button>
+                      <button type="button" data-satellite-constellation="UFO"><strong>UHF Follow-On</strong><span data-satellite-constellation-count="UFO">0</span></button>
+                      <button type="button" data-satellite-constellation="FLTSATCOM"><strong>FLTSATCOM</strong><span data-satellite-constellation-count="FLTSATCOM">0</span></button>
+                      <div class="satellite-constellation-heading">情报侦察与保密任务</div>
+                      <button type="button" data-satellite-constellation="NRO_PUBLIC"><strong>NRO 公开可归属</strong><span data-satellite-constellation-count="NRO_PUBLIC">0</span></button>
+                      <button type="button" data-satellite-constellation="US_CLASSIFIED"><strong>USA 编号保密载荷</strong><span data-satellite-constellation-count="US_CLASSIFIED">0</span></button>
+                      <div class="satellite-constellation-heading">民用与商业遥感</div>
+                      <button type="button" data-satellite-constellation="LANDSAT"><strong>Landsat</strong><span data-satellite-constellation-count="LANDSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="PLANET"><strong>Planet</strong><span data-satellite-constellation-count="PLANET">0</span></button>
+                      <button type="button" data-satellite-constellation="VANTOR"><strong>Vantor</strong><span data-satellite-constellation-count="VANTOR">0</span></button>
+                      <button type="button" data-satellite-constellation="BLACKSKY"><strong>BlackSky</strong><span data-satellite-constellation-count="BLACKSKY">0</span></button>
+                      <button type="button" data-satellite-constellation="CAPELLA"><strong>Capella</strong><span data-satellite-constellation-count="CAPELLA">0</span></button>
+                      <button type="button" data-satellite-constellation="UMBRA"><strong>Umbra</strong><span data-satellite-constellation-count="UMBRA">0</span></button>
+                      <div class="satellite-constellation-heading">导航、数据中继与商业通信</div>
+                      <button type="button" data-satellite-constellation="GPS"><strong>GPS</strong><span data-satellite-constellation-count="GPS">0</span></button>
+                      <button type="button" data-satellite-constellation="TDRS"><strong>NASA TDRS</strong><span data-satellite-constellation-count="TDRS">0</span></button>
+                      <button type="button" data-satellite-constellation="STARLINK"><strong>星链</strong><span data-satellite-constellation-count="STARLINK">0</span></button>
+                      <button type="button" data-satellite-constellation="AMAZON_LEO"><strong>Amazon Leo</strong><span data-satellite-constellation-count="AMAZON_LEO">0</span></button>
+                      <button type="button" data-satellite-constellation="IRIDIUM"><strong>Iridium 铱星</strong><span data-satellite-constellation-count="IRIDIUM">0</span></button>
+                      <button type="button" data-satellite-constellation="GLOBALSTAR"><strong>Globalstar</strong><span data-satellite-constellation-count="GLOBALSTAR">0</span></button>
+                      <button type="button" data-satellite-constellation="ORBCOMM"><strong>ORBCOMM</strong><span data-satellite-constellation-count="ORBCOMM">0</span></button>
+                      <button type="button" data-satellite-constellation="INTELSAT"><strong>Intelsat / Galaxy</strong><span data-satellite-constellation-count="INTELSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="ECHOSTAR"><strong>EchoStar / Hughes</strong><span data-satellite-constellation-count="ECHOSTAR">0</span></button>
+                      <button type="button" data-satellite-constellation="VIASAT"><strong>Viasat</strong><span data-satellite-constellation-count="VIASAT">0</span></button>
+                      <button type="button" data-satellite-constellation="SIRIUSXM"><strong>SiriusXM</strong><span data-satellite-constellation-count="SIRIUSXM">0</span></button>
+                      <button type="button" data-satellite-constellation="DIRECTV"><strong>DirecTV</strong><span data-satellite-constellation-count="DIRECTV">0</span></button>
+                      <button type="button" data-satellite-constellation="AST_SPACEMOBILE"><strong>AST SpaceMobile</strong><span data-satellite-constellation-count="AST_SPACEMOBILE">0</span></button>
+                      <button type="button" data-satellite-constellation="LYNK"><strong>Lynk</strong><span data-satellite-constellation-count="LYNK">0</span></button>
+                      <button type="button" data-satellite-constellation="US_MSS_LEGACY"><strong>美国传统 MSS</strong><span data-satellite-constellation-count="US_MSS_LEGACY">0</span></button>
+                    </div>
+                  </details>
+
+                  <details class="satellite-series-country" open>
+                    <summary><strong>中国</strong><span>遥感、通信、导航与互联网</span></summary>
+                    <div class="satellite-series-country-body">
+                      <div class="satellite-constellation-heading">遥感、测绘与气象</div>
+                      <button type="button" data-satellite-constellation="JILIN"><strong>吉林一号</strong><span data-satellite-constellation-count="JILIN">0</span></button>
+                      <button type="button" data-satellite-constellation="YAOGAN"><strong>遥感系列</strong><span data-satellite-constellation-count="YAOGAN">0</span></button>
+                      <button type="button" data-satellite-constellation="GAOFEN"><strong>高分系列</strong><span data-satellite-constellation-count="GAOFEN">0</span></button>
+                      <button type="button" data-satellite-constellation="ZIYUAN"><strong>资源 / CBERS</strong><span data-satellite-constellation-count="ZIYUAN">0</span></button>
+                      <button type="button" data-satellite-constellation="FENGYUN"><strong>风云系列</strong><span data-satellite-constellation-count="FENGYUN">0</span></button>
+                      <button type="button" data-satellite-constellation="TIANHUI"><strong>天绘系列</strong><span data-satellite-constellation-count="TIANHUI">0</span></button>
+                      <button type="button" data-satellite-constellation="CHINA_OCEAN_ENV"><strong>海洋 / 环境</strong><span data-satellite-constellation-count="CHINA_OCEAN_ENV">0</span></button>
+                      <button type="button" data-satellite-constellation="CHINA_COMMERCIAL_RS"><strong>中国商业遥感</strong><span data-satellite-constellation-count="CHINA_COMMERCIAL_RS">0</span></button>
+                      <div class="satellite-constellation-heading">通信、试验与数据中继</div>
+                      <button type="button" data-satellite-constellation="TIANLIAN"><strong>天链数据中继</strong><span data-satellite-constellation-count="TIANLIAN">0</span></button>
+                      <button type="button" data-satellite-constellation="TJS"><strong>通信试验卫星</strong><span data-satellite-constellation-count="TJS">0</span></button>
+                      <button type="button" data-satellite-constellation="CHINASAT"><strong>中星系列</strong><span data-satellite-constellation-count="CHINASAT">0</span></button>
+                      <div class="satellite-constellation-heading">导航与卫星互联网</div>
+                      <button type="button" data-satellite-constellation="BEIDOU"><strong>北斗</strong><span data-satellite-constellation-count="BEIDOU">0</span></button>
+                      <button type="button" data-satellite-constellation="GUOWANG"><strong>星网</strong><span data-satellite-constellation-count="GUOWANG">0</span></button>
+                      <button type="button" data-satellite-constellation="QIANFAN"><strong>千帆</strong><span data-satellite-constellation-count="QIANFAN">0</span></button>
+                      <div class="satellite-constellation-heading">其他公开目录对象</div>
+                      <button type="button" data-satellite-constellation="CHINA_OTHER"><strong>中国其他在轨卫星</strong><span data-satellite-constellation-count="CHINA_OTHER">0</span></button>
+                    </div>
+                  </details>
+
+                  <details class="satellite-series-country" open>
+                    <summary><strong>俄罗斯</strong><span>民用、军用与宽带通信</span></summary>
+                    <div class="satellite-series-country-body">
+                      <div class="satellite-constellation-heading">遥感与气象</div>
+                      <button type="button" data-satellite-constellation="RESURS"><strong>Resurs</strong><span data-satellite-constellation-count="RESURS">0</span></button>
+                      <button type="button" data-satellite-constellation="KANOPUS"><strong>Kanopus</strong><span data-satellite-constellation-count="KANOPUS">0</span></button>
+                      <button type="button" data-satellite-constellation="KONDOR"><strong>Kondor-FKA</strong><span data-satellite-constellation-count="KONDOR">0</span></button>
+                      <button type="button" data-satellite-constellation="METEOR"><strong>Meteor-M</strong><span data-satellite-constellation-count="METEOR">0</span></button>
+                      <button type="button" data-satellite-constellation="ELEKTRO_ARKTIKA"><strong>Elektro / Arktika</strong><span data-satellite-constellation-count="ELEKTRO_ARKTIKA">0</span></button>
+                      <div class="satellite-constellation-heading">通信、导航与互联网</div>
+                      <button type="button" data-satellite-constellation="RASSVET_1440"><strong>Bureau 1440 黎明</strong><span data-satellite-constellation-count="RASSVET_1440">0</span></button>
+                      <button type="button" data-satellite-constellation="GLONASS"><strong>格洛纳斯</strong><span data-satellite-constellation-count="GLONASS">0</span></button>
+                      <button type="button" data-satellite-constellation="GONETS"><strong>Gonets</strong><span data-satellite-constellation-count="GONETS">0</span></button>
+                      <button type="button" data-satellite-constellation="LUCH"><strong>Luch</strong><span data-satellite-constellation-count="LUCH">0</span></button>
+                      <button type="button" data-satellite-constellation="EXPRESS"><strong>Express</strong><span data-satellite-constellation-count="EXPRESS">0</span></button>
+                      <button type="button" data-satellite-constellation="YAMAL"><strong>Yamal</strong><span data-satellite-constellation-count="YAMAL">0</span></button>
+                      <div class="satellite-constellation-heading">军用通信、预警与公开 Cosmos</div>
+                      <button type="button" data-satellite-constellation="MERIDIAN"><strong>Meridian</strong><span data-satellite-constellation-count="MERIDIAN">0</span></button>
+                      <button type="button" data-satellite-constellation="EKS"><strong>EKS 预警</strong><span data-satellite-constellation-count="EKS">0</span></button>
+                      <button type="button" data-satellite-constellation="RODNIK"><strong>Rodnik</strong><span data-satellite-constellation-count="RODNIK">0</span></button>
+                      <button type="button" data-satellite-constellation="RUSSIAN_MILITARY_COMMS"><strong>俄军传统通信</strong><span data-satellite-constellation-count="RUSSIAN_MILITARY_COMMS">0</span></button>
+                      <button type="button" data-satellite-constellation="RUSSIAN_COSMOS"><strong>Cosmos 公开目录</strong><span data-satellite-constellation-count="RUSSIAN_COSMOS">0</span></button>
+                      <div class="satellite-constellation-heading">小卫星与其他对象</div>
+                      <button type="button" data-satellite-constellation="RUSSIAN_SMALLSAT"><strong>俄罗斯小卫星</strong><span data-satellite-constellation-count="RUSSIAN_SMALLSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="RUSSIA_OTHER"><strong>俄罗斯其他在轨卫星</strong><span data-satellite-constellation-count="RUSSIA_OTHER">0</span></button>
+                    </div>
+                  </details>
+
+                  <details class="satellite-series-country" open>
+                    <summary><strong>欧洲与跨国机构</strong><span>遥感、导航与通信</span></summary>
+                    <div class="satellite-series-country-body">
+                      <div class="satellite-constellation-heading">遥感</div>
+                      <button type="button" data-satellite-constellation="SENTINEL"><strong>Sentinel</strong><span data-satellite-constellation-count="SENTINEL">0</span></button>
+                      <button type="button" data-satellite-constellation="PLEIADES"><strong>Pléiades</strong><span data-satellite-constellation-count="PLEIADES">0</span></button>
+                      <button type="button" data-satellite-constellation="COSMO_SKYMED"><strong>COSMO-SkyMed</strong><span data-satellite-constellation-count="COSMO_SKYMED">0</span></button>
+                      <button type="button" data-satellite-constellation="ICEYE"><strong>ICEYE</strong><span data-satellite-constellation-count="ICEYE">0</span></button>
+                      <div class="satellite-constellation-heading">导航与通信</div>
+                      <button type="button" data-satellite-constellation="GALILEO"><strong>Galileo</strong><span data-satellite-constellation-count="GALILEO">0</span></button>
+                      <button type="button" data-satellite-constellation="ONEWEB"><strong>一网</strong><span data-satellite-constellation-count="ONEWEB">0</span></button>
+                      <button type="button" data-satellite-constellation="INMARSAT"><strong>Inmarsat 海事通信</strong><span data-satellite-constellation-count="INMARSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="SES_O3B"><strong>SES / O3b</strong><span data-satellite-constellation-count="SES_O3B">0</span></button>
+                    </div>
+                  </details>
+
+                  <details class="satellite-series-country" open>
+                    <summary><strong>其他国家与地区</strong><span>商业及公共遥感</span></summary>
+                    <div class="satellite-series-country-body">
+                      <div class="satellite-constellation-heading">加拿大、韩国、日本、印度与南美</div>
+                      <button type="button" data-satellite-constellation="RADARSAT"><strong>RADARSAT</strong><span data-satellite-constellation-count="RADARSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="KOMPSAT"><strong>KOMPSAT</strong><span data-satellite-constellation-count="KOMPSAT">0</span></button>
+                      <button type="button" data-satellite-constellation="SYNSPECTIVE"><strong>Synspective</strong><span data-satellite-constellation-count="SYNSPECTIVE">0</span></button>
+                      <button type="button" data-satellite-constellation="IQPS"><strong>iQPS</strong><span data-satellite-constellation-count="IQPS">0</span></button>
+                      <button type="button" data-satellite-constellation="AXELSPACE"><strong>Axelspace</strong><span data-satellite-constellation-count="AXELSPACE">0</span></button>
+                      <button type="button" data-satellite-constellation="PIXXEL"><strong>Pixxel</strong><span data-satellite-constellation-count="PIXXEL">0</span></button>
+                      <button type="button" data-satellite-constellation="SATELLOGIC"><strong>Satellogic</strong><span data-satellite-constellation-count="SATELLOGIC">0</span></button>
+                      <div class="satellite-constellation-heading">待核实</div>
+                      <button type="button" data-satellite-constellation="UNCLASSIFIED"><strong>未归入现有系列</strong><span data-satellite-constellation-count="UNCLASSIFIED">0</span></button>
+                    </div>
+                  </details>
+                </div>
+                <small id="satelliteConstellationStatus">单击一个系列可单独查看；按住 Ctrl 或 Shift 可组合多个系列，重复选择可取消。数量较多时可关闭名称或覆盖层以保持画面清晰。</small>
+                <small id="satellitePayloadStatus">等待载荷参数库</small>
+                </div>
+              </details>
+
+              <details class="satellite-control-section" open>
+                <summary><span>时间与参考系</span><small>控制模拟时刻、播放方向和参考系</small></summary>
+                <div class="satellite-control-body">
+                  <button id="satelliteDualClockToggle" type="button" aria-pressed="false">显示北京时间 / UTC</button>
+                  <div class="satellite-reference-panel">
+                    <span>动画参考系</span>
+                    <div class="satellite-reference-row segmented" role="group" aria-label="卫星轨道参考系">
+                      <button class="active" type="button" data-satellite-reference="earth-fixed" aria-pressed="true">地球固定</button>
+                      <button type="button" data-satellite-reference="inertial" aria-pressed="false">轨道固定</button>
+                    </div>
+                    <small id="satelliteReferenceStatus">地球不动，轨道与卫星相对地表运行</small>
+                  </div>
+                  <div class="satellite-time-panel">
+                    <label>
+                      <span>日历指定时刻（北京时间）</span>
+                      <input id="satelliteTimeInput" type="datetime-local" step="1" />
+                    </label>
+                    <button id="satelliteDateApplyButton" class="satellite-date-apply" type="button">加载该时刻根数</button>
+                    <details class="satellite-history-account">
+                      <summary>历史根数数据源账号</summary>
+                      <div>
+                        <label><span>Space-Track 账号</span><input id="satelliteHistoryIdentityInput" type="email" autocomplete="username" /></label>
+                        <label><span>Space-Track 密码</span><input id="satelliteHistoryPasswordInput" type="password" autocomplete="current-password" /></label>
+                        <small id="satelliteHistoryStatus">过去日期从 Space-Track GP_HISTORY 批量下载并保存本地；账号密码仅用于本次运行，不写入配置。</small>
+                      </div>
+                    </details>
+                    <div class="satellite-time-step-row">
+                      <button type="button" data-satellite-step="-86400">−1天</button>
+                      <button type="button" data-satellite-step="-3600">−1时</button>
+                      <button id="satelliteNowButton" type="button">现在</button>
+                      <button type="button" data-satellite-step="3600">+1时</button>
+                      <button type="button" data-satellite-step="86400">+1天</button>
+                    </div>
+                    <div class="satellite-playback-row">
+                      <button id="satelliteReverseButton" type="button" title="倒放" aria-label="倒放">◀</button>
+                      <button id="satellitePauseButton" class="active" type="button" title="暂停" aria-label="暂停">Ⅱ</button>
+                      <button id="satelliteForwardButton" type="button" title="正放" aria-label="正放">▶</button>
+                      <label><span>速率</span><select id="satelliteSpeedSelect">
+                        <option value="1">1×</option>
+                        <option value="10">10×</option>
+                        <option value="60" selected>60×</option>
+                        <option value="600">600×</option>
+                        <option value="3600">3600×</option>
+                        <option value="86400">1天/秒</option>
+                      </select></label>
+                    </div>
+                  </div>
+                  <div id="satelliteEpochStatus" class="satellite-epoch-status">等待卫星目录</div>
+                  <p class="control-note">“地球固定”便于观察星下点移动；“轨道固定”便于观察地球自转。日历时刻可使用当前缓存外推，加载历史根数则会向数据源请求所选日期附近的公开轨道根数。</p>
+                </div>
+              </details>
+            </div>
+            <label id="launchSiteFilterBox" class="field-box launch-site-filter" hidden>
+              <span>按发射场筛选</span>
+              <select id="launchSiteFilterSelect"></select>
+            </label>
+            <div id="launchFilterControls" class="launch-filter-controls" hidden>
+              <button id="launchNext7Button" type="button" aria-pressed="false">最近7天</button>
+            </div>
+            <div id="restrictionList" class="restriction-list"></div>
+          </section>
+        </aside>
+        <div class="tooltip" id="tooltip" hidden></div>
+      </main>
+    </div>
+
+    <script src="/deployment-config.js"></script>
+    <script src="/frontend/browser-saved-regions.js"></script>
+    <script src="/frontend/world-land.js?v=faa-map-84"></script>
+    <script src="/frontend/place-labels.js?v=place-labels-2"></script>
+    <script src="/node_modules/jszip/dist/jszip.min.js"></script>
+    <script src="/frontend/vendor/proj4.js?v=2.19.10"></script>
+    <script src="/frontend/kml-io.js?v=kml-io-1"></script>
+    <script src="/frontend/globe-camera.js?v=earth-camera-6"></script>
+    <script src="/frontend/ballistics.js?v=physics-13"></script>
+    <script src="/frontend/reentry-animation.js?v=reentry-animation-8"></script>
+    <script src="/frontend/trajectory-history.js?v=trajectory-history-1"></script>
+    <script src="/frontend/powered-path.js?v=powered-path-4"></script>
+    <script src="/frontend/satellite-commercial-imaging-catalog.js?v=commercial-imaging-3"></script>
+    <script src="/frontend/satellite-identities.js?v=satellite-identities-2"></script>
+    <script src="/frontend/satellite-payloads.js?v=satellite-payloads-13"></script>
+    <script src="/frontend/satellite-series.js?v=satellite-series-8"></script>
+    <script src="/frontend/satellite-element-input.js?v=satellite-element-input-1"></script>
+    <script src="/frontend/satellite-reference.js?v=satellite-reference-4"></script>
+    <script src="/frontend/satellite-orbit-policy.js?v=satellite-orbit-policy-5"></script>
+  <script src="/frontend/solar-lighting.js?v=solar-lighting-1"></script>
+  <script src="/frontend/performance-profile.js?v=performance-profile-3"></script>
+  <script src="/frontend/i18n-catalog-en.js?v=i18n-en-1"></script>
+    <script src="/frontend/i18n-reviewed-en.js?v=i18n-review-2"></script>
+    <script src="/frontend/i18n.js?v=i18n-runtime-3"></script>
+    <script src="/frontend/saved-regions.js?v=saved-regions-1"></script>
+    <script src="/frontend/app.js?v=polygon-audit-20260908-1"></script>
+  </body>
+</html>

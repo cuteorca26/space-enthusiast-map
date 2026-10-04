@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: space-enthusiast-map
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "10000"
+      - key: DATA_DIR
+        value: /app/data
+      - key: BALLISTIC_WORKERS
+        value: "1"
+      - key: CLOUD_TILE_CACHE_MAX_ITEMS
+        value: "64"
+      - key: CLOUD_DATASET_CACHE_MAX_ITEMS
+        value: "1"
+      - key: FAA_NOTAM_FIR_CONCURRENCY
+        value: "4"
+      - key: FAA_NOTAM_BROWSER_CONCURRENCY
+        value: "1"
+      - key: MSA_NAV_WARNING_DETAIL_CONCURRENCY
+        value: "3"
+      - key: NAVAREA_FETCH_CONCURRENCY
+        value: "2"

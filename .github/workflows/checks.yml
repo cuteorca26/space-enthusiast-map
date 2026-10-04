@@ -1,0 +1,32 @@
+name: Verify online deployment
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Build cloud image
+        run: docker build -t space-map:check .
+      - name: Check cloud startup
+        run: |
+          docker run -d --name space-map -p 10000:10000 space-map:check
+          trap 'docker logs space-map; docker rm -f space-map' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:10000/api/health; then
+              curl --fail --silent http://127.0.0.1:10000/ >/dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1

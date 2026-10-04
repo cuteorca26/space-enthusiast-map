@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+runtime
+logs
+.env
+.env.*
+.tools
+.publication
+dist
+data
+tests
+*.log
