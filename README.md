@@ -4,6 +4,8 @@
 
 这份副本已经适配在线托管，同时保留本地启动方式。原始使用说明见 [LOCAL_GUIDE.md](LOCAL_GUIDE.md)。
 
+**在线地图：[GitHub 在线入口](https://cuteorca26.github.io/space-enthusiast-map/) · [直接打开完整地图](https://space-enthusiast-map.onrender.com/)**
+
 ## 在线运行方式
 
 **GitHub 保存代码和发布访问入口；Render 运行 Node.js 后台和完整地图。**
@@ -25,7 +27,7 @@ GitHub Pages 不运行 Node.js 后台。把 `frontend/index.html` 直接上传�
 5. 部署完成后，打开 Render 提供的 `https://…onrender.com` 地址。
 6. 初次运行没有数据缓存，在“数据更新”中手动刷新需要的数据源。
 
-Docker 镜像包含 Linux Chromium，供 FAA 的浏览器模式使用；云图文件使用 Node.js 下载，不依赖 Windows PowerShell。Node.js 版本固定为 24 系列，依赖版本由锁文件固定。
+Docker 镜像包含 Linux Chromium，供 FAA 的浏览器模式使用，以及卫星目录下载需要的 curl；云图文件使用 Node.js 下载，不依赖 Windows PowerShell。Node.js 版本固定为 24 系列，依赖版本由锁文件固定。
 
 ### 3. 启用 GitHub 在线访问入口
 

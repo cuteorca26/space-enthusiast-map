@@ -3,7 +3,7 @@ ENV NODE_ENV=production HOST=0.0.0.0 PORT=10000 DATA_DIR=/app/data \
     FAA_NOTAM_BROWSER_EXECUTABLE=/usr/bin/chromium \
     BALLISTIC_WORKERS=1 CLOUD_TILE_CACHE_MAX_ITEMS=64 CLOUD_DATASET_CACHE_MAX_ITEMS=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium ca-certificates pciutils && rm -rf /var/lib/apt/lists/*
+    chromium ca-certificates curl pciutils && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force

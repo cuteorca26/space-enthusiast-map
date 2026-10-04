@@ -20,6 +20,7 @@ jobs:
         run: docker build -t space-map:check .
       - name: Check cloud startup
         run: |
+          docker run --rm --entrypoint curl space-map:check --version
           docker run -d --name space-map -p 10000:10000 space-map:check
           trap 'docker logs space-map; docker rm -f space-map' EXIT
           for attempt in $(seq 1 30); do
