@@ -16,6 +16,8 @@ GitHub Pages 不运行 Node.js 后台。把 `frontend/index.html` 直接上传�
 
 ### 2. 免费部署完整应用
 
+可使用 [本项目的 Render 部署入口](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2Fcuteorca26%2Fspace-enthusiast-map)，登录后检查实例为 **Free** 再部署。
+
 1. 登录 [Render](https://dashboard.render.com/)。
 2. 选择 **New → Blueprint**，关联这个 GitHub 仓库。
 3. Render 会读取仓库中的 `render.yaml`，创建名为 `space-enthusiast-map` 的 Docker Web Service。
