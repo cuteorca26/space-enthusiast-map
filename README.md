@@ -49,6 +49,8 @@ Docker 镜像包含 Linux Chromium，供 FAA 的浏览器模式使用，以及�
 - 卫星历史查询仍需要使用者自己的 Space-Track 账号。凭据只用于查询；不要提交到 GitHub 或放入 `APP_URL`。
 - 使用免费实例，不添加付费升级。本项目不会通过持续请求绕过平台休眠限制。
 
+当前服务通过公开仓库网址连接。后续更新代码后，请在 [Render 服务页](https://dashboard.render.com/web/srv-db1dm4c9v7es73f34jkg) 选择 **Manual Deploy → Deploy latest commit**。如需自动更新，先在 Render 连接自己的 GitHub 仓库账号；公开仓库网址连接本身不支持自动部署（[官方说明](https://render.com/docs/deploys)）。GitHub Pages 入口仍会自动发布。
+
 官方说明：[GitHub Pages](https://docs.github.com/en/pages/getting-started-with-github-pages/about-github-pages)、[Render 免费限制](https://render.com/docs/free)。
 
 ## 本地运行

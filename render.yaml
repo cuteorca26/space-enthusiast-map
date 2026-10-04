@@ -13,6 +13,8 @@ services:
         value: "10000"
       - key: DATA_DIR
         value: /app/data
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=320
       - key: BALLISTIC_WORKERS
         value: "1"
       - key: CLOUD_TILE_CACHE_MAX_ITEMS
