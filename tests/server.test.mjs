@@ -31,6 +31,11 @@ test('cloud-mode server starts and serves the complete app and API without local
   });
   const base = `http://127.0.0.1:${port}`;
   assert.equal((await fetch(`${base}/api/health`)).status, 200);
+  for (const path of ['/api/restrictions?status=1', '/api/satellites?status=1', '/api/msa-warnings?status=1']) {
+    const response = await fetch(base + path);
+    assert.equal(response.status, 200);
+    assert.ok(await response.json());
+  }
   const page = await (await fetch(`${base}/`)).text();
   assert.ok(page.includes('航天爱好者地图'));
   assert.ok(page.includes('/deployment-config.js'));

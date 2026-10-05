@@ -319,6 +319,9 @@ let satelliteRefreshStartedAt = "";
 let satelliteRefreshResult = null;
 const aggregateStatusMetadata = new Map();
 let satelliteStatusMetadata = null;
+let msaRefreshJob = null;
+let msaRefreshStartedAt = "";
+let msaRefreshResult = null;
 const hydropacCache = new Map();
 const hydropacInFlight = new Map();
 const hydropacHistoryCache = new Map();
@@ -377,7 +380,11 @@ const BALLISTIC_WORKER_COUNT = clampIntegerEnv(
 let ballisticWorkerPool = null;
 const memoryBudget = new MemoryBudgetQueue({
   enabled: onlineDeployment && process.env.MEMORY_BUDGET_MODE !== "0",
-  release: async () => {
+  release: releaseWorkingCaches,
+});
+const cachedReadBudget = new MemoryBudgetQueue({ enabled: memoryBudget.enabled, release: releaseWorkingCaches });
+
+async function releaseWorkingCaches() {
     for (const [key, cached] of aggregateCache) aggregateStatusMetadata.set(key, restrictionStatusMetadata(cached.data, key));
     if (satelliteCatalogService.memory) satelliteStatusMetadata = catalogStatusMetadata(satelliteCatalogService.memory);
     for (const cache of [aggregateCache, hydropacCache, hydropacHistoryCache, msaWarningCache,
@@ -387,8 +394,7 @@ const memoryBudget = new MemoryBudgetQueue({
     // Let the previous response and background result handlers finish first.
     await new Promise(resolve => setImmediate(resolve));
     globalThis.gc?.();
-  },
-});
+}
 
 class BallisticWorkerPool {
   constructor(size) {
@@ -486,10 +492,24 @@ const server = createServer(async (req, res) => {
     if (await handleSavedRegionsApi(req, res, url, savedRegionStore)) return;
     if (url.pathname.startsWith("/api/")) {
       const statusRequest = req.method === "GET" && (
-        (["/api/restrictions", "/api/satellites"].includes(url.pathname) && url.searchParams.get("status") === "1") ||
+        (["/api/restrictions", "/api/satellites", "/api/msa-warnings"].includes(url.pathname) && url.searchParams.get("status") === "1") ||
         url.pathname === "/api/satellites/history-status"
       );
-      await memoryBudget.run(statusRequest ? null : dataResourceGroup(url.pathname), () => handleApi(req, res, url), {
+      const backgroundStarter = memoryBudget.enabled && req.method === "GET" &&
+        ["/api/restrictions", "/api/satellites", "/api/msa-warnings"].includes(url.pathname) &&
+        url.searchParams.get("refresh") === "1" && url.searchParams.get("wait") !== "1";
+      const cachedRead = memoryBudget.enabled && req.method === "GET" && !statusRequest &&
+        url.searchParams.get("refresh") !== "1" &&
+        ["/api/restrictions", "/api/satellites", "/api/hydropac", "/api/msa-warnings", "/api/navarea-warnings", "/api/launches"].includes(url.pathname);
+      if (cachedRead) {
+        // Reading saved data stays available while a long refresh is running.
+        await cachedReadBudget.run(dataResourceGroup(url.pathname), async () => {
+          try { await handleApi(req, res, url); }
+          finally { memoryBudget.group = null; await releaseWorkingCaches(); }
+        }, { fresh: true });
+        return;
+      }
+      await memoryBudget.run(statusRequest || backgroundStarter ? null : dataResourceGroup(url.pathname), () => handleApi(req, res, url), {
         fresh: url.searchParams.get("refresh") === "1",
       });
       return;
@@ -566,8 +586,12 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/msa-warnings") {
+    if (url.searchParams.get("status") === "1") {
+      sendJson(res, 200, msaBackgroundStatus());
+      return;
+    }
     const refresh = url.searchParams.get("refresh") === "1";
-    const payload = await getMsaNavWarnings({ refresh });
+    const payload = await getMsaNavWarnings({ refresh, waitForRefresh: url.searchParams.get("wait") === "1" });
     sendJson(res, 200, payload);
     return;
   }
@@ -1365,10 +1389,11 @@ async function getRestrictions({ includeDetails, refresh, waitForRefresh, includ
   const cacheKey = restrictionsCacheKey({ includeDetails, includeGlobalNotams, includeTfr });
   if (refresh && !waitForRefresh) {
     const cachedForRefresh = readAggregateDiskCache(cacheKey, { allowExpired: true, allowStaleVersion: true });
-    if (cachedForRefresh) {
-      aggregateStatusMetadata.set(cacheKey, restrictionStatusMetadata(cachedForRefresh, cacheKey));
+    if (cachedForRefresh || memoryBudget.enabled) {
+      const payload = cachedForRefresh || await getRestrictions({ includeDetails, includeGlobalNotams, includeTfr, refresh: false });
+      aggregateStatusMetadata.set(cacheKey, restrictionStatusMetadata(payload, cacheKey));
       const started = startBackgroundRestrictionsRefresh(cacheKey, { includeDetails, includeGlobalNotams, includeTfr });
-      return withBackgroundRefreshStatus(cachedForRefresh, started ? "started" : "running");
+      return withBackgroundRefreshStatus(payload, started ? "started" : "running");
     }
   }
   const cached = aggregateCache.get(cacheKey);
@@ -3334,17 +3359,23 @@ function firstFiniteNumber(values) {
   return NaN;
 }
 
-async function getMsaNavWarnings({ refresh }) {
+async function getMsaNavWarnings({ refresh, waitForRefresh = false }) {
   const cacheKey = `v2:msa-nav-warning:pages:${MSA_NAV_WARNING_MAX_PAGES_PER_BUREAU}:lookback:${MSA_NAV_WARNING_LOOKBACK_DAYS}`;
   const cached = msaWarningCache.get(cacheKey);
-  if (!refresh && cached && cached.expiresAt > Date.now()) return cached.data;
+  if (refresh && memoryBudget.enabled && !waitForRefresh) {
+    const payload = cached?.data || readMsaNavWarningDiskCache(cacheKey, { allowExpired: true }) ||
+      emptyMarineCachePayload(cacheKey, "中国航警", "首次全量扫描尚未完成。");
+    startBackgroundMsaRefresh();
+    return withMsaBackgroundRefresh(payload);
+  }
+  if (!refresh && cached && cached.expiresAt > Date.now()) return withMsaBackgroundRefresh(cached.data);
   if (!refresh) {
     const diskCached = readMsaNavWarningDiskCache(cacheKey, { allowExpired: true });
     if (diskCached) {
       msaWarningCache.set(cacheKey, { expiresAt: Date.now() + CACHE_TTL_MS, data: diskCached });
-      return diskCached;
+      return withMsaBackgroundRefresh(diskCached);
     }
-    return emptyMarineCachePayload(cacheKey, "中国航警", "No saved China MSA navigational-warning cache is available. Use the refresh button to fetch it manually.");
+    return withMsaBackgroundRefresh(emptyMarineCachePayload(cacheKey, "中国航警", "No saved China MSA navigational-warning cache is available. Use the refresh button to fetch it manually."));
   }
   const inFlight = msaWarningInFlight.get(cacheKey);
   if (inFlight) return inFlight;
@@ -3360,6 +3391,41 @@ async function getMsaNavWarnings({ refresh }) {
     });
   msaWarningInFlight.set(cacheKey, request);
   return request;
+}
+
+function msaBackgroundStatus() {
+  return {
+    active: Boolean(msaRefreshJob),
+    status: msaRefreshJob ? (memoryBudget.activeGroup === "msa" ? "running" : "queued") : "idle",
+    startedAt: msaRefreshStartedAt,
+    elapsedMs: msaRefreshStartedAt ? Date.now() - Date.parse(msaRefreshStartedAt) : 0,
+    lastRefresh: msaRefreshResult,
+  };
+}
+
+function withMsaBackgroundRefresh(payload) {
+  if (!msaRefreshJob) return payload;
+  return { ...payload, source: { ...payload.source, backgroundRefresh: msaBackgroundStatus(),
+    message: "中国航警后台全量扫描中，完成后自动载入结果。" } };
+}
+
+function startBackgroundMsaRefresh() {
+  if (msaRefreshJob) return false;
+  msaRefreshStartedAt = new Date().toISOString();
+  msaRefreshResult = null;
+  msaRefreshJob = memoryBudget.run("msa", () => getMsaNavWarnings({ refresh: true, waitForRefresh: true }), { fresh: true })
+    .then(payload => {
+      msaRefreshResult = { status: payload?.source?.status === "ok" ? "success" : "error",
+        finishedAt: new Date().toISOString(), objectCount: payload?.restrictions?.length || 0,
+        message: payload?.source?.message || "中国航警扫描结束。" };
+    })
+    .catch(error => {
+      msaRefreshResult = { status: "error", finishedAt: new Date().toISOString(),
+        message: error instanceof Error ? error.message : String(error) };
+      console.warn("China MSA background refresh failed:", msaRefreshResult.message);
+    })
+    .finally(() => { msaRefreshJob = null; msaRefreshStartedAt = ""; });
+  return true;
 }
 
 function readMsaNavWarningDiskCache(cacheKey, options = {}) {

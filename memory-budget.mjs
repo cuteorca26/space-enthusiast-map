@@ -5,6 +5,7 @@ export class MemoryBudgetQueue {
     this.release = release;
     this.tail = Promise.resolve();
     this.group = null;
+    this.activeGroup = null;
   }
 
   run(group, operation, { fresh = false } = {}) {
@@ -12,7 +13,9 @@ export class MemoryBudgetQueue {
     const task = this.tail.then(async () => {
       if (fresh || this.group !== group) await this.release();
       this.group = group;
-      return operation();
+      this.activeGroup = group;
+      try { return await operation(); }
+      finally { this.activeGroup = null; }
     });
     this.tail = task.then(() => {}, () => {});
     return task;

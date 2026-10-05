@@ -343,6 +343,8 @@ let flatSatelliteRefineAt = 0;
 let flatSatelliteRefineTimer = 0;
 let activeLoadController = null;
 let faaRefreshPollTimer = null;
+let msaRefreshPollTimer = null;
+let msaRefreshPollFailures = 0;
 let cloudAutoRefreshTimer = null;
 let sunlightClockTimer = null;
 let pendingFaaRefresh = false;
@@ -2523,6 +2525,11 @@ async function loadMsaWarnings(refresh) {
     renderNotamIdSearchResults();
     applyFilters();
     const source = state.msaPayload.source || {};
+    if (source.backgroundRefresh?.active) {
+      updateMsaProgress("busy", "中国航警后台全量扫描中", "首次扫描可能需要较长时间，完成后自动载入结果。");
+      scheduleMsaRefreshPoll();
+      return;
+    }
     const progressState = source.status === "warn" ? "warn" : source.status === "empty" ? "muted" : "success";
     updateMsaProgress(
       progressState,
@@ -2543,7 +2550,41 @@ async function loadMsaWarnings(refresh) {
     updateMsaProgress("error", "中国航警获取失败", error.message);
   } finally {
     state.msaLoading = false;
+    if (els.msaFetchButton) els.msaFetchButton.disabled = Boolean(state.msaPayload?.source?.backgroundRefresh?.active);
+  }
+}
+
+function scheduleMsaRefreshPoll() {
+  if (msaRefreshPollTimer) return;
+  msaRefreshPollTimer = window.setTimeout(pollMsaRefreshStatus, 10000);
+}
+
+async function pollMsaRefreshStatus() {
+  msaRefreshPollTimer = null;
+  try {
+    const response = await fetch("/api/msa-warnings?status=1", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const status = await response.json();
+    msaRefreshPollFailures = 0;
+    if (status.active) {
+      updateMsaProgress("busy", status.status === "queued" ? "中国航警刷新已排队" : "中国航警后台全量扫描中",
+        `已等待 ${formatDurationSeconds(status.elapsedMs / 1000)}，完成后自动载入结果。`);
+      scheduleMsaRefreshPoll();
+      return;
+    }
+    if (state.msaPayload?.source) state.msaPayload.source.backgroundRefresh = { active: false };
     if (els.msaFetchButton) els.msaFetchButton.disabled = false;
+    if (status.lastRefresh?.status === "success") await loadMsaWarnings(false);
+    else updateMsaProgress("error", "中国航警后台刷新未完成", status.lastRefresh?.message || "任务状态已丢失，请重试刷新。");
+  } catch (error) {
+    if (++msaRefreshPollFailures < 12) {
+      updateMsaProgress("busy", "中国航警刷新状态暂时无法连接", "正在重新连接，已载入区域继续保留。");
+      scheduleMsaRefreshPoll();
+    } else {
+      if (state.msaPayload?.source) state.msaPayload.source.backgroundRefresh = { active: false };
+      if (els.msaFetchButton) els.msaFetchButton.disabled = false;
+      updateMsaProgress("error", "无法连接中国航警刷新服务", error.message);
+    }
   }
 }
 
@@ -5545,12 +5586,12 @@ function renderSourceStatus() {
     Boolean(notam.backgroundRefresh?.active) ||
     state.faaRestrictions.length > 0;
   els.sourceLine.textContent = notamUsable
-    ? `FAA NOTAM 已加载（获取：${notamFetchedLabel}）；HYDROPAC ${state.hydropacWarnings.length ? "已加载" : "未获取"}；发射预告 ${
+    ? `${notam.backgroundRefresh?.active ? "FAA NOTAM 刷新中" : "FAA NOTAM 已加载"}（获取：${notamFetchedLabel}）；HYDROPAC ${state.hydropacWarnings.length ? "已加载" : "未获取"}；发射预告 ${
         state.launchForecasts.length ? "已加载" : "未获取"
       }`
     : "FAA NOTAM 数据状态异常";
   if (notamUsable) {
-    els.sourceLine.textContent += `；中国航警 ${state.msaWarnings.length ? "已加载" : "未获取"}`;
+    els.sourceLine.textContent += `；中国航警 ${msa?.backgroundRefresh?.active ? "刷新中" : state.msaWarnings.length ? "已加载" : "未获取"}`;
     els.sourceLine.textContent += `；NAVAREA ${state.navareaWarnings.length ? "已加载" : "未获取"}`;
   }
   if (notamUsable) els.sourceLine.textContent += `；卫星云图 ${cloudSource?.status === "ok" ? "已加载" : "未获取"}`;
