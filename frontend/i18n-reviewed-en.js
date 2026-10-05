@@ -370,7 +370,7 @@
     "未来日期从": "Future dates use", "过去日期从": "Past dates use",
     "搜索始终覆盖完整目录": "Search always covers the entire catalog",
     "四类区域可独立显示。搜索和“新发布”“有图形”会共同筛选当前内容；“仅显示高亮”只保留 Shift 选中的区域。": "Toggle each area layer independently. Search, Recently issued, and With geometry filter the current content together. Show highlighted only keeps areas selected with Shift.",
-    "先选择数据源，再点击一个时间快照回放当时保存的内容。删除按钮只移除对应的本地快照，不会触发联网刷新。": "Choose a data source, then select a snapshot to replay its saved data. Delete removes only that local snapshot and does not start an online refresh.",
+    "先选择数据源，再点击一个时间快照回放当时保存的内容。删除按钮只移除对应的历史快照，不会触发联网刷新。": "Choose a data source, then select a snapshot to replay its saved data. Delete removes only that history snapshot and does not start an online refresh.",
     "三角标志、中文名称和发射预告圆环可以分别控制。隐藏地标时，对应圆环和数字也会一并隐藏。": "Site markers, names, and launch rings can be toggled independently. Hiding a site also hides its launch ring and count.",
     "打开总开关后，点击地图添加轨迹点；固定当前线后，地图点击不再改变它。按住 Shift 点击区域可多选高亮，再次点击取消；按住 Ctrl 点击区域可用黄色虚线查找同一北京时间窗口的跨数据源通告。": "Enable drawing to add track points on the map. Lock the track to prevent further edits. Shift-click areas to highlight or deselect them. Ctrl-click an area to outline warnings from all sources that share its Beijing-time window.",
     "支持点、线、面 KML/KMZ；批量粘贴支持十进制度和度分秒。": "Import KML/KMZ points, lines, and polygons. Pasted coordinates may use decimal degrees or degrees, minutes, and seconds.",
