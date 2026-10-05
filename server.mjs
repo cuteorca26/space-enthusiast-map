@@ -3714,8 +3714,8 @@ function parseMsaWarningListPage(html, column, pageUrl) {
       bureau: column.bureau,
       listUrl: pageUrl,
       url: absoluteMsaUrl(href),
-      title,
-      publishDateText,
+      title: ownText(title),
+      publishDateText: ownText(publishDateText),
       publishDate: parseMsaPublishDate(publishDateText),
     });
   }
@@ -3750,12 +3750,12 @@ function parseMsaWarningDetail(html, item) {
   const title = getHtmlMeta(source, "ArticleTitle") || item.title;
   const pubDate = getHtmlMeta(source, "PubDate") || item.publishDateText;
   const bureau = getHtmlMeta(source, "ContentSource") || item.bureau;
-  const warningId = extractMsaWarningId(`${title} ${source}`) || title;
+  const warningId = ownText(extractMsaWarningId(`${title} ${source}`) || title);
   const paragraphs = [...source.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)]
     .map((match) => stripHtml(match[1]).replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .filter((line) => !/收藏|打印本页|关闭窗口|下载PDF|分享到/.test(line));
-  const bodyText = paragraphs.join("\n") || stripHtml(source).replace(/\s+/g, " ").trim();
+  const bodyText = ownText(paragraphs.join("\n") || stripHtml(source).replace(/\s+/g, " ").trim());
   const publishIso = parseMsaPublishDate(pubDate);
   const schedule = parseMsaWarningSchedule(bodyText, publishIso);
   return {
@@ -3773,7 +3773,14 @@ function parseMsaWarningDetail(html, item) {
 
 function getHtmlMeta(html, name) {
   const pattern = new RegExp(`<meta\\s+name=["']${escapeRegExp(name)}["']\\s+content=["']([^"']*)["']`, "i");
-  return decodeEntities(String(html || "").match(pattern)?.[1] || "").trim() || null;
+  const value = decodeEntities(String(html || "").match(pattern)?.[1] || "").trim();
+  return value ? ownText(value) : null;
+}
+
+function ownText(value) {
+  // A short RegExp capture can otherwise keep an entire downloaded HTML page alive.
+  // UTF-16 copying preserves the original JavaScript string, including surrogates.
+  return Buffer.from(String(value || ""), "utf16le").toString("utf16le");
 }
 
 function extractMsaWarningId(text) {
@@ -11007,6 +11014,8 @@ function toDeg(value) {
 }
 
 export {
+  parseMsaWarningDetail,
+  parseMsaWarningListPage,
   recoverFaaNotamFirs,
   extractCoordinateSections,
   hasUnsupportedBoundaryInstruction,
