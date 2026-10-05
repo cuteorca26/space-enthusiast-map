@@ -15,6 +15,8 @@ services:
         value: /app/data
       - key: NODE_OPTIONS
         value: --max-old-space-size=320
+      - key: MEMORY_BUDGET_MODE
+        value: "1"
       - key: BALLISTIC_WORKERS
         value: "1"
       - key: CLOUD_TILE_CACHE_MAX_ITEMS

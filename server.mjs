@@ -28,6 +28,7 @@ import { chromium } from "playwright-core";
 import { SatelliteCatalogService } from "./satellite-catalog.mjs";
 import { SatelliteHistoryService } from "./satellite-history.mjs";
 import { readCloudDataset } from "./cloud-dataset.mjs";
+import { MemoryBudgetQueue, dataResourceGroup } from "./memory-budget.mjs";
 import { SavedRegionStore, handleSavedRegionsApi } from "./saved-regions.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -331,7 +332,7 @@ const cloudTileCache = new Map();
 const cloudDatasetCache = new Map();
 const cloudDatasetInFlight = new Map();
 const detailCache = new Map();
-const jsonResponseCache = new WeakMap();
+let jsonResponseCache = new WeakMap();
 let refreshHistoryIndexCache = null;
 let faaNotamNextRequestAt = 0;
 const CACHE_TTL_MS = 30 * 60 * 1000;
@@ -372,6 +373,18 @@ const BALLISTIC_WORKER_COUNT = clampIntegerEnv(
   8,
 );
 let ballisticWorkerPool = null;
+const memoryBudget = new MemoryBudgetQueue({
+  enabled: onlineDeployment && process.env.MEMORY_BUDGET_MODE !== "0",
+  release: async () => {
+    for (const cache of [aggregateCache, hydropacCache, hydropacHistoryCache, msaWarningCache,
+      navareaWarningCache, launchCache, cloudSatelliteCache, cloudTileCache, cloudDatasetCache, detailCache]) cache.clear();
+    satelliteCatalogService.memory = null;
+    jsonResponseCache = new WeakMap();
+    // Let the previous response and background result handlers finish first.
+    await new Promise(resolve => setImmediate(resolve));
+    globalThis.gc?.();
+  },
+});
 
 class BallisticWorkerPool {
   constructor(size) {
@@ -468,7 +481,9 @@ const server = createServer(async (req, res) => {
     }
     if (await handleSavedRegionsApi(req, res, url, savedRegionStore)) return;
     if (url.pathname.startsWith("/api/")) {
-      await handleApi(req, res, url);
+      await memoryBudget.run(dataResourceGroup(url.pathname), () => handleApi(req, res, url), {
+        fresh: url.searchParams.get("refresh") === "1",
+      });
       return;
     }
 
@@ -1440,7 +1455,7 @@ function startBackgroundRestrictionsRefresh(cacheKey, args) {
   if (aggregateInFlight.has(cacheKey)) return false;
   aggregateRefreshResults.delete(cacheKey);
   aggregateRefreshStartedAt.set(cacheKey, new Date().toISOString());
-  const request = buildRestrictionsPayload(args, cacheKey)
+  const request = memoryBudget.run("notam", () => buildRestrictionsPayload(args, cacheKey), { fresh: true })
     .then((data) => {
       const source = data?.sources?.faaNotamSearch || {};
       const success = source.status === "ok" && !source.cacheFallback;
@@ -2083,7 +2098,7 @@ function startBackgroundSatelliteRefresh() {
   if (satelliteRefreshJob) return false;
   satelliteRefreshResult = null;
   satelliteRefreshStartedAt = new Date().toISOString();
-  satelliteRefreshJob = refreshSatelliteCatalogAndPersist({ refresh: true })
+  satelliteRefreshJob = memoryBudget.run("satellite", () => refreshSatelliteCatalogAndPersist({ refresh: true }), { fresh: true })
     .then((payload) => {
       const source = payload?.source || {};
       const success = source.refreshCompleted === true && source.historySnapshotSaved !== false;
