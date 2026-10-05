@@ -79,9 +79,17 @@ test('a failed remote commit preserves the old backup; retry publishes the compl
   await rm(join(source, 'msa_nav_warning_snapshots/a.json'));
   await persistence.flush();
   await mkdir(join(target, 'msa_nav_warning_snapshots')); await writeFile(join(target, 'msa_nav_warning_snapshots/a.json'), 'stale');
-  const restored = createPublicDataPersistence({ directory: target, enabled: true, repository: 'owner/map', fetchImpl: fakeFetch });
+  const restoreFetch = (url, options = {}) => options.headers?.authorization === 'Bearer expired-test-only'
+    ? result({}, 401) : fakeFetch(url, options);
+  const restored = createPublicDataPersistence({ directory: target, enabled: true, repository: 'owner/map', token: 'expired-test-only', fetchImpl: restoreFetch });
   t.after(() => restored.close()); await restored.ready;
   assert.equal(await readFile(join(target, 'msa_nav_warning_cache.json'), 'utf8'), 'second');
   await assert.rejects(readFile(join(target, 'msa_nav_warning_snapshots/a.json')));
   assert.ok(restored.status().savedAt);
+  assert.equal(restored.status().error, false, 'Expired write tokens must not prevent public restores');
+  const committed = remote.body;
+  await writeFile(join(target, 'msa_nav_warning_cache.json'), 'uncommitted');
+  await restored.flush();
+  assert.equal(restored.status().error, true, 'Expired tokens must not authorize new backups');
+  assert.equal(remote.body, committed, 'An expired token must preserve the existing backup');
 });

@@ -161,7 +161,13 @@ export function createPublicDataPersistence({ directory, enabled = false, reposi
   async function api(path, options = {}) {
     const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'space-enthusiast-map', ...(options.headers || {}) };
     if (token) headers.authorization = `Bearer ${token}`;
-    const response = await fetchImpl(`${base}${path}`, { ...options, headers, signal: AbortSignal.timeout(options.upload ? 300000 : 30000) });
+    const perform = () => fetchImpl(`${base}${path}`, { ...options, headers, signal: AbortSignal.timeout(options.upload ? 300000 : 30000) });
+    let response = await perform();
+    if (options.publicRead && token && [401, 403].includes(response.status)) {
+      await response.body?.cancel();
+      delete headers.authorization;
+      response = await perform();
+    }
     if (!response.ok) { await response.body?.cancel(); const error = new Error(`GitHub data storage HTTP ${response.status}`); error.status = response.status; throw error; }
     return response.status === 204 ? null : response.json();
   }
@@ -172,7 +178,8 @@ export function createPublicDataPersistence({ directory, enabled = false, reposi
     } catch { return null; }
   }
   async function release(create = false) {
-    try { return await api(`/releases/tags/${TAG}`); }
+    // Public restores remain available when the write token expires or is revoked.
+    try { return await api(`/releases/tags/${TAG}`, { publicRead: !create }); }
     catch (error) {
       if (error.status !== 404 || !create) throw error;
       return api('/releases', { method: 'POST', headers: { 'content-type': 'application/json' },

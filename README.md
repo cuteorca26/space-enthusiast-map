@@ -21,7 +21,7 @@
 | 后台轨迹计算 | 十秒轨迹传播成功，NRLMSISE-00 大气模型正常运行 |
 | FAA 全球 NOTAM | 后续完整刷新成功，覆盖 329 个区域、11,607 条唯一通告；按刷新时间筛选后保存 11,317 条，其中 3,367 条可绘制边界 |
 | 中国海事局航警 | 16 个海事局、180 天完整回溯，扫描 6,766 个详情页；保存 500 条当前或未来航警，其中 103 条可绘制边界；来源错误和覆盖缺失均为零，首次扫描约 26 分钟 |
-| 管理员权限与长期保存 | 17 项测试通过；线上七类访客刷新请求及历史删除均返回 401，管理员登录、刷新和退出失效通过；实例启动已从 GitHub Release 恢复上述最新数据和五类历史，管理员新刷新也已成功写入长期备份 |
+| 管理员权限与长期保存 | 17 项测试通过；线上七类访客刷新请求及历史删除均返回 401，管理员登录、刷新和退出失效通过；重新部署后，管理员新刷新的 HYDROPAC 内容校验和、刷新时间及对应历史均一致，五类共享历史仍可读取 |
 
 通告正文无法可靠解析成边界时，保留文本记录并说明原因，不把参考点或不完整坐标粗略画成区域。FAA 刷新期间，已保存的海上通告与服务健康检查仍可读取；网页能够继续显示地球、云图和卫星轨道。测试覆盖管理员接口隔离、默认锁定、登录限流和退出失效，以及公开数据备份、校验恢复、排除私密文件、备份提交失败重试及历史删除同步；GitHub Actions 还会检查 Linux 容器构建与启动。
 
@@ -41,7 +41,7 @@ GitHub Pages 不运行 Node.js 后台。把 `frontend/index.html` 直接上传�
 
 启用长期保存时，已迁入升级前各数据源的最新缓存及对应五类最新历史。原免费实例重新部署后，一条更早的 NAVAREA 历史内容已不可读取，未能迁入；没有使用最新数据冒充旧快照。
 
-Render 的 Environment 需配置 `PUBLIC_DATA_REPOSITORY=cuteorca26/space-enthusiast-map` 和 `GITHUB_DATA_TOKEN`。令牌应为 Fine-grained token，仅选择这个仓库，权限只需 Contents 的 Read and write；不要上传到仓库或聊天。令牌到期或被撤销后，服务器保留当前缓存并显示备份未成功，需更新令牌。GitHub Releases 的单文件上限为 2 GiB，本程序在 1,900 MiB 压缩大小时停止上传并保留上一次完整备份（[官方说明](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)）。这是个人地图的数据发布方案，仍受平台使用规则和接口限制约束。
+Render 的 Environment 需配置 `PUBLIC_DATA_REPOSITORY=cuteorca26/space-enthusiast-map` 和 `GITHUB_DATA_TOKEN`。令牌应为 Fine-grained token，仅选择这个仓库，权限只需 Contents 的 Read and write；不要上传到仓库或聊天。令牌到期或被撤销后，服务器保留当前缓存并显示新备份未成功，需更新令牌；读取已有公开备份时会回退到公开访问，仍能恢复。GitHub Releases 的单文件上限为 2 GiB，本程序在 1,900 MiB 压缩大小时停止上传并保留上一次完整备份（[官方说明](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)）。这是个人地图的数据发布方案，仍受平台使用规则和接口限制约束。
 
 ### 1. 发布代码
 
