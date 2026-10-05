@@ -6642,3 +6642,16 @@ input[type="checkbox"] {
   }
 }
 
+.administrator-panel {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  margin-bottom: 14px;
+  border: 1px solid rgba(130, 180, 205, 0.35);
+  border-radius: 10px;
+  background: rgba(30, 55, 68, 0.28);
+}
+.administrator-panel[hidden], .administrator-panel [hidden], [data-admin-action][hidden] { display: none !important; }
+.administrator-panel form { display: grid; gap: 8px; }
+.administrator-panel input { width: 100%; min-width: 0; box-sizing: border-box; }
+.administrator-panel .control-note { margin: 0; }

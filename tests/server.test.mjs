@@ -15,7 +15,8 @@ test('cloud-mode server starts and serves the complete app and API without local
   await new Promise(resolve => portFinder.close(resolve));
   const data = await mkdtemp(join(tmpdir(), 'space-map-server-'));
   const child = spawn(process.execPath, ['server.mjs'], { cwd: root, windowsHide: true,
-    env: { ...process.env, HOST: '0.0.0.0', PORT: String(port), DATA_DIR: data, BALLISTIC_WORKERS: '1' } });
+    env: { ...process.env, HOST: '0.0.0.0', PORT: String(port), DATA_DIR: data, BALLISTIC_WORKERS: '1',
+      ADMIN_SECRET_SHA256: '', PUBLIC_DATA_REPOSITORY: '', GITHUB_DATA_TOKEN: '' } });
   let log = '';
   child.stdout.on('data', chunk => { log += chunk; });
   child.stderr.on('data', chunk => { log += chunk; });
@@ -31,6 +32,9 @@ test('cloud-mode server starts and serves the complete app and API without local
   });
   const base = `http://127.0.0.1:${port}`;
   assert.equal((await fetch(`${base}/api/health`)).status, 200);
+  assert.equal((await fetch(`${base}/api/msa-warnings?refresh=1`)).status, 401);
+  const missingLogin = await fetch(`${base}/api/admin/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"secret":"test"}' });
+  assert.equal(missingLogin.status, 503);
   for (const path of ['/api/restrictions?status=1', '/api/satellites?status=1', '/api/msa-warnings?status=1']) {
     const response = await fetch(base + path);
     assert.equal(response.status, 200);

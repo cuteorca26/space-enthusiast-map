@@ -1400,6 +1400,10 @@ window.addEventListener("app-language-change", () => {
   syncLayerButtons();
   scheduleDraw();
 });
+window.addEventListener('administrator-change', () => {
+  renderRefreshHistory();
+  window.MapAdministrator?.render();
+});
 
 async function init() {
   initializeAdaptivePerformanceProfile();
@@ -1637,7 +1641,9 @@ function startCloudAutoRefresh() {
   if (cloudAutoRefreshTimer) window.clearInterval(cloudAutoRefreshTimer);
   cloudAutoRefreshTimer = window.setInterval(() => {
     if (!state.cloudOverlayEnabled || state.cloudLoading || state.cloudSelectedSlot !== 0) return;
-    refreshLatestCloudSatellite();
+    // Online public data is refreshed explicitly by the administrator.
+    if (window.APP_DEPLOYMENT?.online) loadCloudSatellite(false);
+    else refreshLatestCloudSatellite();
   }, CLOUD_TIMELINE_REFRESH_INTERVAL_MS);
 }
 
@@ -2748,7 +2754,7 @@ function renderRefreshHistory() {
             <span>${escapeHtml(satelliteMeta || meta)}</span>
             <em>${escapeHtml(satelliteDetail || detail)}</em>
           </button>
-          <button class="history-delete" type="button" data-delete-history-id="${escapeHtml(item.id)}" data-delete-history-source="${escapeHtml(item.source)}" title="删除这条本地缓存" aria-label="删除 ${escapeHtml(title)}">删除</button>
+          ${window.MapAdministrator?.canManage() === false ? '' : `<button class="history-delete" type="button" data-delete-history-id="${escapeHtml(item.id)}" data-delete-history-source="${escapeHtml(item.source)}" title="删除这条服务器历史快照" aria-label="删除 ${escapeHtml(title)}">删除</button>`}
         </div>
       `;
     })

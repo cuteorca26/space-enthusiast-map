@@ -13,6 +13,8 @@ import {
 } from "node:fs";
 import { createServer, Agent as HttpAgent, get as httpGet } from "node:http";
 import { downloadCloudFile, publicFilePath, runtimeSettings, sameOriginWrite } from "./deployment.mjs";
+import { createAdminAccess, requiresAdministrator } from "./admin-access.mjs";
+import { createPublicDataPersistence } from "./public-data-persistence.mjs";
 import { Agent as HttpsAgent, get as httpsGet } from "node:https";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -37,6 +39,9 @@ const BALLISTIC_ENGINE = require("./frontend/ballistics.js");
 const { Geodesic } = require("geographiclib-geodesic");
 const execFileAsync = promisify(execFile);
 const { host, port, online: onlineDeployment, dataDirectory } = runtimeSettings(root);
+const administrator = createAdminAccess({ enabled: onlineDeployment, secretHash: process.env.ADMIN_SECRET_SHA256 });
+const publicDataPersistence = createPublicDataPersistence({ directory: dataDirectory, enabled: onlineDeployment,
+  repository: process.env.PUBLIC_DATA_REPOSITORY, token: process.env.GITHUB_DATA_TOKEN });
 const satelliteCatalogService = new SatelliteCatalogService(root, dataDirectory);
 const satelliteHistoryService = new SatelliteHistoryService(root, dataDirectory);
 const savedRegionStore = new SavedRegionStore(join(dataDirectory, "saved_regions.json"));
@@ -486,6 +491,12 @@ const server = createServer(async (req, res) => {
       sendJson(res, 403, { error: "cross_origin_write" });
       return;
     }
+    if (await administrator.handle(req, res, url, { sendJson, storageStatus: publicDataPersistence.status })) return;
+    if (onlineDeployment && requiresAdministrator(req.method, url) && administrator.reject(req, res, sendJson)) return;
+    if (onlineDeployment && requiresAdministrator(req.method, url) && publicDataPersistence.status().configured && !publicDataPersistence.status().writable) {
+      sendJson(res, 503, { error: 'long_term_storage_not_connected', message: '请先连接长期保存的写入凭据，再刷新或删除公共数据。' }); return;
+    }
+    if (url.pathname.startsWith('/api/') && !['/api/health', '/api/system-profile'].includes(url.pathname)) await publicDataPersistence.ready;
     if (onlineDeployment && url.pathname.startsWith("/api/saved-regions")) {
       sendJson(res, 409, { error: "Online saved regions use this browser's storage" });
       return;
@@ -581,7 +592,7 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/hydropac-history") {
     const date = url.searchParams.get("date");
     const refresh = url.searchParams.get("refresh") === "1";
-    const payload = await getHydropacHistoryForDate({ date, refresh });
+    const payload = await getHydropacHistoryForDate({ date, refresh, cacheOnly: onlineDeployment && !administrator.authenticated(req) });
     sendJson(res, 200, payload);
     return;
   }
@@ -624,7 +635,7 @@ async function handleApi(req, res, url) {
   if (req.method === "DELETE" && url.pathname === "/api/refresh-history/item") {
     const source = url.searchParams.get("source");
     const id = url.searchParams.get("id");
-    const deleted = deleteRefreshHistoryItem(source, id);
+    const deleted = await deleteRefreshHistoryItem(source, id);
     if (!deleted.ok) {
       sendJson(res, deleted.status || 400, { error: deleted.error || "history_delete_failed" });
       return;
@@ -2215,6 +2226,7 @@ function catalogStatusMetadata(data) {
 }
 
 function seedSatelliteSnapshotFromCurrentCache() {
+  if (onlineDeployment) return; // Public reads must not recreate an administrator-deleted snapshot.
   if (!existsSync(SATELLITE_CACHE_FILE)) return;
   try {
     const wrapped = JSON.parse(readFileSync(SATELLITE_CACHE_FILE, "utf8"));
@@ -2619,7 +2631,7 @@ function readRefreshHistoryItem(source, id) {
   }
 }
 
-function deleteRefreshHistoryItem(source, id) {
+async function deleteRefreshHistoryItem(source, id) {
   const normalized = String(source || "").toLowerCase();
   const safeId = String(id || "");
   if (!["notam", "hydropac", "msa", "navarea", "satellite"].includes(normalized) || !/^[\w.-]+\.json$/.test(safeId)) {
@@ -2660,6 +2672,17 @@ function deleteRefreshHistoryItem(source, id) {
       index.sources[normalized] = previousRecords;
       index.updatedAt = previousUpdatedAt;
       return { ok: false, status: 500, error: "history_index_persistence_failed" };
+    }
+    if (onlineDeployment && publicDataPersistence.status().configured) {
+      await publicDataPersistence.flush();
+      if (publicDataPersistence.status().error || !publicDataPersistence.status().writable) {
+        writeFileSync(filePath, fileContents);
+        index.sources[normalized] = previousRecords;
+        index.updatedAt = previousUpdatedAt;
+        writeRefreshHistoryIndex();
+        publicDataPersistence.schedule();
+        return { ok: false, status: 503, error: 'long_term_history_delete_failed' };
+      }
     }
     return { ok: true, source: normalized, id: safeId };
   } catch (error) {
@@ -3097,7 +3120,7 @@ async function buildHydropacPayload(cacheKey) {
   return displayData;
 }
 
-async function getHydropacHistoryForDate({ date, refresh }) {
+async function getHydropacHistoryForDate({ date, refresh, cacheOnly = false }) {
   const normalizedDate = normalizeHistoryDate(date);
   if (!normalizedDate) {
     return {
@@ -3115,6 +3138,15 @@ async function getHydropacHistoryForDate({ date, refresh }) {
   const inFlightKey = `${cacheKey}:${refresh ? "refresh" : "cache"}`;
   const cached = hydropacHistoryCache.get(inFlightKey);
   if (!refresh && cached && cached.expiresAt > Date.now()) return cached.data;
+  if (cacheOnly) {
+    const prefix = `hydropac_history_${normalizedDate.replaceAll('-', '')}_`;
+    const snapshots = existsSync(HYDROPAC_SNAPSHOT_DIR) ? readdirSync(HYDROPAC_SNAPSHOT_DIR).filter(name => name.startsWith(prefix) && /^[\w.-]+\.json$/.test(name)).sort().reverse() : [];
+    for (const id of snapshots) {
+      const snapshot = readRefreshHistoryItem('hydropac', id);
+      if (snapshot?.data?.historyDate === normalizedDate) return snapshot.data;
+    }
+    return { ...emptyMarineCachePayload(cacheKey, 'HYDROPAC 历史', '该日期没有服务器快照，请管理员先查询并保存。'), historyDate: normalizedDate };
+  }
   const inFlight = hydropacHistoryInFlight.get(inFlightKey);
   if (inFlight) return inFlight;
   const request = buildHydropacHistoryPayload(normalizedDate, { refresh }).finally(() => {
@@ -9947,6 +9979,8 @@ async function getCloudTimeline({ refresh = false } = {}) {
 
   const localCache = readGmgsiTimelineDiskCache();
   const localTimeline = localCache?.timeline?.length ? localCache.timeline : buildGmgsiTimelineFromCachedFiles();
+  // Public viewing uses the administrator's saved timeline, even when it is old.
+  if (onlineDeployment && !refresh) return normalizeGmgsiTimeline(localTimeline);
   const localCacheAgeMs = Date.now() - Date.parse(localCache?.savedAt || "");
   if (!refresh && Number.isFinite(localCacheAgeMs) && localCacheAgeMs <= GMGSI_TIMELINE_DISK_MAX_AGE_MS && isCurrentGmgsiTimeline(localTimeline)) {
     const timeline = normalizeGmgsiTimeline(localTimeline);

@@ -6,6 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 test('a slow maritime scan retries a disconnect, follows HTTP links, and publishes its complete result without blocking saved reads', async t => {
   const finder = createServer();
@@ -57,7 +58,8 @@ test('a slow maritime scan retries a disconnect, follows HTTP links, and publish
   `;
   const child = spawn(process.execPath, ['--expose-gc', '--input-type=module', '-e', script], {
     cwd: fileURLToPath(new URL('../', import.meta.url)), windowsHide: true,
-    env: { ...process.env, HOST: '0.0.0.0', PORT: String(port), DATA_DIR: data, MEMORY_BUDGET_MODE: '1' },
+    env: { ...process.env, HOST: '0.0.0.0', PORT: String(port), DATA_DIR: data, MEMORY_BUDGET_MODE: '1',
+      ADMIN_SECRET_SHA256: createHash('sha256').update('background-test-secret').digest('hex') },
   });
   let log = '';
   child.stdout.on('data', chunk => { log += chunk; });
@@ -73,8 +75,10 @@ test('a slow maritime scan retries a disconnect, follows HTTP links, and publish
     child.stdout.on('data', () => { if (log.includes('Serving Space Enthusiast Map')) { clearTimeout(timeout); resolve(); } });
   });
   const base = 'http://127.0.0.1:'+port;
+  const login = await (await fetch(base+'/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ secret: 'background-test-secret' }) })).json();
   const started = Date.now();
-  const response = await fetch(base+'/api/msa-warnings?refresh=1');
+  const response = await fetch(base+'/api/msa-warnings?refresh=1', { headers: { authorization: 'Bearer '+login.token } });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).source.backgroundRefresh.active, true);
   assert.ok(Date.now()-started < 1500, 'The API waited for the slow upstream source');

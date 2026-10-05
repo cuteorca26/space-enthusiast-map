@@ -7,6 +7,12 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     envVars:
+      - key: ADMIN_SECRET_SHA256
+        sync: false
+      - key: PUBLIC_DATA_REPOSITORY
+        value: cuteorca26/space-enthusiast-map
+      - key: GITHUB_DATA_TOKEN
+        sync: false
       - key: HOST
         value: 0.0.0.0
       - key: PORT

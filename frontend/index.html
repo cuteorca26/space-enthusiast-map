@@ -323,19 +323,30 @@
             <button type="button" data-panel-nav="right" data-panel-view-target="sources" aria-selected="false">数据更新</button>
           </nav>
           <section class="panel-section source-card panel-view-section" data-panel-view="sources" hidden>
+            <div id="administratorPanel" class="administrator-panel" hidden>
+              <strong id="administratorStatus">访客模式</strong>
+              <form id="administratorLoginForm">
+                <label for="administratorSecret">管理员口令</label>
+                <input id="administratorSecret" type="password" autocomplete="current-password" maxlength="128" required />
+                <button type="submit">管理员登录</button>
+              </form>
+              <button id="administratorLogout" type="button" hidden>退出管理员</button>
+              <p id="administratorMessage" class="control-note" role="status"></p>
+              <p id="serverStorageStatus" class="control-note" role="status"></p>
+            </div>
             <div class="section-title">
               <h2>数据源</h2>
               <span id="updatedAt">--</span>
             </div>
             <div class="source-action-grid">
-              <button id="notamSourceRefreshButton" class="source-refresh-button" type="button">刷新 NOTAM</button>
-              <button id="hydropacFetchButton" class="hydropac-fetch-button" type="button">刷新 HYDROPAC</button>
-              <button id="msaFetchButton" class="hydropac-fetch-button" type="button">刷新中国航警</button>
-              <button id="navareaFetchButton" class="hydropac-fetch-button" type="button">刷新 NAVAREA</button>
-              <button id="launchFetchButton" class="launch-fetch-button" type="button">刷新发射预告</button>
-              <button id="satelliteFetchButton" class="satellite-fetch-button" type="button">刷新卫星轨道</button>
+              <button id="notamSourceRefreshButton" data-admin-action class="source-refresh-button" type="button">刷新 NOTAM</button>
+              <button id="hydropacFetchButton" data-admin-action class="hydropac-fetch-button" type="button">刷新 HYDROPAC</button>
+              <button id="msaFetchButton" data-admin-action class="hydropac-fetch-button" type="button">刷新中国航警</button>
+              <button id="navareaFetchButton" data-admin-action class="hydropac-fetch-button" type="button">刷新 NAVAREA</button>
+              <button id="launchFetchButton" data-admin-action class="launch-fetch-button" type="button">刷新发射预告</button>
+              <button id="satelliteFetchButton" data-admin-action class="satellite-fetch-button" type="button">刷新卫星轨道</button>
             </div>
-            <p class="control-note">各数据源独立刷新，并在成功后保存本地快照。刷新期间可以继续缩放地图、筛选内容和播放既有动画；失败时仍保留上一次可用缓存。</p>
+            <p class="control-note">公共数据由管理员刷新，结果保存在服务器端供所有访客读取。刷新期间可以继续浏览已有数据；失败时保留上一次可用缓存。</p>
             <div id="refreshProgress" class="refresh-progress idle">
               <span class="spinner" aria-hidden="true"></span>
               <strong>数据就绪</strong>
@@ -375,7 +386,7 @@
                   <label><span>小时</span><select id="cloudHourSelect"></select></label>
                   <div class="cloud-date-time-actions">
                     <button id="cloudTimeApplyButton" type="button">应用时间</button>
-                    <button id="cloudLatestRefreshButton" type="button">刷新最新</button>
+                    <button id="cloudLatestRefreshButton" data-admin-action type="button">刷新最新</button>
                   </div>
                 </div>
                 <label class="cloud-time-slider-control">
@@ -807,6 +818,7 @@
     <script src="/frontend/i18n-reviewed-en.js?v=i18n-review-2"></script>
     <script src="/frontend/i18n.js?v=i18n-runtime-3"></script>
     <script src="/frontend/saved-regions.js?v=saved-regions-1"></script>
-    <script src="/frontend/app.js?v=polygon-audit-20260908-1"></script>
+    <script src="/frontend/admin-access.js?v=admin-1"></script>
+    <script src="/frontend/app.js?v=admin-1"></script>
   </body>
 </html>
