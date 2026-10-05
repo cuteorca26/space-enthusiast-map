@@ -317,6 +317,8 @@ const aggregateRefreshStartedAt = new Map();
 let satelliteRefreshJob = null;
 let satelliteRefreshStartedAt = "";
 let satelliteRefreshResult = null;
+const aggregateStatusMetadata = new Map();
+let satelliteStatusMetadata = null;
 const hydropacCache = new Map();
 const hydropacInFlight = new Map();
 const hydropacHistoryCache = new Map();
@@ -376,6 +378,8 @@ let ballisticWorkerPool = null;
 const memoryBudget = new MemoryBudgetQueue({
   enabled: onlineDeployment && process.env.MEMORY_BUDGET_MODE !== "0",
   release: async () => {
+    for (const [key, cached] of aggregateCache) aggregateStatusMetadata.set(key, restrictionStatusMetadata(cached.data, key));
+    if (satelliteCatalogService.memory) satelliteStatusMetadata = catalogStatusMetadata(satelliteCatalogService.memory);
     for (const cache of [aggregateCache, hydropacCache, hydropacHistoryCache, msaWarningCache,
       navareaWarningCache, launchCache, cloudSatelliteCache, cloudTileCache, cloudDatasetCache, detailCache]) cache.clear();
     satelliteCatalogService.memory = null;
@@ -481,7 +485,11 @@ const server = createServer(async (req, res) => {
     }
     if (await handleSavedRegionsApi(req, res, url, savedRegionStore)) return;
     if (url.pathname.startsWith("/api/")) {
-      await memoryBudget.run(dataResourceGroup(url.pathname), () => handleApi(req, res, url), {
+      const statusRequest = req.method === "GET" && (
+        (["/api/restrictions", "/api/satellites"].includes(url.pathname) && url.searchParams.get("status") === "1") ||
+        url.pathname === "/api/satellites/history-status"
+      );
+      await memoryBudget.run(statusRequest ? null : dataResourceGroup(url.pathname), () => handleApi(req, res, url), {
         fresh: url.searchParams.get("refresh") === "1",
       });
       return;
@@ -1358,6 +1366,7 @@ async function getRestrictions({ includeDetails, refresh, waitForRefresh, includ
   if (refresh && !waitForRefresh) {
     const cachedForRefresh = readAggregateDiskCache(cacheKey, { allowExpired: true, allowStaleVersion: true });
     if (cachedForRefresh) {
+      aggregateStatusMetadata.set(cacheKey, restrictionStatusMetadata(cachedForRefresh, cacheKey));
       const started = startBackgroundRestrictionsRefresh(cacheKey, { includeDetails, includeGlobalNotams, includeTfr });
       return withBackgroundRefreshStatus(cachedForRefresh, started ? "started" : "running");
     }
@@ -1412,20 +1421,12 @@ async function getRestrictions({ includeDetails, refresh, waitForRefresh, includ
 
 function getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr }) {
   const cacheKey = restrictionsCacheKey({ includeDetails, includeGlobalNotams, includeTfr });
-  const cached = aggregateCache.get(cacheKey)?.data || readAggregateDiskCache(cacheKey, { allowExpired: true, allowStaleVersion: true });
-  const source = cached?.sources?.faaNotamSearch || {};
-  const fetchedAt = source.fetchedAt || cached?.faaNotamFetchedAt || source.cacheSavedAt || cached?.cacheSavedAt || cached?.generatedAt || "";
+  const cached = aggregateCache.get(cacheKey)?.data || (!memoryBudget.enabled && readAggregateDiskCache(cacheKey, { allowExpired: true, allowStaleVersion: true }));
+  const metadata = cached ? restrictionStatusMetadata(cached, cacheKey) : aggregateStatusMetadata.get(cacheKey) || restrictionStatusMetadata(null, cacheKey);
   const refreshStartedAt = aggregateRefreshStartedAt.get(cacheKey) || "";
 
   return {
-    dataVersion: cached?.dataVersion || cacheKey,
-    restrictionsCount: cached?.restrictions?.length || 0,
-    generatedAt: cached?.generatedAt || "",
-    faaNotamFetchedAt: fetchedAt,
-    cacheSavedAt: cached?.cacheSavedAt || "",
-    sourceStatus: source.status || "unknown",
-    sourceMessage: source.message || "",
-    cacheFallback: Boolean(source.cacheFallback),
+    ...metadata,
     backgroundRefresh: {
       active: aggregateInFlight.has(cacheKey),
       status: aggregateInFlight.has(cacheKey) ? "running" : "idle",
@@ -1448,6 +1449,20 @@ function getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr
       publishOnlyWhenComplete: FAA_NOTAM_MAX_FAILED_FIRS === 0,
     },
     lastBackgroundRefresh: aggregateRefreshResults.get(cacheKey) || null,
+  };
+}
+
+function restrictionStatusMetadata(data, cacheKey) {
+  const source = data?.sources?.faaNotamSearch || {};
+  return {
+    dataVersion: ownText(data?.dataVersion || cacheKey),
+    restrictionsCount: data?.restrictions?.length || 0,
+    generatedAt: ownText(data?.generatedAt || ""),
+    faaNotamFetchedAt: ownText(source.fetchedAt || data?.faaNotamFetchedAt || source.cacheSavedAt || data?.cacheSavedAt || data?.generatedAt || ""),
+    cacheSavedAt: ownText(data?.cacheSavedAt || ""),
+    sourceStatus: ownText(source.status || "unknown"),
+    sourceMessage: ownText(source.message || ""),
+    cacheFallback: Boolean(source.cacheFallback),
   };
 }
 
@@ -2152,17 +2167,24 @@ function withBackgroundSatelliteRefresh(payload, status) {
 }
 
 async function getSatelliteRefreshStatus() {
-  const cached = await satelliteCatalogService.getCatalog({ refresh: false });
+  const cached = memoryBudget.enabled ? satelliteCatalogService.memory : await satelliteCatalogService.getCatalog({ refresh: false });
+  const metadata = cached ? catalogStatusMetadata(cached) : satelliteStatusMetadata || catalogStatusMetadata(null);
   const startedAt = satelliteRefreshStartedAt;
   return {
     active: Boolean(satelliteRefreshJob),
     status: satelliteRefreshJob ? "running" : "idle",
     startedAt,
     elapsedMs: startedAt ? Math.max(0, Date.now() - Date.parse(startedAt)) : 0,
-    cachedObjectCount: Array.isArray(cached?.satellites) ? cached.satellites.length : 0,
-    cacheSavedAt: cached?.cacheSavedAt || cached?.source?.fetchedAt || "",
-    dataVersion: cached?.dataVersion || "",
+    ...metadata,
     lastRefresh: satelliteRefreshResult,
+  };
+}
+
+function catalogStatusMetadata(data) {
+  return {
+    cachedObjectCount: data?.satellites?.length || 0,
+    cacheSavedAt: ownText(data?.cacheSavedAt || data?.source?.fetchedAt || ""),
+    dataVersion: ownText(data?.dataVersion || ""),
   };
 }
 
