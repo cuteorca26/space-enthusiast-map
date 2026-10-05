@@ -11,7 +11,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, Agent as HttpAgent, get as httpGet } from "node:http";
 import { downloadCloudFile, publicFilePath, runtimeSettings, sameOriginWrite } from "./deployment.mjs";
 import { Agent as HttpsAgent, get as httpsGet } from "node:https";
 import { execFile } from "node:child_process";
@@ -371,6 +371,7 @@ const GMGSI_TIMELINE_CACHE_FILE = join(dataDirectory, "cloud_cache", "gmgsi_time
 const REFRESH_HISTORY_INDEX_FILE = join(dataDirectory, "refresh_history_index.json");
 let nrlmsiseRuntimePromise = null;
 const msaHttpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: MSA_NAV_WARNING_DETAIL_CONCURRENCY });
+const msaHttpAgent = new HttpAgent({ keepAlive: true, maxSockets: MSA_NAV_WARNING_DETAIL_CONCURRENCY });
 const BALLISTIC_WORKER_COUNT = clampIntegerEnv(
   "BALLISTIC_WORKERS",
   Math.min(6, Math.max(1, availableParallelism())),
@@ -10886,20 +10887,35 @@ async function fetchTextOfficial(url, timeoutMs = 15000) {
 }
 
 async function fetchMsaText(url, timeoutMs = 15000) {
-  try {
-    return await fetchMsaTextViaHttps(url, timeoutMs);
-  } catch (error) {
-    if (process.platform !== "win32") throw error;
-    return fetchMsaTextViaPowerShell(url, timeoutMs);
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await fetchMsaTextViaHttp(url, timeoutMs);
+    } catch (error) {
+      lastError = error;
+      const message = describeMsaFetchError(error);
+      if (attempt === 2 || !/ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|timed out|socket hang up|HTTP (?:429|500|502|503|504)\b/i.test(message)) break;
+      await sleep(1000 * (attempt + 1));
+    }
   }
+  if (process.platform === "win32") return fetchMsaTextViaPowerShell(url, timeoutMs);
+  throw new Error(`China MSA request failed for ${url}: ${describeMsaFetchError(lastError)}`);
 }
 
-function fetchMsaTextViaHttps(url, timeoutMs = 15000, redirectCount = 0) {
+function describeMsaFetchError(error) {
+  const nested = Array.isArray(error?.errors) ? error.errors.map(describeMsaFetchError).filter(Boolean) : [];
+  return [error?.code, error?.message, ...nested].filter(Boolean).join("; ") || String(error);
+}
+
+function fetchMsaTextViaHttp(url, timeoutMs = 15000, redirectCount = 0) {
   return new Promise((resolve, reject) => {
-    const request = httpsGet(
+    const protocol = new URL(url).protocol;
+    if (protocol !== "https:" && protocol !== "http:") throw new Error(`Unsupported China MSA URL protocol: ${protocol}`);
+    const get = protocol === "https:" ? httpsGet : httpGet;
+    const request = get(
       url,
       {
-        agent: msaHttpsAgent,
+        agent: protocol === "https:" ? msaHttpsAgent : msaHttpAgent,
         headers: {
           accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "accept-language": "zh-CN,zh;q=0.9",
@@ -10911,12 +10927,14 @@ function fetchMsaTextViaHttps(url, timeoutMs = 15000, redirectCount = 0) {
       (response) => {
         const status = Number(response.statusCode || 0);
         if (status >= 300 && status < 400 && response.headers.location && redirectCount < 5) {
+          clearTimeout(timeout);
           response.resume();
           const nextUrl = new URL(response.headers.location, url).href;
-          fetchMsaTextViaHttps(nextUrl, timeoutMs, redirectCount + 1).then(resolve, reject);
+          fetchMsaTextViaHttp(nextUrl, timeoutMs, redirectCount + 1).then(resolve, reject);
           return;
         }
         if (status < 200 || status >= 300) {
+          clearTimeout(timeout);
           response.resume();
           reject(new Error(`HTTP ${status} for ${url}`));
           return;
@@ -10931,12 +10949,12 @@ function fetchMsaTextViaHttps(url, timeoutMs = 15000, redirectCount = 0) {
           }
           chunks.push(chunk);
         });
-        response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-        response.on("error", reject);
+        response.on("end", () => { clearTimeout(timeout); resolve(Buffer.concat(chunks).toString("utf8")); });
+        response.on("error", error => { clearTimeout(timeout); reject(error); });
       },
     );
-    request.setTimeout(timeoutMs, () => request.destroy(new Error(`China MSA request timed out for ${url}`)));
-    request.on("error", reject);
+    const timeout = setTimeout(() => request.destroy(new Error(`China MSA request timed out for ${url}`)), timeoutMs);
+    request.on("error", error => { clearTimeout(timeout); reject(error); });
   });
 }
 

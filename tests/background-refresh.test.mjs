@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-test('a slow maritime scan acknowledges immediately, keeps saved reads available, and publishes its complete result', async t => {
+test('a slow maritime scan retries a disconnect, follows HTTP links, and publishes its complete result without blocking saved reads', async t => {
   const finder = createServer();
   await new Promise(resolve => finder.listen(0, '127.0.0.1', resolve));
   const port = finder.address().port;
@@ -15,26 +15,42 @@ test('a slow maritime scan acknowledges immediately, keeps saved reads available
   const data = await mkdtemp(join(tmpdir(), 'space-background-test-'));
   const script = `
     import https from 'node:https';
+    import http from 'node:http';
     import { EventEmitter } from 'node:events';
     import { Readable } from 'node:stream';
     import { syncBuiltinESMExports } from 'node:module';
     import { fileURLToPath } from 'node:url';
     const date = new Date().toISOString().slice(0,10);
     const index = '<li class="nav_lv2_list"><a href="https://www.msa.gov.cn/test/index.jhtml"><div class="nav_lv2_text">上海海事局</div></a></li>'+
-      '<a href="https://www.msa.gov.cn/notice.jhtml"><span class="name">CNSEA10000/26 航警</span><span class="time">'+date+'</span></a>';
+      '<a href="http://www.msa.gov.cn/notice.jhtml"><span class="name">CNSEA10000/26 航警</span><span class="time">'+date+'</span></a>';
     const detail = '<meta name="ArticleTitle" content="CNSEA10000/26 航警"><meta name="PubDate" content="'+date+'"><meta name="ContentSource" content="上海海事局">'+
       '<p>航警区域 300000N 1100000E 300000N 1110000E 310000N 1110000E。SFC-UNL.</p>';
-    https.get = (url, options, callback) => {
+    let firstRequest = true;
+    const mockGet = protocol => (url, options, callback) => {
+      if (!String(url).startsWith(protocol)) throw new Error('The source link used the wrong HTTP transport');
+      if (options.agent.protocol !== protocol) throw new Error('The source link used the wrong HTTP agent');
       const request = new EventEmitter();
       request.setTimeout = () => request;
       request.destroy = error => request.emit('error', error);
+      if (firstRequest) {
+        firstRequest = false;
+        const connection = Object.assign(new Error('connection reset'), {code:'ECONNRESET'});
+        setTimeout(() => request.emit('error', new AggregateError([connection], '')), 10);
+        return request;
+      }
       setTimeout(() => {
         const response = Readable.from([Buffer.from(String(url).includes('notice.jhtml') ? detail : index)]);
         response.statusCode = 200; response.headers = {};
+        if (String(url).includes('94df14ce1110415da44e67593e76619f')) {
+          response.statusCode = 302;
+          response.headers.location = 'http://www.msa.gov.cn/start/index.jhtml';
+        }
         callback(response);
       }, 1500);
       return request;
     };
+    https.get = mockGet('https:');
+    http.get = mockGet('http:');
     syncBuiltinESMExports();
     process.argv[1] = fileURLToPath(new URL('./server.mjs', import.meta.url));
     await import('./server.mjs');
@@ -67,7 +83,7 @@ test('a slow maritime scan acknowledges immediately, keeps saved reads available
   assert.equal((await fetch(base+'/api/health')).status, 200);
   assert.equal((await fetch(base+'/api/restrictions?details=0&tfr=0')).status, 200);
   let complete;
-  for (let i=0; i<60; i++) {
+  for (let i=0; i<150; i++) {
     complete = await (await fetch(base+'/api/msa-warnings?status=1')).json();
     if (!complete.active) break;
     await new Promise(resolve => setTimeout(resolve, 100));
