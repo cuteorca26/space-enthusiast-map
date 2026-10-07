@@ -2473,7 +2473,7 @@ async function loadHydropac(refresh) {
     const response = await fetch(`/api/hydropac${refresh ? "?refresh=1" : ""}`, { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.hydropacPayload = await response.json();
-    state.hydropacWarnings = (state.hydropacPayload.restrictions || []).map(enrichRestriction);
+    state.hydropacWarnings = marineDisplayRecords(state.hydropacPayload, "hydropac").map(enrichRestriction);
     syncCombinedRestrictions();
     renderSourceStatus();
     renderFilters();
@@ -2603,14 +2603,14 @@ async function loadNavareaWarnings(refresh) {
   updateNavareaProgress(
     "loading",
     refresh ? "正在刷新 NAVAREA" : "正在载入 NAVAREA 本地缓存",
-    refresh ? "连接 NAVAREA I/II/IV/VIII/XI/XII/XIII 航行警告源" : "启动时不会联网刷新",
+    refresh ? "连接 NAVAREA I–XXI 航行警告源" : "启动时不会联网刷新",
   );
   if (els.navareaFetchButton) els.navareaFetchButton.disabled = true;
   try {
     const response = await fetch(`/api/navarea-warnings${refresh ? "?refresh=1" : ""}`, { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.navareaPayload = await response.json();
-    state.navareaWarnings = (state.navareaPayload.restrictions || []).map(enrichRestriction);
+    state.navareaWarnings = marineDisplayRecords(state.navareaPayload, "navarea").map(enrichRestriction);
     syncCombinedRestrictions();
     renderSourceStatus();
     renderFilters();
@@ -2826,7 +2826,7 @@ function applyRefreshHistorySnapshot(snapshot) {
     state.detailMode = "notam";
   } else if (source === "hydropac") {
     state.hydropacPayload = data;
-    state.hydropacWarnings = (data.restrictions || []).map(enrichRestriction);
+    state.hydropacWarnings = marineDisplayRecords(data, "hydropac").map(enrichRestriction);
     state.detailMode = "hydropac";
     state.hydropacEnabled = true;
     syncSourceToggleButton(els.hydropacToggle, state.hydropacEnabled);
@@ -2844,7 +2844,7 @@ function applyRefreshHistorySnapshot(snapshot) {
     state.detailMode = "msa";
   } else if (source === "navarea") {
     state.navareaPayload = data;
-    state.navareaWarnings = (data.restrictions || []).map(enrichRestriction);
+    state.navareaWarnings = marineDisplayRecords(data, "navarea").map(enrichRestriction);
     state.detailMode = "navarea";
   } else if (source === "satellite") {
     state.satellitePayload = data;
@@ -5615,7 +5615,7 @@ function renderSourceStatus() {
     </div>
     <div class="source-row ${navarea?.status === "ok" ? "ok" : navarea?.status === "error" ? "error" : "muted"}">
       <strong>NAVAREA 航行警告</strong>
-      <span>${escapeHtml(navarea?.message || "独立读取 NAVAREA I / II / IV / VIII / XI / XII / XIII 活动航行警告。")}</span>
+      <span>${escapeHtml(navarea?.message || "独立读取 NAVAREA I–XXI 活动航行警告。")}</span>
     </div>
     <div class="source-row ${launchSource?.status === "ok" ? "ok" : launchSource?.status === "error" ? "error" : launchSource?.status === "warn" ? "warn" : "muted"}">
       <strong>火箭发射预告</strong>
@@ -21358,7 +21358,7 @@ function updateMsaProgress(status = "idle", message = "中国航警未获取", d
   `;
 }
 
-function updateNavareaProgress(status = "idle", message = "NAVAREA 未获取", detail = "I / II / IV / VIII / XI / XII / XIII 航行警告") {
+function updateNavareaProgress(status = "idle", message = "NAVAREA 未获取", detail = "I–XXI 共 21 个海区的航行警告") {
   if (!els.navareaProgress) return;
   const allowed = new Set(["idle", "loading", "busy", "success", "error"]);
   const normalized = allowed.has(status) ? status : "idle";
