@@ -71,7 +71,7 @@ const scheduledRefresh = createScheduledRefresh({ directory: dataDirectory, enab
   },
   afterApply: async () => {
     refreshHistoryIndexCache = null;
-    aggregateCache.clear(); hydropacCache.clear(); navareaWarningCache.clear();
+    aggregateCache.clear(); hydropacCache.clear(); navareaWarningCache.clear(); msaWarningCache.clear();
     publicDataPersistence.schedule();
     if (publicDataPersistence.status().writable) await publicDataPersistence.flush();
   },
@@ -11332,6 +11332,11 @@ function fetchMsaTextViaHttp(url, timeoutMs = 15000, redirectCount = 0) {
       url,
       {
         agent: protocol === "https:" ? msaHttpsAgent : msaHttpAgent,
+        // Overseas TCP handshakes can outlast Node's short per-address default.
+        // Retain DNS failover and the overall deadline while allowing each
+        // address time to connect; never pin an IP or weaken TLS verification.
+        autoSelectFamily: true,
+        autoSelectFamilyAttemptTimeout: Math.min(10000, timeoutMs),
         headers: {
           accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "accept-language": "zh-CN,zh;q=0.9",
