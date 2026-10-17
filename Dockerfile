@@ -9,6 +9,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY --chown=node:node . .
+ARG BUILD_PUBLIC_DATA_REPOSITORY=cuteorca26/space-enthusiast-map
+RUN node --max-old-space-size=2048 scripts/prepare-cloud-history.mjs
 RUN mkdir -p /app/data && chown node:node /app/data
 USER node
 EXPOSE 10000

@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readStreamedNotamResponse, migrateCachedNotamParseResults, filterPayloadToReferenceTime, prepareAggregateCacheMetadata } from '../server.mjs';
+import { streamNotamResponse } from '../streamed-notam-history.mjs';
 const fixtures = JSON.parse(readFileSync(new URL('fixtures/boundary-regressions.json', import.meta.url)));
 const referenceTime = '2026-10-05T00:00:00.000Z';
 function normalize(value) {
@@ -12,6 +13,29 @@ function normalize(value) {
   if (data.faaNotamParseMigration) delete data.faaNotamParseMigration.appliedAt;
   return value;
 }
+
+test('prepared responses work across machines only for identical source content and parser rules', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'space-prepared-test-'));
+  try {
+    const path = join(root, 'source.json'), relocated = join(root, 'restored.json'), prepared = join(root, 'build');
+    mkdirSync(prepared);
+    writeFileSync(path, JSON.stringify({ savedAt: referenceTime, data: { restrictions: [{ id: 'a', rawText: 'original text' }] } }));
+    const options = { path, directory: join(root, 'cache'), version: 'rules-1', id: 'same-history.json', rules: {
+      migrate: migrateCachedNotamParseResults, filter: (data, time, mode) => filterPayloadToReferenceTime('notam', data, time, mode),
+      reference: wrapped => wrapped.savedAt, filters: () => ({}), summaryVersion: 'test',
+    } };
+    const first = await streamNotamResponse(options), name = first.filePath.split(/[\\/]/).at(-1);
+    copyFileSync(path, relocated); copyFileSync(first.filePath, join(prepared, name));
+    copyFileSync(first.filePath.replace(/\.json$/, '.meta.json'), join(prepared, name.replace(/\.json$/, '.meta.json')));
+    const restored = { ...options, path: relocated, directory: join(root, 'runtime'), rules: { preparedDirectory: prepared, migrate: () => { throw new Error('must reparse'); } } };
+    const hit = await streamNotamResponse(restored);
+    assert.deepEqual(readFileSync(hit.filePath), readFileSync(first.filePath));
+    assert.equal(hit.filePath, join(prepared, name));
+    await assert.rejects(streamNotamResponse({ ...restored, version: 'rules-2', rules: { ...restored.rules, reference: () => referenceTime } }), /must reparse/);
+    writeFileSync(relocated, JSON.stringify({ savedAt: referenceTime, data: { restrictions: [{ id: 'changed' }] } }));
+    await assert.rejects(streamNotamResponse({ ...restored, rules: { ...restored.rules, reference: () => referenceTime } }), /must reparse/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 for (const migrated of [false, true]) for (const skipped of [false, true]) {
   test(`streamed NOTAM keeps every geometry, field and filter (current parser=${migrated}, skipped=${skipped})`, async () => {
     const root = mkdtempSync(join(tmpdir(), 'space-stream-test-'));

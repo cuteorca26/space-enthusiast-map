@@ -13,7 +13,7 @@ import { fileRevision } from './history-derived-cache.mjs';
 // Only our own saved snapshots enter this parser. Keep one notice in memory,
 // using exactly the same geometry and time rules as the ordinary history path.
 export async function readNotamMetadata(path) {
-  const input = chain([createReadStream(path), parser(), replace({
+  const input = chain([createReadStream(path), parser({ streamKeys: false, streamStrings: false, streamNumbers: false }), replace({
     filter: /^(data\.)?(restrictions|skipped)$/, replacement: [{ name: 'startArray' }, { name: 'endArray' }],
   }), streamValues()]);
   for await (const { value } of input) return value;
@@ -21,7 +21,7 @@ export async function readNotamMetadata(path) {
 }
 
 async function* rows(path, prefix, field) {
-  const input = chain([createReadStream(path), parser(), pick({
+  const input = chain([createReadStream(path), parser({ streamKeys: false, streamStrings: false, streamNumbers: false }), pick({
     filter: new RegExp(`^${prefix}${field}\\.\\d+$`),
   }), streamValues()]);
   for await (const { value } of input) yield value;
@@ -46,9 +46,17 @@ function rowWriter(path) {
 export async function streamNotamResponse({ path, directory, version, id, current = false, cacheKey, rules }) {
   mkdirSync(directory, { recursive: true });
   const revision = fileRevision(path);
-  const key = createHash('sha256').update(`${version}:${path}:${revision}:${id}:${current}:${cacheKey || ''}`).digest('hex');
+  // A content identity also lets deployment builds prepare the same exact
+  // response on a larger CPU. File paths/inodes differ between build and server.
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  if (fileRevision(path) !== revision) throw new Error('NOTAM snapshot changed during reading; please retry');
+  const key = createHash('sha256').update(`${version}:${hash.digest('hex')}:${id}:${current}:${cacheKey || ''}`).digest('hex');
   const filePath = join(directory, `${key}.json`), metaPath = join(directory, `${key}.meta.json`);
   if (existsSync(filePath) && existsSync(metaPath)) return { filePath, ...JSON.parse(readFileSync(metaPath, 'utf8')) };
+  const prepared = rules.preparedDirectory && join(rules.preparedDirectory, `${key}.json`);
+  if (prepared && existsSync(prepared) && existsSync(prepared.replace(/\.json$/, '.meta.json')))
+    return { filePath: prepared, ...JSON.parse(readFileSync(prepared.replace(/\.json$/, '.meta.json'), 'utf8')) };
   const wrapped = await readNotamMetadata(path);
   let data = wrapped.data || wrapped;
   if (current) {

@@ -7,6 +7,7 @@ logs/
 .tools/
 .publication/
 dist/
+prepared_history_v1/
 *.log
 data/*
 !data/reference/

@@ -8,6 +8,7 @@ logs
 .tools
 .publication
 dist
+prepared_history_v1
 data
 tests
 *.log

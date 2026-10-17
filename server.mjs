@@ -1729,7 +1729,8 @@ async function readStreamedNotamResponse({ path, id, current = false, cacheKey }
     rules: { migrate: migrateCachedNotamParseResults,
       filter: (data, time, mode) => filterPayloadToReferenceTime('notam', data, time, mode),
       reference: (wrapped, data) => refreshHistoryReferenceTime('notam', wrapped, data),
-      prepareCache: prepareAggregateCacheMetadata, filters: buildFilters, summaryVersion: refreshHistorySummaryParseVersion('notam') },
+      prepareCache: prepareAggregateCacheMetadata, filters: buildFilters, summaryVersion: refreshHistorySummaryParseVersion('notam'),
+      preparedDirectory: join(root, 'prepared_history_v1') },
   });
 }
 
@@ -11530,7 +11531,7 @@ function toDeg(value) {
 }
 
 export {
-  readStreamedNotamResponse, prepareAggregateCacheMetadata,
+  readStreamedNotamResponse, prepareAggregateCacheMetadata, restrictionsCacheKey,
   refreshHistorySummaryParseVersion,
   readSnapshotSummary, readRefreshHistoryItem, historyItemFilePath, buildRefreshHistoryListAsync, readRefreshHistoryResponse,
   loadGmgsiDataset, readGmgsiDatasetFile, renderGmgsiTile, renderGmgsiGlobeTexture, renderCloudImageInWorker, closePerformanceWorkers,
