@@ -9,8 +9,10 @@
       if (!response.ok) throw new Error('status unavailable');
       const status = await response.json();
       const text = document.getElementById('scheduledRefreshStatus');
+      const labels = { notam: 'NOTAM', hydropac: 'HYDROPAC', navarea: 'NAVAREA' };
+      const missing = status.lastRunAt ? status.sources.filter(source => !status.lastSources.includes(source)) : [];
       if (text) text.textContent = status.enabled
-        ? `${status.schedule}自动全量刷新 NOTAM、NAVAREA、HYDROPAC。${status.active ? '正在同步新历史。' : status.error ? '本次同步未成功，稍后自动重试。' : status.lastRunAt ? `最近同步批次：${new Date(status.lastRunAt).toLocaleString()}。` : '等待首次刷新完成。'}左侧“刷新历史”可调阅；删除需管理员登录。`
+        ? `${status.schedule}自动全量刷新 NOTAM、NAVAREA、HYDROPAC。${status.active ? '正在同步新历史。' : status.error ? '本次同步未成功，稍后自动重试。' : status.lastRunAt ? `最近同步批次：${new Date(status.lastRunAt).toLocaleString()}。` : '等待首次刷新完成。'}${missing.length ? `${missing.map(source => labels[source]).join('、')} 本批次未完成，保留此前的数据。` : ''}左侧“刷新历史”可调阅；删除需管理员登录。`
         : '自动刷新尚未启用。';
       if (status.lastImportedAt && status.lastImportedAt !== imported) {
         imported = status.lastImportedAt;

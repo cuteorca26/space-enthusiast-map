@@ -2713,12 +2713,15 @@ async function loadCloudSatellite(refresh) {
   }
 }
 
+let refreshHistoryReloadTimer;
 async function loadRefreshHistory(options = {}) {
+  clearTimeout(refreshHistoryReloadTimer);
   if (!els.refreshHistoryList) return;
   try {
     const response = await fetch("/api/refresh-history", { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.refreshHistory = await response.json();
+    if (state.refreshHistory.preparing) refreshHistoryReloadTimer = setTimeout(() => loadRefreshHistory(), 15000);
     if (options.source) state.refreshHistorySource = options.source;
     if (options.selectIdIncludes) {
       const items = state.refreshHistory?.sources?.[state.refreshHistorySource] || [];

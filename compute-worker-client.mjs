@@ -15,7 +15,10 @@ export class ComputeWorkerClient {
     if (this.current || !this.queue.length) return;
     if (!this.worker) {
       let worker;
-      try { worker = new Worker(new URL("./server-compute-worker.mjs", import.meta.url), { name: this.name }); }
+      try { worker = new Worker(new URL("./server-compute-worker.mjs", import.meta.url), {
+        name: this.name,
+        ...(process.env.MEMORY_BUDGET_MODE === '1' ? { execArgv: [], resourceLimits: { maxOldGenerationSizeMb: 256 } } : {}),
+      }); }
       catch (error) {
         this.queue.shift().reject(error);
         queueMicrotask(() => this.pump());

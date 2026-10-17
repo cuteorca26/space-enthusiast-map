@@ -120,12 +120,12 @@ node -e "const c=require('node:crypto');const s=c.randomBytes(32).toString('base
 
 1. 把代码提交并推送到 GitHub。
 2. 确认 GitHub Actions 检查通过。
-3. 在 [当前 Render 服务页](https://dashboard.render.com/web/srv-db1dm4c9v7es73f34jkg)检查部署状态。当前服务设置为 `main` 提交自动部署；如果没有触发，再检查 Render 的 GitHub 连接。
+3. 当前服务通过公开仓库地址连接，需要在 [Render 服务页](https://dashboard.render.com/web/srv-db1dm4c9v7es73f34jkg)选择 **Manual Deploy → Deploy latest commit**，或通过 Render API 触发部署。
 4. 等部署完成，检查地图、管理员登录和公共数据恢复状态。
 
 只改 README 或使用说明，无需重启地图后台。GitHub Pages 入口会按工作流发布。
 
-新建服务时应在 Render 关联自己的 GitHub 账号及仓库，确认自动部署选项。[Render 部署官方说明](https://render.com/docs/deploys)
+只有关联 Git 提供商的服务才能自动部署；通过公开仓库 URL 创建的服务需要手动部署，即使 API 返回的默认自动部署字段为开启，也应以实际连接方式和部署记录为准。需要自动部署代码时，在 Render 关联自己的 GitHub 账号及仓库。[Render 部署官方说明](https://render.com/docs/deploys)
 
 ## 每日全量刷新与历史保存
 

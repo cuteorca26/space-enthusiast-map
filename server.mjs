@@ -60,7 +60,12 @@ const publicDataPersistence = createPublicDataPersistence({ directory: dataDirec
   repository: process.env.PUBLIC_DATA_REPOSITORY, token: process.env.GITHUB_DATA_TOKEN });
 const scheduledRefresh = createScheduledRefresh({ directory: dataDirectory, enabled: onlineDeployment && isMainThread,
   repository: process.env.PUBLIC_DATA_REPOSITORY, token: process.env.GITHUB_DATA_TOKEN, ready: publicDataPersistence.ready,
-  beforeApply: async () => { await buildRefreshHistoryListAsync(); },
+  beforeApply: async () => {
+    if (historyIndexPreparation) await historyIndexPreparation;
+    loadRefreshHistoryIndex();
+    if (historyIndexNeedsScan) await buildRefreshHistoryListAsync();
+    else writeRefreshHistoryIndex();
+  },
   afterApply: async () => {
     refreshHistoryIndexCache = null;
     aggregateCache.clear(); hydropacCache.clear(); navareaWarningCache.clear();
@@ -660,7 +665,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/refresh-history") {
-    sendJson(res, 200, await buildRefreshHistoryListAsync());
+    sendJson(res, 200, await buildRefreshHistoryListAsync({ wait: !onlineDeployment }));
     return;
   }
 
@@ -686,7 +691,7 @@ async function handleApi(req, res, url) {
       sendJson(res, deleted.status || 400, { error: deleted.error || "history_delete_failed" });
       return;
     }
-    sendJson(res, 200, { deleted: { source: deleted.source, id: deleted.id }, history: await buildRefreshHistoryListAsync() });
+    sendJson(res, 200, { deleted: { source: deleted.source, id: deleted.id }, history: await buildRefreshHistoryListAsync({ wait: !onlineDeployment }) });
     return;
   }
 
@@ -2330,11 +2335,14 @@ function loadRefreshHistoryIndex() {
   return refreshHistoryIndexCache;
 }
 
-async function buildRefreshHistoryListAsync() {
+async function buildRefreshHistoryListAsync({ wait = true } = {}) {
   const index = loadRefreshHistoryIndex();
   if (!historyIndexPreparation) {
     const sourceDirectories = [["notam", FAA_NOTAM_SNAPSHOT_DIR, null], ["hydropac", HYDROPAC_SNAPSHOT_DIR, HYDROPAC_CACHE_FILE], ["msa", MSA_NAV_WARNING_SNAPSHOT_DIR, MSA_NAV_WARNING_CACHE_FILE], ["navarea", NAVAREA_WARNING_SNAPSHOT_DIR, NAVAREA_WARNING_CACHE_FILE], ["satellite", SATELLITE_SNAPSHOT_DIR, null]];
-    const pendingSources = sourceDirectories.filter(([source]) => historyIndexNeedsScan || index.sources[source].some(record => !record.dailyAsset && (record.summaryParseVersion || "") !== refreshHistorySummaryParseVersion(source)));
+    // A deployment must not reparse every old snapshot on a 512 MB host.
+    // Keep capture-time summaries; a selected replay is still fully reparsed
+    // and updates its own summary. Local installations retain eager migration.
+    const pendingSources = sourceDirectories.filter(([source]) => historyIndexNeedsScan || (!onlineDeployment && index.sources[source].some(record => !record.dailyAsset && (record.summaryParseVersion || "") !== refreshHistorySummaryParseVersion(source))));
     if (pendingSources.length) {
       historyIndexPreparation = (async () => {
         if (historyIndexNeedsScan) seedSatelliteSnapshotFromCurrentCache();
@@ -2359,10 +2367,13 @@ async function buildRefreshHistoryListAsync() {
         }
         historyIndexNeedsScan = false;
       })().finally(() => { historyIndexPreparation = null; });
+      // On the small public host, show the saved index immediately while older
+      // summaries are brought up to date. The actual replay still parses fully.
+      historyIndexPreparation.catch(error => console.error('History summary update:', error.message));
     }
   }
-  if (historyIndexPreparation) await historyIndexPreparation;
-  return buildRefreshHistoryList();
+  if (historyIndexPreparation && wait) await historyIndexPreparation;
+  return { ...buildRefreshHistoryList(), preparing: Boolean(historyIndexPreparation) };
 }
 
 async function readRefreshHistoryResponse(source, id) {
@@ -2370,6 +2381,12 @@ async function readRefreshHistoryResponse(source, id) {
   // Validate before queueing, and again after completion to respect concurrent deletion.
   if (!historyItemFilePath(source, id)) return null;
   const response = await historyCompute.run("history-item", { source, id }, 1);
+  if (response?.summary && historyItemFilePath(source, id)) {
+    const record = loadRefreshHistoryIndex().sources[source]?.find(item => item.id === id);
+    if (record && record.summaryParseVersion !== response.summary.summaryParseVersion) {
+      Object.assign(record, response.summary); writeRefreshHistoryIndex();
+    }
+  }
   return historyItemFilePath(source, id) ? response : null;
 }
 
@@ -11490,6 +11507,7 @@ function toDeg(value) {
 }
 
 export {
+  refreshHistorySummaryParseVersion,
   readSnapshotSummary, readRefreshHistoryItem, historyItemFilePath, buildRefreshHistoryListAsync, readRefreshHistoryResponse,
   loadGmgsiDataset, readGmgsiDatasetFile, renderGmgsiTile, renderGmgsiGlobeTexture, renderCloudImageInWorker, closePerformanceWorkers,
   fetchMsaText,
