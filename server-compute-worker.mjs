@@ -1,5 +1,6 @@
 import { parentPort } from "node:worker_threads";
-import { readSnapshotSummary, readRefreshHistoryItem, historyItemFilePath, refreshHistorySummaryParseVersion, loadGmgsiDataset, renderGmgsiTile, renderGmgsiGlobeTexture } from "./server.mjs";
+import { readSnapshotSummary, readRefreshHistoryItem, historyItemFilePath, refreshHistorySummaryParseVersion, loadGmgsiDataset, renderGmgsiTile, renderGmgsiGlobeTexture, readStreamedNotamResponse } from "./server.mjs";
+import { readNotamMetadata } from './streamed-notam-history.mjs';
 import { fileRevision } from "./history-derived-cache.mjs";
 
 const responses = new Map(); let responseBytes = 0;
@@ -7,10 +8,18 @@ const responseLimit = process.env.MEMORY_BUDGET_MODE === '1' ? 8 * 1024 * 1024 :
 parentPort.on("message", async ({ id, type, payload }) => {
   try {
     let result;
-    if (type === "history-summary") result = readSnapshotSummary(payload.source, payload.path, payload.id, payload.latest);
+    if (type === 'notam-cache') result = await readStreamedNotamResponse({ current: true, cacheKey: payload.cacheKey });
+    else if (type === 'history-summary' && payload.source === 'notam' && process.env.MEMORY_BUDGET_MODE === '1') {
+      const response = await readStreamedNotamResponse(payload), wrapped = await readNotamMetadata(payload.path), data = response.dataMetadata;
+      result = { id: payload.id, source: 'notam', latest: payload.latest, savedAt: wrapped.savedAt || data.sources?.faaNotamSearch?.fetchedAt || data.faaNotamFetchedAt || data.generatedAt || '',
+        historyDate: wrapped.historyDate || data.historyDate || data.sources?.faaNotamSearch?.historyDate || '',
+        dataVersion: data.dataVersion || wrapped.cacheKey || '', message: data.sources?.faaNotamSearch?.message || '', ...response.summary };
+    }
+    else if (type === "history-summary") result = readSnapshotSummary(payload.source, payload.path, payload.id, payload.latest);
     else if (type === "history-item") {
       const path = historyItemFilePath(payload.source, payload.id);
       if (!path) result = null;
+      else if (payload.source === 'notam' && process.env.MEMORY_BUDGET_MODE === '1') result = await readStreamedNotamResponse({ path, id: payload.id });
       else {
         const key = `${payload.source}:${payload.id}:${fileRevision(path)}`;
         let cached = responses.get(key), summary;

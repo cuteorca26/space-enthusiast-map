@@ -42,9 +42,16 @@ try {
     for (let attempt = 1; attempt <= 2 && !ok; attempt++) {
       console.log(`Full ${source} refresh, attempt ${attempt}`);
       ok = await runSource(source, directory);
+      if (!ok) {
+        try { if (/403|拒绝访问/.test(JSON.parse(await readFile(join(directory, `${source}-report.json`), 'utf8')).message || '')) break; } catch {}
+      }
       if (!ok && attempt === 1) await new Promise(done => setTimeout(done, 30000));
     }
-    if (!ok) { report.push({ source, status: 'failed' }); continue; }
+    if (!ok) {
+      let failure;
+      try { failure = JSON.parse(await readFile(join(directory, `${source}-report.json`), 'utf8')); } catch {}
+      report.push(failure?.status === 'failed' ? failure : { source, status: 'failed', message: '本次全量刷新未完成。' }); continue;
+    }
     const detail = JSON.parse(await readFile(join(directory, `${source}-report.json`), 'utf8'));
     const index = JSON.parse(await readFile(join(directory, 'refresh_history_index.json'), 'utf8'));
     const record = index.sources[source]?.sort((a, b) => b.savedAt.localeCompare(a.savedAt))[0];
@@ -54,8 +61,11 @@ try {
     await mkdir(join(bundle, config.directory));
     await copyFile(join(directory, config.directory, record.id), join(bundle, config.directory, record.id));
   }
-  if (report.some(item => item.status === 'success')) {
+  // Publish the outcome even if every upstream is unavailable. The website must
+  // show today's failure, not silently keep displaying an old successful run.
+  {
     const { writeFile } = await import('node:fs/promises');
+    combined.dailyReport = { version: 1, results: report };
     await writeFile(join(bundle, 'refresh_history_index.json'), JSON.stringify(combined));
     const archive = join(temporary, 'daily.pack.gz'), packed = await packPublicData(bundle, archive), at = new Date();
     const name = dailyAssetName({ at, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT || 1, sha256: packed.sha256 });
@@ -90,7 +100,7 @@ try {
   }
 } finally {
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY,
-    `## 每日全量刷新\n\n| 数据源 | 结果 | 总条数 | 可绘制 |\n|---|---|---:|---:|\n${report.map(row => `| ${row.source} | ${row.status} | ${row.total ?? '—'} | ${row.drawable ?? '—'} |`).join('\n')}\n\n失败的数据源不会覆盖上一次成功的数据。\n`);
+    `## 每日全量刷新\n\n| 数据源 | 结果 | 总条数 | 可绘制 |\n|---|---|---:|---:|\n${report.map(row => `| ${row.source} | ${row.status} | ${row.total ?? '—'} | ${row.drawable ?? '—'} |`).join('\n')}\n\n${report.filter(row => row.status !== 'success').map(row => `- ${row.source}: ${(row.message || '未完成').replace(/[\r\n]/g, ' ')}`).join('\n')}\n\n失败的数据源不会覆盖上一次成功的数据。\n`);
   await rm(temporary, { recursive: true, force: true });
 }
 if (report.some(item => item.status !== 'success')) process.exitCode = 1;

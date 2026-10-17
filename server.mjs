@@ -25,6 +25,8 @@ import { execFile } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { ComputeWorkerClient } from "./compute-worker-client.mjs";
 import { HistoryDerivedCache } from "./history-derived-cache.mjs";
+import { streamNotamResponse } from './streamed-notam-history.mjs';
+import { pipeline } from 'node:stream/promises';
 import { arch, availableParallelism, cpus, platform, release, totalmem } from "node:os";
 import { basename, extname, join, normalize } from "node:path";
 import { createRequire } from "node:module";
@@ -50,7 +52,7 @@ let historyIndexPreparation = null;
 let historyIndexNeedsScan = false;
 // Any parser/rule source change invalidates derived files, including temporal semantics.
 const historyDerivedVersion = createHash("sha256");
-for (const file of ["server.mjs", "boundary-primitives.mjs", "notam-schedule.mjs", "msa-schedule.mjs", "history-derived-cache.mjs"]) historyDerivedVersion.update(readFileSync(join(root, file)));
+for (const file of ["server.mjs", "boundary-primitives.mjs", "notam-schedule.mjs", "msa-schedule.mjs", "history-derived-cache.mjs", "streamed-notam-history.mjs"]) historyDerivedVersion.update(readFileSync(join(root, file)));
 const historyDerivedCache = new HistoryDerivedCache(root, historyDerivedVersion.digest("hex"), { dataDirectory, memoryBytes: onlineDeployment ? 8 * 1024 * 1024 : undefined });
 const BALLISTIC_ENGINE = require("./frontend/ballistics.js");
 const { Geodesic } = require("geographiclib-geodesic");
@@ -626,6 +628,16 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr }));
       return;
     }
+    if (memoryBudget.enabled && !refresh && existsSync(AGGREGATE_CACHE_FILE)) {
+      const cacheKey = restrictionsCacheKey({ includeDetails, includeGlobalNotams, includeTfr });
+      const response = await historyCompute.run('notam-cache', { cacheKey }, 1);
+      if (response) {
+        aggregateStatusMetadata.set(cacheKey, { ...restrictionStatusMetadata(response.dataMetadata, cacheKey), restrictionsCount: response.summary.total });
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        await pipeline(createReadStream(response.filePath), res);
+        return;
+      }
+    }
     const payload = await getRestrictions({ includeDetails, refresh, waitForRefresh, includeGlobalNotams, includeTfr });
     sendJson(res, 200, payload);
     return;
@@ -678,7 +690,8 @@ async function handleApi(req, res, url) {
       return;
     }
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    res.end(Buffer.from(snapshot.body));
+    if (snapshot.filePath) await pipeline(createReadStream(snapshot.filePath), res);
+    else res.end(Buffer.from(snapshot.body));
     return;
   }
 
@@ -1700,6 +1713,26 @@ async function buildRestrictionsPayload({ includeDetails, includeGlobalNotams, i
   return displayData;
 }
 
+function prepareAggregateCacheMetadata(cached, cacheKey) {
+  if (!cached.data || !Date.parse(cached.savedAt || '')) return null;
+  const data = cached.data;
+  if (!data.dataVersion) data.dataVersion = cached.cacheKey || cacheKey;
+  data.cacheSavedAt = cached.savedAt;
+  if (!data.faaNotamFetchedAt) data.faaNotamFetchedAt = data.sources?.faaNotamSearch?.fetchedAt || cached.savedAt || data.generatedAt;
+  if (data.sources?.faaNotamSearch && !data.sources.faaNotamSearch.fetchedAt) data.sources.faaNotamSearch.fetchedAt = data.faaNotamFetchedAt;
+  return cached.cacheKey !== cacheKey ? markAggregateCacheStaleVersion(data, cached.cacheKey, cacheKey, cached.savedAt) : data;
+}
+
+async function readStreamedNotamResponse({ path, id, current = false, cacheKey }) {
+  return streamNotamResponse({ path: path || AGGREGATE_CACHE_FILE, id, current, cacheKey,
+    directory: join(dataDirectory, 'derived_notam_stream_v1'), version: historyDerivedCache.version,
+    rules: { migrate: migrateCachedNotamParseResults,
+      filter: (data, time, mode) => filterPayloadToReferenceTime('notam', data, time, mode),
+      reference: (wrapped, data) => refreshHistoryReferenceTime('notam', wrapped, data),
+      prepareCache: prepareAggregateCacheMetadata, filters: buildFilters, summaryVersion: refreshHistorySummaryParseVersion('notam') },
+  });
+}
+
 function readAggregateDiskCache(cacheKey, options = {}) {
   try {
     if (!existsSync(AGGREGATE_CACHE_FILE)) return null;
@@ -1710,17 +1743,7 @@ function readAggregateDiskCache(cacheKey, options = {}) {
     if (staleVersion && !options.allowStaleVersion) return null;
     if (!options.allowExpired && Date.now() - savedAt > DISK_CACHE_MAX_AGE_MS) return null;
     if (!cached.data?.restrictions?.length) return null;
-    if (!cached.data.dataVersion) cached.data.dataVersion = cached.cacheKey || cacheKey;
-    cached.data.cacheSavedAt = cached.savedAt;
-    if (!cached.data.faaNotamFetchedAt) {
-      cached.data.faaNotamFetchedAt = cached.data.sources?.faaNotamSearch?.fetchedAt || cached.savedAt || cached.data.generatedAt;
-    }
-    if (cached.data.sources?.faaNotamSearch && !cached.data.sources.faaNotamSearch.fetchedAt) {
-      cached.data.sources.faaNotamSearch.fetchedAt = cached.data.faaNotamFetchedAt;
-    }
-    if (staleVersion) {
-      cached.data = markAggregateCacheStaleVersion(cached.data, cached.cacheKey, cacheKey, cached.savedAt);
-    }
+    cached.data = prepareAggregateCacheMetadata(cached, cacheKey);
     const migration = migrateCachedNotamParseResults(cached.data);
     if (migration.changed) {
       cached.data = migration.data;
@@ -11507,6 +11530,7 @@ function toDeg(value) {
 }
 
 export {
+  readStreamedNotamResponse, prepareAggregateCacheMetadata,
   refreshHistorySummaryParseVersion,
   readSnapshotSummary, readRefreshHistoryItem, historyItemFilePath, buildRefreshHistoryListAsync, readRefreshHistoryResponse,
   loadGmgsiDataset, readGmgsiDatasetFile, renderGmgsiTile, renderGmgsiGlobeTexture, renderCloudImageInWorker, closePerformanceWorkers,

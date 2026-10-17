@@ -56,6 +56,30 @@ test('daily import preserves exact source text, times and geometry; repeated che
   assert.equal(index.sources.navarea.length, 1); assert.equal(index.sources.navarea[0].automatic, true);
 });
 
+test('an entirely failed day publishes its outcome without replacing any saved data', async t => {
+  const f = await fixture(t, { sources: [] });
+  const old = Buffer.from('{"data":"previous complete cache"}');
+  await writeFile(join(f.target, DAILY_SOURCES.notam.cache), old);
+  f.index.dailyReport = { version: 1, results: Object.keys(DAILY_SOURCES).map(source => ({ source, status: 'failed', message: 'upstream unavailable' })) };
+  await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(f.index));
+  const result = applyDailyArchive(f.target, f.original, f.name);
+  assert.deepEqual(result.sources, []);
+  assert.deepEqual(await readFile(join(f.target, DAILY_SOURCES.notam.cache)), old);
+  const state = JSON.parse(await readFile(join(f.target, 'scheduled_refresh_state.json')));
+  assert.equal(state.lastResults.length, 3);
+  assert.equal(state.lastResults[0].status, 'failed');
+  assert.ok(state.lastRunAt);
+  assert.equal(applyDailyArchive(f.target, f.original, f.name).applied, false);
+});
+
+test('a daily outcome cannot claim a failed source has a complete new snapshot', async t => {
+  const f = await fixture(t);
+  f.index.dailyReport = { version: 1, results: Object.keys(DAILY_SOURCES).map(source => ({ source, status: 'failed' })) };
+  await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(f.index));
+  assert.throws(() => applyDailyArchive(f.target, f.original, f.name), /does not match/);
+  await assert.rejects(readFile(join(f.target, 'refresh_history_index.json')), /ENOENT/);
+});
+
 test('restart retains all daily history and can load an evicted body; deleted history never returns', async t => {
   const f = await fixture(t); await f.client().check();
   const indexFile = join(f.target, 'refresh_history_index.json');

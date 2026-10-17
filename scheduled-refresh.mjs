@@ -37,6 +37,10 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
   if (state.applied.includes(assetName)) return { applied: false, sources: [] };
   const incoming = readJson(join(staging, INDEX_FILE), null);
   if (incoming?.version !== 3 || !incoming.sources) throw new Error('Daily archive has no valid history index');
+  const results = incoming.dailyReport?.results;
+  if (results !== undefined && (!Array.isArray(results) || results.length !== 3 ||
+    new Set(results.map(row => row.source)).size !== 3 || results.some(row => !DAILY_SOURCES[row.source] || !['success', 'failed'].includes(row.status))))
+    throw new Error('Invalid daily outcome report');
   const index = readJson(join(directory, INDEX_FILE), { version: 3, sources: { notam: [], hydropac: [], navarea: [], msa: [], satellite: [] } });
   if (index.version !== 3 || !index.sources) throw new Error('Existing history index needs migration before daily import');
   const operations = [], imported = [];
@@ -59,7 +63,8 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
     index.sources[source] = [{ ...record, automatic: true, dailyAsset: assetName }, ...stored.filter(item => item.id !== record.id)].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
     imported.push(source);
   }
-  if (!imported.length) throw new Error('Daily archive has no successful sources');
+  if (!imported.length && !results) throw new Error('Daily archive has no successful sources');
+  if (results?.some(row => (row.status === 'success') !== imported.includes(row.source))) throw new Error('Daily outcome does not match saved sources');
   for (const item of operations) {
     mkdirSync(join(item.to, '..'), { recursive: true });
     renameSync(item.from, item.to);
@@ -69,6 +74,7 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
   state.applied.push(assetName); state.lastImportedAt = now;
   state.lastRunAt = assetName.match(ASSET)[2].replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3T$4:$5:$6Z');
   state.lastSources = imported;
+  state.lastResults = results || Object.keys(DAILY_SOURCES).map(source => ({ source, status: imported.includes(source) ? 'success' : 'failed' }));
   atomicJson(join(directory, STATE_FILE), state);
   trimDailyBodies(directory, index);
   return { applied: true, sources: imported };
@@ -99,7 +105,7 @@ export function createScheduledRefresh({ directory, repository, enabled = false,
     const state = readJson(join(directory, STATE_FILE), {});
     return { enabled: Boolean(configured), active: Boolean(running), schedule: '每天北京时间 15:37（UTC 07:37）',
       sources: Object.keys(DAILY_SOURCES), lastCheckAt: lastCheck ? new Date(lastCheck).toISOString() : null,
-      lastImportedAt: state.lastImportedAt || null, lastRunAt: state.lastRunAt || null, lastSources: state.lastSources || [], error: Boolean(error) };
+      lastImportedAt: state.lastImportedAt || null, lastRunAt: state.lastRunAt || null, lastSources: state.lastSources || [], lastResults: state.lastResults || [], error: Boolean(error) };
   };
   async function api(path) {
     const headers = { accept: 'application/vnd.github+json', 'user-agent': 'space-enthusiast-map' };
