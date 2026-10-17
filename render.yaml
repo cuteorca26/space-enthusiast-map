@@ -20,7 +20,7 @@ services:
       - key: DATA_DIR
         value: /app/data
       - key: NODE_OPTIONS
-        value: --max-old-space-size=320
+        value: --max-old-space-size=256
       - key: MEMORY_BUDGET_MODE
         value: "1"
       - key: BALLISTIC_WORKERS

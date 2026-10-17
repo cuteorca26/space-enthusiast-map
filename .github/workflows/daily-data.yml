@@ -1,0 +1,35 @@
+name: Daily full warning refresh
+on:
+  schedule:
+    # UTC 07:37 = Beijing 15:37, every 24 hours.
+    - cron: '37 7 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: daily-full-warning-refresh
+  cancel-in-progress: false
+jobs:
+  refresh:
+    if: github.repository == 'cuteorca26/space-enthusiast-map'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Locate Chrome for the official FAA fallback
+        run: echo "FAA_NOTAM_BROWSER_EXECUTABLE=$(command -v google-chrome)" >> "$GITHUB_ENV"
+      - name: Refresh all three sources and publish durable history
+        run: node scripts/refresh-daily.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_URL: ${{ vars.APP_URL || 'https://space-enthusiast-map.onrender.com' }}
+          FAA_NOTAM_FIR_CONCURRENCY: '8'
+          FAA_NOTAM_BROWSER_CONCURRENCY: '2'
+          NAVAREA_FETCH_CONCURRENCY: '4'

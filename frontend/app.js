@@ -254,6 +254,12 @@ const ballisticAnimationPerformanceStats = {
   lastDatasetUpdateAt: 0,
 };
 let ballisticPhysicsRevision = 0;
+let ballisticPreviewWorker = null;
+let ballisticPreviewActive = null;
+let ballisticPreviewWorkerFailed = false;
+const ballisticPreviewQueue = [];
+const ballisticPreviewJobs = new Map();
+const ballisticPreviewOwners = new WeakMap();
 let trajectoryRenderRevision = 0;
 let flatProjectionFrame = null;
 let globeParamsMemo = null;
@@ -262,6 +268,14 @@ let restrictionSurfaceCache = null;
 let flatRestrictionGpuRenderer = null;
 let flatBallisticGpuRenderer = null;
 let restrictionHitSpatialIndex = null;
+let globeDrawableItemsCache = null;
+const flatRingSourceCache = new WeakMap();
+const dateTimeFormatterCache = new Map();
+let satelliteSearchIndex = null;
+let satelliteSearchResultCache = null;
+let satelliteEpochSummaryCache = null;
+const customCoordinateRows = new Map();
+const customCoordinateTextCache = new WeakMap();
 const restrictionSurfaceGeometryCache = new WeakMap();
 const restrictionSurfaceBoundsCache = new WeakMap();
 let nextRestrictionArrayIdentity = 1;
@@ -286,6 +300,13 @@ let satelliteWorkerRejectedCount = 0;
 let satelliteWorkerGeneration = 0;
 let satelliteWorkerAssignments = [];
 let satelliteWorkerIndexById = new Map();
+let satelliteWorkerCatalogState = new Map();
+let satelliteCatalogSampleSignature = "";
+let satelliteCatalogForcePaths = false;
+let satelliteGeometryWorker = null;
+let satelliteGeometryBusy = false;
+let satelliteGeometryFailed = false;
+const satelliteGeometrySentPaths = new Map();
 let satellitePendingFrame = null;
 let satelliteWorkerRequestId = 0;
 let satelliteFramePending = false;
@@ -2522,7 +2543,7 @@ async function loadMsaWarnings(refresh) {
     const response = await fetch(`/api/msa-warnings${refresh ? "?refresh=1" : ""}`, { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.msaPayload = await response.json();
-    state.msaWarnings = (state.msaPayload.restrictions || []).map(enrichRestriction);
+    state.msaWarnings = marineDisplayRecords(state.msaPayload, "msa").map(enrichRestriction);
     syncCombinedRestrictions();
     renderSourceStatus();
     renderFilters();
@@ -2620,12 +2641,13 @@ async function loadNavareaWarnings(refresh) {
     applyFilters();
     const source = state.navareaPayload.source || {};
     const progressState = source.status === "warn" ? "warn" : source.status === "empty" ? "muted" : "success";
+    const coverage = navareaCoverageSummary(source);
     updateNavareaProgress(
       progressState,
-      source.status === "warn"
+      coverage ? `NAVAREA ${coverage.short}：${source.drawableWarnings ?? 0} 条可绘制` : source.status === "warn"
         ? `NAVAREA 刷新失败，保留缓存：${source.drawableWarnings ?? state.navareaWarnings.length} 条可绘制`
         : `NAVAREA 已载入：${source.drawableWarnings ?? state.navareaWarnings.length} 条可绘制`,
-      source.status === "warn" ? source.message : `版本：${state.navareaPayload.dataVersion || "--"}`,
+      coverage ? coverage.detail : source.status === "warn" ? source.message : `版本：${state.navareaPayload.dataVersion || "--"}`,
     );
     loadRefreshHistory();
   } catch (error) {
@@ -2709,6 +2731,8 @@ async function loadRefreshHistory(options = {}) {
   }
 }
 
+window.addEventListener('scheduled-data-change', () => loadRefreshHistory());
+
 function latestMatchingHistoryItem(items, idNeedle) {
   const matches = (items || []).filter((item) => String(item.id || "").includes(idNeedle));
   if (!matches.length) return null;
@@ -2735,7 +2759,7 @@ function renderRefreshHistory() {
       const isHistoryDate = Boolean(item.historyDate);
       const title = isHistoryDate
         ? `${historySourceLabel(item.source)}历史 ${item.historyDate} 当天回放`
-        : `${saved}${item.latest ? " · 当前缓存" : ""}`;
+        : `${saved}${item.latest ? " · 当前缓存" : item.automatic ? " · 自动刷新" : ""}`;
       const meta = isHistoryDate
         ? `${historySourceLabel(item.source)} / 可绘制 ${item.drawable ?? 0} / 总计 ${item.total ?? 0} / 保存 ${saved}`
         : `${historySourceLabel(item.source)} / 可绘制 ${item.drawable ?? 0} / 总计 ${item.total ?? 0} / 回放 ${reference}`;
@@ -2840,7 +2864,7 @@ function applyRefreshHistorySnapshot(snapshot) {
     );
   } else if (source === "msa") {
     state.msaPayload = data;
-    state.msaWarnings = (data.restrictions || []).map(enrichRestriction);
+    state.msaWarnings = marineDisplayRecords(data, "msa").map(enrichRestriction);
     state.detailMode = "msa";
   } else if (source === "navarea") {
     state.navareaPayload = data;
@@ -3280,7 +3304,7 @@ function isAreaGeometry(geometry) {
 
 function applyFilters() {
   const useSelection = state.displayMode === "selected";
-  state.filtered = state.restrictions.filter((item) => {
+  const nextFiltered = state.restrictions.filter((item) => {
     if (item.savedRegion) return true;
     if (state.withGeometryOnly && !item.hasGeometry) return false;
     if (state.newOnly && !item.isNew) return false;
@@ -3299,6 +3323,10 @@ function applyFilters() {
     return true;
   });
 
+  // A new collection with the same objects/order must not invalidate all GPU geometry.
+  if (nextFiltered.length !== state.filtered.length || nextFiltered.some((item, index) => item !== state.filtered[index])) {
+    state.filtered = nextFiltered;
+  }
   renderList();
   updateCounts();
   draw();
@@ -4106,6 +4134,7 @@ function renderBallisticTargetControls(segment, stage) {
 function renderBallisticPreview(segment, stage) {
   if (!BALLISTIC_PHYSICS) return `<p class="ballistic-result error">弹道物理模块未载入，请刷新页面。</p>`;
   if (!segment) return `<p class="ballistic-result muted">请先设置独立分离点，并保证星下点线至少有两个点以确定飞行切向。</p>`;
+  if (segment.physics.computationStatus === "pending") return `<p class="ballistic-result muted" role="status">正在计算完整弹道，请稍候。</p>`;
   if (!segment.physics.valid) return `<p class="ballistic-result error">${escapeHtml(segment.physics.message || "输入参数无效")}</p>`;
   const physics = segment.physics;
   const statusText = physics.status === "impact"
@@ -4207,7 +4236,7 @@ function ballisticAnimationCatalog() {
         stage: candidateStage,
         segment,
         physics,
-        pending: physics?.empiricalStatus === "pending",
+        pending: physics?.empiricalStatus === "pending" || physics?.computationStatus === "pending",
         ready: Boolean(physics?.valid && physics.samples?.length > 1 && physics.empiricalStatus !== "pending"),
       });
     });
@@ -4351,7 +4380,9 @@ function prepareBallisticAnimationSession() {
   if (pending.length || invalid.length) {
     animation.cacheStatus = pending.length ? "pending" : "error";
     animation.cacheMessage = pending.length
-      ? `等待 ${pending.length} 个物体完成 NRLMSISE-00 传播计算`
+      ? pending.every(entry => entry.physics?.empiricalStatus === "pending")
+        ? `等待 ${pending.length} 个物体完成 NRLMSISE-00 传播计算`
+        : `等待 ${pending.length} 个物体完成弹道计算`
       : `${invalid.length} 个物体尚未形成有效传播结果`;
     ballisticAnimationSession = null;
     return null;
@@ -4478,8 +4509,7 @@ function ballisticAnimationPhaseLabel(phase, sample) {
   return reentryPhaseLabel(sample?.reentryPhase);
 }
 
-function bindBallisticControlEvents() {
-  const root = els.trajectoryPlanList;
+function bindBallisticControlEvents(root = els.trajectoryPlanList) {
   root.querySelector("[data-ballistic-toggle]")?.addEventListener("change", (event) => {
     const track = activeTrajectory();
     ensureTrajectoryBallistic(track);
@@ -5192,7 +5222,7 @@ async function optimizeActiveBallisticRange() {
       trimMapCache(ballisticEmpiricalSimulationCache, 64);
     } else {
       ballisticSimulationCache.set(cacheKey, payload.result);
-      trimMapCache(ballisticSimulationCache, 64);
+      trimBallisticPreviewResults();
     }
     currentStage.maxRangeState = {
       status: "success",
@@ -5598,7 +5628,7 @@ function renderSourceStatus() {
     : "FAA NOTAM 数据状态异常";
   if (notamUsable) {
     els.sourceLine.textContent += `；中国航警 ${msa?.backgroundRefresh?.active ? "刷新中" : state.msaWarnings.length ? "已加载" : "未获取"}`;
-    els.sourceLine.textContent += `；NAVAREA ${state.navareaWarnings.length ? "已加载" : "未获取"}`;
+    els.sourceLine.textContent += `；NAVAREA ${navareaCoverageSummary(navarea)?.short || (state.navareaWarnings.length ? navarea?.status === "warn" ? "缓存（刷新失败）" : "已加载" : "未获取")}`;
   }
   if (notamUsable) els.sourceLine.textContent += `；卫星云图 ${cloudSource?.status === "ok" ? "已加载" : "未获取"}`;
   if (!activeLoadController && !notam.backgroundRefresh?.active) updateRefreshProgress("idle", "数据就绪");
@@ -5613,9 +5643,9 @@ function renderSourceStatus() {
       <strong>NGA MSI HYDROPAC</strong>
       <span>${escapeHtml(hydropac?.message || "独立读取 NGA MSI 航海/水文警告。")}</span>
     </div>
-    <div class="source-row ${navarea?.status === "ok" ? "ok" : navarea?.status === "error" ? "error" : "muted"}">
+    <div class="source-row ${navarea?.status === "ok" ? "ok" : navarea?.status === "error" ? "error" : navarea?.status === "warn" ? "warn" : "muted"}">
       <strong>NAVAREA 航行警告</strong>
-      <span>${escapeHtml(navarea?.message || "独立读取 NAVAREA I–XXI 活动航行警告。")}</span>
+      <span>${escapeHtml(navareaCoverageSummary(navarea)?.detail || navarea?.message || "独立读取 NAVAREA I–XXI 活动航行警告。")}</span>
     </div>
     <div class="source-row ${launchSource?.status === "ok" ? "ok" : launchSource?.status === "error" ? "error" : launchSource?.status === "warn" ? "warn" : "muted"}">
       <strong>火箭发射预告</strong>
@@ -6405,7 +6435,7 @@ function initializeSatelliteWorker() {
   if (!state.satellites.length) return;
   while (satelliteWorkers.length < SATELLITE_WORKER_COUNT) {
     const workerIndex = satelliteWorkers.length;
-    const worker = new Worker("/frontend/satellite-orbit-worker.js?v=orbit-worker-14", { type: "module" });
+    const worker = new Worker("/frontend/satellite-orbit-worker.js?v=performance-20261016-1", { type: "module" });
     worker.addEventListener("message", (event) => handleSatelliteWorkerMessage(event, workerIndex));
     worker.addEventListener("error", (event) => {
       const detail = [event.message, event.filename, event.lineno ? `line ${event.lineno}` : ""].filter(Boolean).join(" · ");
@@ -6423,24 +6453,10 @@ function initializeSatelliteWorker() {
 
 function syncSatelliteWorkerCatalogs() {
   if (!satelliteWorkers.length) return;
-  satelliteWorkerReady = false;
-  satelliteWorkerReadyCount = 0;
-  satelliteWorkerAcceptedCount = 0;
-  satelliteWorkerRejectedCount = 0;
-  satelliteFramePending = false;
-  satellitePendingFrame = null;
-  satelliteLastPropagatedTimeMs = NaN;
-  state.satellitePropagationErrorIds = new Set();
-  state.satelliteOrbitPaths.clear();
-  satelliteOrbitMissingIds = new Set();
-  satelliteOrbitPathRetryCount = 0;
-  satelliteLastPathAt = 0;
-  satelliteLastPathSimulationMs = NaN;
-  satellitePathRevision += 1;
-  satelliteGpuOrbitRevision += 1;
+  satelliteWorkerReady = false; satelliteWorkerReadyCount = 0;
+  satelliteWorkerAcceptedCount = 0; satelliteWorkerRejectedCount = 0;
+  satelliteFramePending = false; satellitePendingFrame = null;
   satelliteWorkerGeneration += 1;
-  satelliteWorkerAssignments = Array.from({ length: satelliteWorkers.length }, () => []);
-  satelliteWorkerIndexById = new Map();
   const selectedItems = state.satelliteVisibleIds
     .map((id) => {
       const item = state.satelliteById.get(String(id));
@@ -6455,24 +6471,35 @@ function syncSatelliteWorkerCatalogs() {
       };
     })
     .filter(Boolean);
-  state.satellitePositions = new Map(
-    selectedItems
-      .map((item) => [String(item.id), state.satellitePositions.get(String(item.id))])
-      .filter(([, position]) => Boolean(position)),
-  );
-  selectedItems.forEach((item, index) => {
-    const workerIndex = index % satelliteWorkers.length;
-    satelliteWorkerAssignments[workerIndex].push(item);
-    satelliteWorkerIndexById.set(String(item.id), workerIndex);
-  });
-  satelliteWorkers.forEach((worker, workerIndex) => {
-    worker.postMessage({
-      type: "catalog",
-      requestId: ++satelliteWorkerRequestId,
-      generation: satelliteWorkerGeneration,
-      satellites: satelliteWorkerAssignments[workerIndex],
-    });
-  });
+
+  const nextState = new Map(), updates = satelliteWorkers.map(() => []), removals = satelliteWorkers.map(() => []);
+  satelliteWorkerAssignments = satelliteWorkers.map(() => []);
+  satelliteWorkerIndexById = new Map();
+  for (const item of selectedItems) {
+    const id = String(item.id), previous = satelliteWorkerCatalogState.get(id);
+    let hash = 2166136261;
+    for (let i = 0; i < id.length; i += 1) hash = Math.imul(hash ^ id.charCodeAt(i), 16777619) >>> 0;
+    const workerIndex = previous?.workerIndex ?? hash % satelliteWorkers.length;
+    const changed = !previous || previous.omm !== item.omm || previous.elementSets !== item.elementSets
+      || previous.periodMinutes !== item.periodMinutes || previous.orbitClass !== item.orbitClass || previous.needsHeading !== item.needsHeading;
+    nextState.set(id, { omm: item.omm, elementSets: item.elementSets, periodMinutes: item.periodMinutes, orbitClass: item.orbitClass, needsHeading: item.needsHeading, workerIndex });
+    satelliteWorkerAssignments[workerIndex].push(item); satelliteWorkerIndexById.set(id, workerIndex);
+    if (changed) { updates[workerIndex].push(item); state.satelliteOrbitPaths.delete(id); }
+  }
+  for (const [id, previous] of satelliteWorkerCatalogState) if (!nextState.has(id)) { removals[previous.workerIndex].push(id); state.satelliteOrbitPaths.delete(id); }
+  satelliteWorkerCatalogState = nextState;
+  const sampleSignature = JSON.stringify(satellitePathSampleCounts(state.satelliteVisibleIds.length));
+  satelliteCatalogForcePaths = satelliteCatalogSampleSignature !== sampleSignature;
+  satelliteCatalogSampleSignature = sampleSignature;
+  state.satellitePositions = new Map(selectedItems.map(item => [String(item.id), state.satellitePositions.get(String(item.id))]).filter(([,position]) => Boolean(position)));
+  state.satellitePropagationErrorIds = new Set([...state.satellitePropagationErrorIds].filter(id => nextState.has(id)));
+  satelliteOrbitMissingIds = new Set(); satelliteOrbitPathRetryCount = 0;
+  satellitePathRevision += 1; satelliteGpuOrbitRevision += 1;
+  satelliteWorkers.forEach((worker, workerIndex) => worker.postMessage({
+    type: "catalog-delta", requestId: ++satelliteWorkerRequestId, generation: satelliteWorkerGeneration,
+    satellites: updates[workerIndex], removeIds: removals[workerIndex],
+    catalogIds: satelliteWorkerAssignments[workerIndex].map(item => String(item.id)),
+  }));
 }
 
 function handleSatelliteWorkerMessage(event, workerIndex) {
@@ -6491,7 +6518,7 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
       els.satelliteControls.dataset.workerRejected = String(satelliteWorkerRejectedCount);
     }
     updateSatelliteSelectionStatus();
-    requestSatellitePropagation(true);
+    requestSatellitePropagation(satelliteCatalogForcePaths);
     return;
   }
   if (message.type !== "frame") return;
@@ -6501,6 +6528,9 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
     satellitePendingFrame.positionChunks.push({
       workerIndex,
       data: new Float32Array(message.positionBuffer),
+      scenes: message.sceneBuffer instanceof ArrayBuffer ? new Float64Array(message.sceneBuffer) : null,
+      referenceFrame: message.referenceFrame,
+      referenceEpochMs: message.referenceEpochMs,
       count: Math.max(0, Number(message.positionCount) || 0),
       stride: Math.max(5, Number(message.positionStride) || 5),
     });
@@ -6540,10 +6570,12 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
   satelliteGpuCoverageRevision += 1;
   satelliteCoverageRenderSignature = "";
   if (satellitePendingFrame.includePaths) {
-    const requestedPathIds = satellitePendingFrame.pathIds || new Set();
+    const requestedPathIds = satellitePendingFrame.requestedPathIds || satellitePendingFrame.pathIds || new Set();
+    const retainedPathIds = satellitePendingFrame.pathIds || new Set();
+    let pathsChanged = false;
     const receivedPaths = new Map();
     for (const id of [...state.satelliteOrbitPaths.keys()]) {
-      if (!requestedPathIds.has(id)) state.satelliteOrbitPaths.delete(id);
+      if (!retainedPathIds.has(id)) { state.satelliteOrbitPaths.delete(id); pathsChanged = true; }
     }
     for (const chunk of satellitePendingFrame.pathChunks || []) {
       for (const descriptor of chunk.descriptors) {
@@ -6565,11 +6597,12 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
       const nextPath = receivedPaths.get(id);
       if (nextPath) {
         state.satelliteOrbitPaths.set(id, nextPath);
+        pathsChanged = true;
         continue;
       }
       const previousPath = state.satelliteOrbitPaths.get(id);
       if (!satelliteOrbitPathHasRenderableSegment(previousPath)) {
-        state.satelliteOrbitPaths.set(id, new Float32Array(0));
+        if (!previousPath) { state.satelliteOrbitPaths.set(id, new Float32Array(0)); pathsChanged = true; }
         missingIds.add(id);
       }
     }
@@ -6580,13 +6613,15 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
     }
     if (missingIds.size && satelliteOrbitPathRetryCount < 2) {
       satelliteOrbitPathRetryCount += 1;
-      satelliteForcePathQueued = true;
+      if (!satelliteForcePathQueued) satelliteForcePathQueued = "missing";
     } else if (!missingIds.size) {
       satelliteOrbitPathRetryCount = 0;
     }
-    satellitePathRevision += 1;
-    satelliteGpuOrbitRevision += 1;
-    invalidateSatelliteStaticLayers({ orbit: true });
+    if (pathsChanged) {
+      satellitePathRevision += 1;
+      satelliteGpuOrbitRevision += 1;
+      invalidateSatelliteStaticLayers({ orbit: true });
+    }
   }
   satellitePendingFrame = null;
   if (state.satellitePendingFitId) {
@@ -6602,8 +6637,9 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
     if (!state.satellitePlaybackRate) requestSatelliteThreeDraw();
   }
   if (satelliteForcePathQueued) {
+    const queued = satelliteForcePathQueued;
     satelliteForcePathQueued = false;
-    requestSatellitePropagation(true);
+    requestSatellitePropagation(queued);
   }
 }
 
@@ -6674,6 +6710,8 @@ function requestSatellitePropagation(forcePaths = false) {
   if (!ids.length) {
     state.satellitePositions.clear();
     state.satelliteOrbitPaths.clear();
+    satelliteGeometryWorker?.terminate(); satelliteGeometryWorker = null; satelliteGeometryBusy = false;
+    satelliteGeometrySentPaths.clear();
     satelliteOrbitMissingIds = new Set();
     satelliteOrbitPathRetryCount = 0;
     invalidateSatelliteStaticLayers({ orbit: true, coverage: true });
@@ -6682,7 +6720,7 @@ function requestSatellitePropagation(forcePaths = false) {
   }
   if (satelliteFramePending) {
     satelliteRequestSkipPendingCount += 1;
-    if (forcePaths) satelliteForcePathQueued = true;
+    if (forcePaths) satelliteForcePathQueued = forcePaths;
     return;
   }
   const requestNow = performance.now();
@@ -6693,16 +6731,16 @@ function requestSatellitePropagation(forcePaths = false) {
   const pathRefreshDue = state.satelliteOrbitLinesEnabled && requestedPathIds.length > 0
     && requestNow - satelliteLastPathAt >= satellitePathRefreshIntervalMs(ids.length)
     && simulatedPathAgeMs >= satellitePathRefreshSimulationMs(ids.length);
-  const includePaths = Boolean(state.satelliteOrbitLinesEnabled && (forcePaths
-    || pathRefreshDue
-    || requestedPathIds.some((id) => !state.satelliteOrbitPaths.has(String(id)))));
+  const fullPathRefresh = forcePaths === true || pathRefreshDue;
+  const pendingPathIds = requestedPathIds.filter(id => fullPathRefresh || !state.satelliteOrbitPaths.has(String(id)) || (forcePaths === "missing" && satelliteOrbitMissingIds.has(String(id))));
+  const includePaths = Boolean(state.satelliteOrbitLinesEnabled && pendingPathIds.length);
   if (includePaths) {
     satelliteLastPathAt = requestNow;
     satelliteLastPathSimulationMs = state.satelliteTimeMs;
   }
   const expectedWorkers = new Set(satelliteWorkerAssignments.map((workerItems, index) => workerItems.length ? index : -1).filter((index) => index >= 0));
   if (!expectedWorkers.size) return;
-  const pathIdSet = includePaths ? new Set(requestedPathIds) : new Set();
+  const pathIdSet = includePaths ? new Set(pendingPathIds) : new Set();
   satelliteFramePending = true;
   satellitePerformanceStats.requests += 1;
   satelliteWorkerRequestId += 1;
@@ -6720,6 +6758,7 @@ function requestSatellitePropagation(forcePaths = false) {
     paths: [],
     pathChunks: [],
     pathIds: new Set(requestedPathIds.map(String)),
+    requestedPathIds: pathIdSet,
     workerComputeMs: [],
     interpolationDurationSec: satelliteInterpolationWindowSec(),
     timeoutMs: satellitePathRequestTimeoutMs(ids.length, includePaths),
@@ -6737,6 +6776,8 @@ function requestSatellitePropagation(forcePaths = false) {
       pathIds,
       pathSampleCounts,
       interpolationDurationSec: satellitePendingFrame.interpolationDurationSec,
+      referenceFrame: state.satelliteReferenceFrame,
+      referenceEpochMs: state.satelliteReferenceEpochMs,
     });
   }
 }
@@ -6777,6 +6818,21 @@ function updateSatellitePositionMap(frame) {
       }
       position.frameTimeMs = frame.timeMs;
       position.interpolationDurationSec = frame.interpolationDurationSec;
+      if (chunk.scenes && chunk.referenceFrame === state.satelliteReferenceFrame && chunk.referenceEpochMs === state.satelliteReferenceEpochMs) {
+        const unpack = (offset) => {
+          const values = chunk.scenes;
+          if (values[offset + 11] !== 1) return null;
+          return {
+            position: { x: values[offset], y: values[offset + 1], z: values[offset + 2] },
+            velocity: Number.isFinite(values[offset + 3]) ? { x: values[offset + 3], y: values[offset + 4], z: values[offset + 5] } : null,
+            geodetic: { lonDeg: values[offset + 6], latDeg: values[offset + 7], altitudeKm: values[offset + 8] },
+            rotationTimeMs: values[offset + 9], gmstDeg: values[offset + 10],
+          };
+        };
+        position.referenceSceneCache = { frameTimeMs: frame.timeMs, durationSec: frame.interpolationDurationSec,
+          referenceFrame: chunk.referenceFrame, referenceEpochMs: chunk.referenceEpochMs,
+          eciXKm: position.eciXKm, nextEciXKm: position.nextEciXKm, current: unpack(index * 24), next: unpack(index * 24 + 12) };
+      }
       next.set(id, position);
     }
   }
@@ -7550,18 +7606,37 @@ function applySatelliteBulkSelection() {
   satelliteSelectionChanged();
 }
 
+function satelliteActiveEpochSummary() {
+  let cached = satelliteEpochSummaryCache;
+  if (!cached || cached.revision !== satelliteSelectionRevision || cached.catalog !== state.satelliteById || cached.history !== state.satelliteHistoricalElementsById || cached.mode !== state.satelliteElementMode) {
+    cached = { revision: satelliteSelectionRevision, catalog: state.satelliteById, history: state.satelliteHistoricalElementsById, mode: state.satelliteElementMode, min: Infinity, max: -Infinity, custom: [], customCount: 0 };
+    for (const id of state.satelliteVisibleIds) {
+      const item = state.satelliteById.get(String(id));
+      if (item?.customOrbit) { cached.customCount += 1; cached.custom.push(item); continue; }
+      const epoch = Date.parse(satelliteActiveElement(item)?.epoch || "");
+      if (Number.isFinite(epoch)) { cached.min = Math.min(cached.min, epoch); cached.max = Math.max(cached.max, epoch); }
+    }
+    satelliteEpochSummaryCache = cached;
+  }
+  // Custom multi-epoch elements can change while simulation time runs backwards/forwards.
+  let min = cached.min, max = cached.max;
+  for (const item of cached.custom) {
+    const epoch = Date.parse(satelliteActiveElement(item)?.epoch || "");
+    if (Number.isFinite(epoch)) { min = Math.min(min, epoch); max = Math.max(max, epoch); }
+  }
+  return { min: Number.isFinite(min) ? min : NaN, max: Number.isFinite(max) ? max : NaN, customCount: cached.customCount };
+}
+
 function syncSatelliteTimeUi() {
   if (els.satelliteTimeInput && document.activeElement !== els.satelliteTimeInput) {
     els.satelliteTimeInput.value = formatBeijingDateTimeInput(state.satelliteTimeMs);
   }
   if (!els.satelliteEpochStatus) return;
   const selectedCount = state.satelliteVisibleIds.length;
-  const activeEpochs = state.satelliteVisibleIds
-    .map((id) => Date.parse(satelliteActiveElement(state.satelliteById.get(String(id)))?.epoch || ""))
-    .filter(Number.isFinite);
-  const maxEpoch = activeEpochs.length ? Math.max(...activeEpochs) : NaN;
-  const maxDays = activeEpochs.length
-    ? Math.max(...activeEpochs.map((epochMs) => Math.abs(state.satelliteTimeMs - epochMs))) / 86400000
+  const epochSummary = satelliteActiveEpochSummary();
+  const maxEpoch = epochSummary.max;
+  const maxDays = Number.isFinite(maxEpoch)
+    ? Math.max(Math.abs(state.satelliteTimeMs - epochSummary.min), Math.abs(state.satelliteTimeMs - maxEpoch)) / 86400000
     : 0;
   const newestEpoch = Number.isFinite(maxEpoch) ? new Date(maxEpoch).toISOString() : "";
   const onlyPosition = selectedCount === 1 ? state.satellitePositions.get(state.satelliteVisibleIds[0]) : null;
@@ -7571,7 +7646,7 @@ function syncSatelliteTimeUi() {
     : "";
   const warning = maxDays > 7 || Boolean(state.satelliteHistorySource?.futureProjection);
   els.satelliteEpochStatus.classList.toggle("warn", warning);
-  const customCount = state.satelliteVisibleIds.filter((id) => state.satelliteById.get(String(id))?.customOrbit).length;
+  const customCount = epochSummary.customCount;
   const sourceLabel = customCount === selectedCount && selectedCount
     ? "用户输入多历元"
     : customCount ? "目录与用户输入混合根数"
@@ -7742,12 +7817,25 @@ function rebuildSatelliteSelectionCaches() {
 
 function satelliteSearchMatches(query = state.notamIdSearch.trim().toUpperCase()) {
   const normalized = String(query || "").trim().toUpperCase();
-  return state.satellites.filter((item) => {
-    if (!normalized && !satelliteCategoryEnabled(item)) return false;
-    if (!normalized) return state.selectedSatelliteIds.has(item.id);
+  if (!normalized) return state.satellites.filter((item) => satelliteCategoryEnabled(item) && state.selectedSatelliteIds.has(item.id));
+  const index = getSatelliteSearchIndex();
+  if (satelliteSearchResultCache?.index === index && satelliteSearchResultCache.query === normalized) return satelliteSearchResultCache.items;
+  const items = index.items.filter((item, i) => index.texts[i].includes(normalized));
+  satelliteSearchResultCache = { index, query: normalized, items };
+  return items;
+}
+
+function getSatelliteSearchIndex() {
+  if (satelliteSearchIndex?.items === state.satellites && satelliteSearchIndex.payloads === state.satellitePayloadSearchById) return satelliteSearchIndex;
+  const items = state.satellites;
+  const texts = items.map((item) => {
     const payloadText = state.satellitePayloadSearchById.get(String(item.id)) || "";
-    return `${item.name} ${item.noradId} ${item.internationalDesignator} ${item.owner || ""} ${item.orbitClass} ${item.operationalStatusLabel || ""} ${satelliteObjectClass(item)} ${satelliteObjectClassLabel(item)} ${item.objectTypeLabel || ""} ${payloadText}`.toUpperCase().includes(normalized);
+    return `${item.name} ${item.noradId} ${item.internationalDesignator} ${item.owner || ""} ${item.orbitClass} ${item.operationalStatusLabel || ""} ${satelliteObjectClass(item)} ${satelliteObjectClassLabel(item)} ${item.objectTypeLabel || ""} ${payloadText}`.toUpperCase();
   });
+  const classCompare = new Intl.Collator().compare, nameCompare = new Intl.Collator("zh-CN").compare;
+  const sorted = [...items].sort((a, b) => classCompare(satelliteObjectClass(a), satelliteObjectClass(b)) || classCompare(a.orbitClass, b.orbitClass) || nameCompare(a.name, b.name));
+  satelliteSearchIndex = { items, texts, sorted, payloads: state.satellitePayloadSearchById };
+  return satelliteSearchIndex;
 }
 
 function scheduleSatelliteSearchRender() {
@@ -7761,9 +7849,8 @@ function scheduleSatelliteSearchRender() {
 }
 
 function satelliteListItems() {
-  const matches = satelliteSearchMatches();
-  if (state.notamIdSearch.trim()) return matches;
-  return matches.sort((a, b) => satelliteObjectClass(a).localeCompare(satelliteObjectClass(b)) || (a.orbitClass.localeCompare(b.orbitClass)) || a.name.localeCompare(b.name, "zh-CN"));
+  if (state.notamIdSearch.trim()) return satelliteSearchMatches();
+  return getSatelliteSearchIndex().sorted.filter((item) => satelliteCategoryEnabled(item) && state.selectedSatelliteIds.has(item.id));
 }
 
 function renderSatelliteList() {
@@ -8809,8 +8896,8 @@ function renderList() {
       const membership = trajectoryMembership(item.id, membershipIndex);
       const inTrajectory = Boolean(membership);
       const inTimeWindow = state.timeWindowRestrictionIds.has(item.id);
-      const shape = item.hasGeometry ? "有图形" : "无图形";
-      const geometryNote = item.hasGeometry ? item.geometrySource : item.geometryReason;
+      const shape = item.hasGeometry ? item.geometryComplete === false ? "部分图形" : "有图形" : "无图形";
+      const geometryNote = item.geometryReason || item.geometrySource;
       const altitudeNote = formatAltitudeWithMeters(item.altitude);
       return `
         <div class="restriction-card-wrap ${inTrajectory ? "trajectory-picked" : ""} ${inTimeWindow ? "time-window-picked" : ""}">
@@ -8824,6 +8911,7 @@ function renderList() {
             <span class="card-meta" ${item.timeLabel ? "data-i18n-static" : ""}>${escapeHtml(item.timeLabel || "时间未解析")}</span>
             <span class="card-meta">${escapeHtml(altitudeNote)}</span>
             <span class="card-meta">${escapeHtml(geometryNote || "图形状态未解析")}</span>
+            ${item.retainedFromPreviousRefresh ? `<span class="card-meta">本海区本次获取不完整，显示上次缓存：${escapeHtml(formatDateTime(item.previousFetchedAt))}</span>` : ""}
           </button>
           ${inTimeWindow ? `<span class="time-window-membership">同时间窗口</span>` : ""}
           ${inTrajectory ? `<span class="trajectory-membership" style="border-color:${membership.color};color:${membership.color}">${escapeHtml(membership.label)}</span>` : ""}
@@ -11986,6 +12074,95 @@ function satelliteFixedTargetReferenceMotion(target, position) {
 }
 
 function updateThreeSatelliteOrbits(globe, layer) {
+  const ids = satelliteOrbitPathIds(visibleSelectedSatelliteIds());
+  if (satelliteGeometryFailed || typeof Worker !== "function" || ids.some(id => { const path = state.satelliteOrbitPaths.get(id); return path && !ArrayBuffer.isView(path); })) {
+    updateThreeSatelliteOrbitsSynchronously(globe, layer); return;
+  }
+  if (satelliteGeometryBusy) return;
+  const revision = satelliteGpuOrbitRevision, selection = satelliteSelectionRevision;
+  const referenceFrame = state.satelliteReferenceFrame, referenceEpochMs = state.satelliteReferenceEpochMs;
+  if (!satelliteGeometryWorker) {
+    const worker = new Worker("/frontend/satellite-geometry-worker.js?v=performance-20261016-1");
+    satelliteGeometryWorker = worker;
+    worker.onerror = () => {
+      if (worker !== satelliteGeometryWorker) return;
+      satelliteGeometryFailed = true; satelliteGeometryBusy = false;
+      satelliteGeometryWorker?.terminate(); satelliteGeometryWorker = null; satelliteGeometrySentPaths.clear();
+      layer.orbitRevision = -1; scheduleDraw();
+    };
+  }
+  const worker = satelliteGeometryWorker, updates = [], entries = [], colors = new Map();
+  const wanted = new Set(ids), removeIds = [];
+  for (const id of satelliteGeometrySentPaths.keys()) if (!wanted.has(id)) { removeIds.push(id); satelliteGeometrySentPaths.delete(id); }
+  for (const id of ids) {
+    const path = state.satelliteOrbitPaths.get(id), item = state.satelliteById.get(id);
+    if (satelliteGeometrySentPaths.get(id) !== path) { updates.push({ id, path: path || null }); satelliteGeometrySentPaths.set(id, path); }
+    if (!item || !satelliteCategoryEnabled(item)) continue;
+    const colorHex = satelliteDisplayColor(item);
+    let color = colors.get(colorHex);
+    if (!color) { const value = new globe.THREE.Color(colorHex); color = { r: value.r, g: value.g, b: value.b }; colors.set(colorHex, color); }
+    const position = state.satellitePositions.get(id);
+    entries.push({ id, color, anchor: position ? satelliteReferenceScenePosition(position) : null });
+  }
+  satelliteGeometryBusy = true;
+  worker.onmessage = (event) => {
+    if (worker !== satelliteGeometryWorker) return;
+    satelliteGeometryBusy = false;
+    if (event.data.error) { satelliteGeometryFailed = true; satelliteGeometrySentPaths.clear(); }
+    const current = revision === satelliteGpuOrbitRevision && selection === satelliteSelectionRevision
+      && referenceFrame === state.satelliteReferenceFrame && referenceEpochMs === state.satelliteReferenceEpochMs && globe === globeRendererState;
+    if (current && !event.data.error) applySatelliteOrbitGeometry(globe, layer, event.data.result);
+    else layer.orbitRevision = -1;
+    requestSatelliteThreeDraw();
+  };
+  worker.postMessage({ ids, entries, updates, removeIds, referenceFrame, referenceEpochMs,
+    referenceTimeMs: satelliteLastPropagatedTimeMs || state.satelliteTimeMs, denseThreshold: SATELLITE_DENSE_ORBIT_LINE_THRESHOLD });
+}
+
+function applySatelliteOrbitGeometry(globe, layer, data) {
+  const { starts, ends, colors, densePositions, denseColors, denseOrbitMode, segmentCount, orbitCount, closedOrbitCount, continuousOrbitCount, rejectedClosureCount, rejectedClosureIds, anchorMaxErrorScene, referenceTimeMs } = data;
+  if (denseOrbitMode) {
+    setSatelliteInstancedGeometryCount(layer.orbitGeometry, 0);
+    layer.denseOrbitGeometry.setAttribute(
+      "position",
+      new globe.THREE.BufferAttribute(densePositions.subarray(0, segmentCount * 6), 3),
+    );
+    layer.denseOrbitGeometry.setAttribute(
+      "color",
+      new globe.THREE.BufferAttribute(denseColors.subarray(0, segmentCount * 6), 3),
+    );
+    layer.denseOrbitGeometry.setDrawRange(0, segmentCount * 2);
+    layer.denseOrbitGeometry.boundingSphere = data.boundingSphere
+      ? new globe.THREE.Sphere(new globe.THREE.Vector3(data.boundingSphere.center.x, data.boundingSphere.center.y, data.boundingSphere.center.z), data.boundingSphere.radius)
+      : new globe.THREE.Sphere(new globe.THREE.Vector3(), 0);
+  } else {
+    layer.denseOrbitGeometry.setDrawRange(0, 0);
+    layer.orbitGeometry.setAttribute("instanceStart", new globe.THREE.InstancedBufferAttribute(starts.subarray(0, segmentCount * 3), 3));
+    layer.orbitGeometry.setAttribute("instanceEnd", new globe.THREE.InstancedBufferAttribute(ends.subarray(0, segmentCount * 3), 3));
+    layer.orbitGeometry.setAttribute("instanceColor", new globe.THREE.InstancedBufferAttribute(colors.subarray(0, segmentCount * 3), 3));
+    setSatelliteInstancedGeometryCount(layer.orbitGeometry, segmentCount);
+  }
+  layer.orbitCount = orbitCount;
+  layer.orbitClosedCount = closedOrbitCount;
+  layer.orbitContinuousCount = continuousOrbitCount;
+  layer.orbitRejectedClosureCount = rejectedClosureCount;
+  layer.orbitRejectedClosureIds = rejectedClosureIds;
+  layer.orbitSegmentCount = segmentCount;
+  layer.orbitSubmittedSegmentCount = denseOrbitMode
+    ? segmentCount
+    : Math.min(
+      Math.max(0, Number(layer.orbitGeometry.instanceCount) || 0),
+      Math.max(0, Number(layer.orbitGeometry._maxInstanceCount) || 0),
+    );
+  layer.denseOrbitMode = denseOrbitMode;
+  layer.orbitReferenceTimeMs = referenceTimeMs;
+  layer.orbitAnchorMaxErrorKm = anchorMaxErrorScene * EARTH_MEAN_RADIUS_KM;
+  layer.orbitExpectedCount = data.expectedCount;
+  satelliteDrawableOrbitCount = orbitCount;
+  updateSatelliteSelectionStatus();
+}
+
+function updateThreeSatelliteOrbitsSynchronously(globe, layer) {
   const expectedOrbitIds = satelliteOrbitPathIds(visibleSelectedSatelliteIds());
   const denseOrbitMode = expectedOrbitIds.length >= SATELLITE_DENSE_ORBIT_LINE_THRESHOLD;
   const denseColorScale = expectedOrbitIds.length > 8000
@@ -13420,9 +13597,13 @@ function drawWatchRegions(ctx, width, height) {
 
 function drawRestrictions(ctx, width, height) {
   if (isGlobeLayer() && globeRendererState?.restrictionGpuLayer) {
-    const allDrawable = drawnFilteredItems().filter(restrictionHasDrawableAreaGeometry);
-    state.drawableRestrictions = allDrawable;
-    state.drawableRestrictionById = new Map(allDrawable.map((item) => [item.id, item]));
+    const source = drawnFilteredItems();
+    if (globeDrawableItemsCache?.source !== source) {
+      const items = source.filter(restrictionHasDrawableAreaGeometry);
+      globeDrawableItemsCache = { source, items, byId: new Map(items.map((item) => [item.id, item])) };
+    }
+    state.drawableRestrictions = globeDrawableItemsCache.items;
+    state.drawableRestrictionById = globeDrawableItemsCache.byId;
     state.restrictionPathsById = new Map();
     state.paths = [];
     els.canvas.dataset.restrictionCache = "webgl-resident-geometry";
@@ -13895,14 +14076,17 @@ function updateFlatBallisticAnimationGpu(session, frameItems, timestamp, width, 
 
 function buildRestrictionSurfaceCache(drawable, width, height, signature, reusableCache = null) {
   const dpr = Math.min(window.devicePixelRatio || 1, currentRenderDprCap());
-  const canvas = reusableCache?.canvas || document.createElement("canvas");
+  // Keep the previous cached surface immutable while the GPU may still read it.
+  // Reusing its backing canvas can show an older area's pixels after filtering.
+  // Panning still reuses the completed cache in the translation fast path.
+  const canvas = document.createElement("canvas");
   const targetWidth = Math.max(1, Math.round(width * dpr));
   const targetHeight = Math.max(1, Math.round(height * dpr));
   if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
     canvas.width = targetWidth;
     canvas.height = targetHeight;
   }
-  const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+  const ctx = canvas.getContext("2d", { alpha: true });
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -14978,7 +15162,7 @@ function buildBallisticStageSegment(stage, selected, path, stageIndex = 0, pathS
     maxTimeSec: stage.maxTimeSec,
     outputStepSec: Math.min(60, Math.max(4, stage.maxTimeSec / 20000)),
   };
-  const physics = cachedBallisticPropagation(options);
+  const physics = cachedBallisticPropagation(options, stage);
   const segment = {
     type: "stage",
     stage,
@@ -15038,48 +15222,178 @@ function ballisticPropagationCacheKey(options) {
     options.f107Average,
     options.ap,
     options.outputStepSec,
+    options.minimumStepSec, options.maximumStepSec, options.positionToleranceM, options.velocityToleranceMps, options.relativeTolerance,
   ]);
 }
 
-function cachedBallisticPropagation(options) {
+function cachedBallisticPropagation(options, owner = null) {
   const key = ballisticPropagationCacheKey(options);
-  if (options.atmosphereModel !== "nrlmsise00" || !options.dragEnabled) {
-    if (ballisticSimulationCache.has(key)) {
-      ballisticPerformanceStats.propagationHits += 1;
-      return ballisticSimulationCache.get(key);
-    }
-    ballisticPerformanceStats.propagationRuns += 1;
-    const result = BALLISTIC_PHYSICS.propagateStage({ ...options, atmosphereModel: "standard1976" });
-    ballisticSimulationCache.set(key, result);
-    if (ballisticSimulationCache.size > 64) ballisticSimulationCache.delete(ballisticSimulationCache.keys().next().value);
-    return result;
-  }
+  if (options.atmosphereModel !== "nrlmsise00" || !options.dragEnabled) return cachedStandardBallisticPropagation(options, key, owner);
   const cached = ballisticEmpiricalSimulationCache.get(key);
-  if (cached?.status === "ready") {
+  if (cached) {
     ballisticPerformanceStats.propagationHits += 1;
-    return cached.result;
+    if (cached.status !== "ready" && cached.fallback?.computationStatus === "pending") {
+      cached.fallback = cachedStandardBallisticPropagation({ ...options, atmosphereModel: "standard1976" }, cached.fallbackKey, owner);
+      cached.displayResult = { ...cached.fallback, empiricalStatus: cached.status, ...(cached.error ? { empiricalError: cached.error } : {}) };
+    }
+    return cached.status === "ready" ? cached.result : cached.displayResult;
   }
-  if (cached?.status === "pending") {
-    ballisticPerformanceStats.propagationHits += 1;
-    return cached.displayResult;
-  }
-  if (cached?.status === "error") {
-    ballisticPerformanceStats.propagationHits += 1;
-    return cached.displayResult;
-  }
-  ballisticPerformanceStats.propagationRuns += 1;
-  const fallback = BALLISTIC_PHYSICS.propagateStage({ ...options, atmosphereModel: "standard1976" });
-  const entry = {
-    status: "pending",
-    fallback,
-    displayResult: { ...fallback, empiricalStatus: "pending" },
-    result: null,
-    error: "",
-  };
+  const fallbackKey = `fallback:${key}`;
+  const fallback = cachedStandardBallisticPropagation({ ...options, atmosphereModel: "standard1976" }, fallbackKey, owner);
+  const entry = { status: "pending", fallbackKey, fallback, displayResult: { ...fallback, empiricalStatus: "pending" }, result: null, error: "" };
   ballisticEmpiricalSimulationCache.set(key, entry);
   if (ballisticEmpiricalSimulationCache.size > 64) ballisticEmpiricalSimulationCache.delete(ballisticEmpiricalSimulationCache.keys().next().value);
   requestNrlmsisePropagation(options, key, entry);
-  return { ...fallback, empiricalStatus: "pending" };
+  return entry.displayResult;
+}
+
+function cachedStandardBallisticPropagation(options, key, owner) {
+  let job = ballisticPreviewJobs.get(key);
+  if (owner) {
+    const previous = ballisticPreviewOwners.get(owner);
+    if (previous?.key === key && previous.status === "ready") {
+      ballisticPerformanceStats.propagationHits += 1;
+      return previous.result;
+    }
+    if (previous && previous !== job) {
+      previous.owners?.delete(owner);
+      queueMicrotask(pumpBallisticPreview);
+    }
+  }
+  const cached = ballisticSimulationCache.get(key);
+  if (cached && cached.computationStatus !== "pending") {
+    ballisticPerformanceStats.propagationHits += 1;
+    if (owner) ballisticPreviewOwners.set(owner, { key, status: "ready", result: cached });
+    return cached;
+  }
+  if (!job || job.status === "cancelled") {
+    ballisticPerformanceStats.propagationRuns += 1;
+    const pending = { valid: false, status: "pending", computationStatus: "pending", samples: [], message: "正在计算完整弹道，请稍候。" };
+    job = { key, options: { ...options }, owners: new Set(), unowned: !owner, status: "queued", pending };
+    ballisticPreviewJobs.set(key, job); ballisticSimulationCache.set(key, pending); ballisticPreviewQueue.push(job);
+    trimBallisticPreviewResults();
+  } else ballisticPerformanceStats.propagationHits += 1;
+  if (owner) { job.owners.add(owner); ballisticPreviewOwners.set(owner, job); }
+  else job.unowned = true;
+  // Coalesce synchronous renders/rapid parameter edits before starting new work.
+  if (!job.scheduled) { job.scheduled = true; queueMicrotask(pumpBallisticPreview); }
+  return job.pending;
+}
+
+function trimBallisticPreviewResults() {
+  // A pending result is a live task, not a disposable cache entry. Each stage also
+  // retains its own completed result so many tracks cannot evict one another's work.
+  for (const [key, value] of ballisticSimulationCache) {
+    if (ballisticSimulationCache.size <= 64) break;
+    if (value.computationStatus !== "pending") ballisticSimulationCache.delete(key);
+  }
+}
+
+function discardBallisticPreview(job) {
+  job.status = "cancelled";
+  if (ballisticPreviewJobs.get(job.key) === job) ballisticPreviewJobs.delete(job.key);
+  if (ballisticSimulationCache.get(job.key) === job.pending) ballisticSimulationCache.delete(job.key);
+}
+
+function pumpBallisticPreview() {
+  if (ballisticPreviewActive && !ballisticPreviewActive.unowned && !ballisticPreviewActive.owners.size) {
+    discardBallisticPreview(ballisticPreviewActive); ballisticPreviewActive = null;
+    ballisticPreviewWorker?.terminate(); ballisticPreviewWorker = null;
+  }
+  if (ballisticPreviewActive) return;
+  let job;
+  while ((job = ballisticPreviewQueue.shift())) {
+    if (job.status === "queued" && ballisticPreviewJobs.get(job.key) === job && (job.unowned || job.owners.size)) break;
+    discardBallisticPreview(job);
+  }
+  if (!job) return;
+  ballisticPreviewActive = job; job.status = "running";
+  if (ballisticPreviewWorkerFailed || typeof Worker !== "function") {
+    finishBallisticPreview(job, BALLISTIC_PHYSICS.propagateStage(job.options)); return;
+  }
+  try {
+    if (!ballisticPreviewWorker) {
+      const worker = new Worker("/frontend/ballistic-preview-worker.js?v=performance-20261016-1");
+      ballisticPreviewWorker = worker;
+      worker.onmessage = ({ data }) => {
+        if (worker !== ballisticPreviewWorker || data.key !== ballisticPreviewActive?.key) return;
+        const active = ballisticPreviewActive;
+        if (data.error) finishBallisticPreview(active, { valid: false, samples: [], status: "error", message: data.error });
+        else finishBallisticPreview(active, data.result);
+      };
+      worker.onerror = () => {
+        if (worker !== ballisticPreviewWorker) return;
+        ballisticPreviewWorkerFailed = true; worker.terminate(); ballisticPreviewWorker = null;
+        const active = ballisticPreviewActive;
+        if (active) finishBallisticPreview(active, BALLISTIC_PHYSICS.propagateStage(active.options));
+      };
+    }
+    ballisticPreviewWorker.postMessage({ key: job.key, options: job.options });
+  } catch {
+    ballisticPreviewWorkerFailed = true;
+    finishBallisticPreview(job, BALLISTIC_PHYSICS.propagateStage(job.options));
+  }
+}
+
+function finishBallisticPreview(job, result) {
+  if (job !== ballisticPreviewActive) return;
+  ballisticPreviewActive = null; job.status = "ready";
+  const current = ballisticPreviewJobs.get(job.key) === job && ballisticSimulationCache.get(job.key) === job.pending;
+  if (current) {
+    ballisticSimulationCache.set(job.key, result);
+    for (const owner of job.owners) ballisticPreviewOwners.set(owner, { key: job.key, status: "ready", result });
+    trimBallisticPreviewResults();
+    for (const entry of ballisticEmpiricalSimulationCache.values()) if (entry.fallbackKey === job.key) {
+      entry.fallback = result;
+      if (entry.status !== "ready") entry.displayResult = { ...result, empiricalStatus: entry.status, ...(entry.error ? { empiricalError: entry.error } : {}) };
+    }
+    ballisticPhysicsRevision += 1; scheduleDraw(); requestBallisticAnimationDraw();
+    refreshBallisticResultUi();
+  }
+  job.owners.clear();
+  // Completed jobs are represented by the existing bounded result cache.
+  if (ballisticPreviewJobs.get(job.key) === job) ballisticPreviewJobs.delete(job.key);
+  queueMicrotask(pumpBallisticPreview);
+}
+
+function refreshBallisticResultUi() {
+  const root = els.trajectoryPlanList;
+  if (!root.contains(document.activeElement)) { renderTrajectoryPlan(); return; }
+  const track = activeTrajectory(), stage = activeBallisticStage(track);
+  if (!stage) return;
+  const segment = activeBallisticSegment(track, stage);
+  // A completed background task must update its result without replacing the input
+  // the user is editing. Bind events only on the panels that were actually replaced.
+  for (const [selector, markup] of [
+    [".ballistic-result", renderBallisticPreview(segment, stage)],
+    [".ballistic-target-panel", renderBallisticTargetControls(segment, stage)],
+    [".ballistic-reentry-panel", renderReentryAnimationControls(track, segment, stage)],
+  ]) {
+    const previous = root.querySelector(selector);
+    if (!previous) continue;
+    const template = document.createElement("template"); template.innerHTML = markup.trim();
+    const next = template.content.firstElementChild;
+    if (!next) continue;
+    if (previous.contains(document.activeElement)) {
+      // Animation offsets/target fields can also have focus. Refresh statuses and
+      // availability in place, leaving input values, selection and listeners intact.
+      for (const control of previous.querySelectorAll("button, input, select")) {
+        const key = [...control.attributes].find(attribute => attribute.name.startsWith("data-ballistic-"));
+        const fresh = key && next.querySelector(`[${key.name}="${CSS.escape(key.value)}"]`);
+        if (fresh) {
+          control.disabled = fresh.disabled;
+          if (control.type === "range" && fresh.hasAttribute("max")) control.max = fresh.max;
+        }
+      }
+      for (const selector of [".ballistic-target-status", ".ballistic-object-name", ".ballistic-object-metrics", ".ballistic-animation-object-option small", "[data-ballistic-animation-duration]"]) {
+        const oldNodes = previous.querySelectorAll(selector), newNodes = next.querySelectorAll(selector);
+        oldNodes.forEach((node, index) => { if (newNodes[index] && !node.contains(document.activeElement)) node.replaceWith(newNodes[index].cloneNode(true)); });
+      }
+      const options = previous.querySelectorAll(".ballistic-animation-object-option"), freshOptions = next.querySelectorAll(".ballistic-animation-object-option");
+      options.forEach((option, index) => { if (freshOptions[index]) option.className = freshOptions[index].className; });
+    } else { previous.replaceWith(next); bindBallisticControlEvents(next); }
+  }
+  drawBallisticProfile(segment);
 }
 
 function requestNrlmsisePropagation(options, key, entry) {
@@ -15152,7 +15466,7 @@ async function flushNrlmsisePropagationQueue() {
     ballisticPhysicsRevision += 1;
     scheduleDraw();
     requestBallisticAnimationDraw();
-    if (!els.trajectoryPlanList.contains(document.activeElement)) renderTrajectoryPlan();
+    refreshBallisticResultUi();
   }
   if (ballisticEmpiricalRequestQueue.length && ballisticEmpiricalRequestFlushTimer === null) {
     ballisticEmpiricalRequestFlushTimer = window.setTimeout(flushNrlmsisePropagationQueue, 0);
@@ -17616,31 +17930,37 @@ function drawGeoRings(ctx, rings, width, height, paint = true) {
   const path = new Path2D();
   let added = false;
   let ringReferenceLon = state.view.lon;
-  const worldSize = flatProjectionFrameFor(width, height).worldSize;
+  const frame = flatProjectionFrameFor(width, height);
+  const worldSize = frame.worldSize;
   for (const ring of rings) {
-    const normalized = normalizeRingForDrawing(ring, ringReferenceLon);
-    if (!normalized) continue;
-    if (!added) ringReferenceLon = averageRingLongitude(normalized);
-    const projected = normalized.map(([lon, lat]) => projectUnwrapped(lon, lat, width, height));
-    const minX = Math.min(...projected.map((point) => point.x));
-    const maxX = Math.max(...projected.map((point) => point.x));
-    const firstCopy = Math.ceil(-maxX / worldSize);
-    const lastCopy = Math.floor((width - minX) / worldSize);
-    for (let copy = firstCopy; copy <= lastCopy; copy += 1) {
-      projected.forEach((point, index) => {
-        const x = point.x + copy * worldSize;
-        if (index === 0) path.moveTo(x, point.y);
-        else path.lineTo(x, point.y);
-      });
-      path.closePath();
-      added = true;
+    // Geometry rings are immutable, as for the existing triangulation/bounds caches.
+    let source = flatRingSourceCache.get(ring);
+    if (!source) {
+      const normalized = normalizeRingForDrawing(ring, 0);
+      if (!normalized) continue;
+      source = { normalized, average: averageRingLongitude(normalized), ys: normalized.map(([, lat]) => mercatorYUnit(lat)) };
+      flatRingSourceCache.set(ring, source);
+    }
+    const shift = Math.round((ringReferenceLon - source.average) / 360) * 360;
+    if (!added) ringReferenceLon = source.average + shift;
+    const projected = new Array(source.normalized.length);
+    let minX = Infinity, maxX = -Infinity;
+    for (let index = 0; index < projected.length; index += 1) {
+      const x = width / 2 + ((source.normalized[index][0] + shift + 180) / 360) * worldSize - frame.centerX;
+      const y = height / 2 + source.ys[index] * worldSize - frame.centerY;
+      projected[index] = { x, y };
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    }
+    for (let copy = Math.ceil(-maxX / worldSize); copy <= Math.floor((width - minX) / worldSize); copy += 1) {
+      for (let index = 0; index < projected.length; index += 1) {
+        const point = projected[index], x = point.x + copy * worldSize;
+        if (index === 0) path.moveTo(x, point.y); else path.lineTo(x, point.y);
+      }
+      path.closePath(); added = true;
     }
   }
   if (!added) return [];
-  if (paint) {
-    ctx.fill(path, "evenodd");
-    ctx.stroke(path);
-  }
+  if (paint) { ctx.fill(path, "evenodd"); ctx.stroke(path); }
   return [path];
 }
 
@@ -18842,7 +19162,8 @@ function tooltipRestrictionHtml(item, { compact, layerIndex, layerCount }) {
     <span>原文时间：<span ${item.timeLabel ? "data-i18n-static" : ""}>${escapeHtml(item.timeLabel || "未解析")}</span></span>
     <span>北京时间：${escapeHtml(beijingTime)}</span>
     <span>高度：${escapeHtml(altitudeNote)}</span>
-    <span>图形：${escapeHtml(item.hasGeometry ? item.geometrySource || "已解析" : item.geometryReason || "无")}</span>
+    <span>图形：${escapeHtml(item.geometryReason || item.geometrySource || (item.hasGeometry ? "已解析" : "无"))}</span>
+    ${item.retainedFromPreviousRefresh ? `<span>本海区本次获取不完整，显示上次缓存：${escapeHtml(formatDateTime(item.previousFetchedAt))}</span>` : ""}
     <span class="tooltip-coords"><em>顶点坐标（纬度 经度）</em>${escapeHtml(vertexText)}</span>
     ${rawDisplay ? `<span class="tooltip-raw ${compact ? "compact" : ""}"><em>${escapeHtml(rawWarningLabel)}</em><span data-i18n-static>${escapeHtml(rawDisplay)}</span></span>` : ""}
     ${compact ? "</div>" : ""}
@@ -19264,7 +19585,7 @@ function auditClientGeometry(geometry) {
   const rings = geometryVertexRings(geometry);
   if (!rings.length) return null;
   for (const ring of rings) {
-    const metrics = clientRingMetrics(ring);
+    const metrics = clientRingMetrics(ring, true);
     if (!metrics) return "几何坐标无效，前端未绘制";
     if (metrics.lonSpan > MAX_NOTAM_DRAW_LON_SPAN || metrics.latSpan > MAX_NOTAM_DRAW_LAT_SPAN) {
       return "前端几何审计：跨度过大，疑似多个区域或航路点被错连";
@@ -19275,7 +19596,7 @@ function auditClientGeometry(geometry) {
   return null;
 }
 
-function clientRingMetrics(ring) {
+function clientRingMetrics(ring, auditOnly = false) {
   const clean = (Array.isArray(ring) ? ring : [])
     .map((coord) => [Number(coord?.[0]), Number(coord?.[1])])
     .filter(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat));
@@ -19292,6 +19613,12 @@ function clientRingMetrics(ring) {
 
   const lons = unwrapped.map(([lon]) => lon);
   const lats = unwrapped.map(([, lat]) => lat);
+  if (auditOnly) return {
+    lonSpan: Math.max(...lons) - Math.min(...lons),
+    latSpan: Math.max(...lats) - Math.min(...lats),
+    selfIntersects: clientRingSelfIntersects(unwrapped),
+    area: Math.abs(planarRingArea(unwrapped)),
+  };
   const segments = [];
   for (let index = 1; index < unwrapped.length; index += 1) {
     segments.push(greatCircleDistanceKm({ lon: unwrapped[index - 1][0], lat: unwrapped[index - 1][1] }, { lon: unwrapped[index][0], lat: unwrapped[index][1] }));
@@ -19331,18 +19658,29 @@ function clientMinTurnAngleDeg(points) {
 }
 
 function clientRingSelfIntersects(points) {
-  const lastIndex = points.length - 1;
-  for (let a = 0; a < lastIndex; a += 1) {
-    for (let b = a + 1; b < lastIndex; b += 1) {
-      if (Math.abs(a - b) <= 1) continue;
-      if (a === 0 && b === lastIndex - 1) continue;
-      if (clientSegmentsIntersect(points[a], points[a + 1], points[b], points[b + 1])) return true;
+  const edgeCount = points.length - 1;
+  const edges = [];
+  for (let index = 0; index < edgeCount; index += 1) {
+    const a = points[index], b = points[index + 1];
+    edges.push({ index, a, b, minX: Math.min(a[0], b[0]), maxX: Math.max(a[0], b[0]), minY: Math.min(a[1], b[1]), maxY: Math.max(a[1], b[1]) });
+  }
+  edges.sort((a, b) => a.minX - b.minX || a.index - b.index);
+  let active = [];
+  for (const edge of edges) {
+    active = active.filter((other) => other.maxX >= edge.minX);
+    for (const other of active) {
+      const separation = Math.abs(edge.index - other.index);
+      if (separation <= 1 || separation === edgeCount - 1 || other.maxY < edge.minY || edge.maxY < other.minY) continue;
+      // Keep the existing robust predicate, including endpoint/collinear semantics.
+      if (clientSegmentsIntersect(edge.a, edge.b, other.a, other.b)) return true;
     }
+    active.push(edge);
   }
   return false;
 }
 
 function clientSegmentsIntersect(a, b, c, d) {
+  if (Math.max(a[0],b[0])<Math.min(c[0],d[0]) || Math.max(c[0],d[0])<Math.min(a[0],b[0]) || Math.max(a[1],b[1])<Math.min(c[1],d[1]) || Math.max(c[1],d[1])<Math.min(a[1],b[1])) return false;
   const o1 = clientOrientation(a, b, c);
   const o2 = clientOrientation(a, b, d);
   const o3 = clientOrientation(c, d, a);
@@ -19360,12 +19698,11 @@ function clientSegmentsIntersect(a, b, c, d) {
 }
 
 function clientOrientationSign(value) {
-  const epsilon = 1e-14;
-  return value > epsilon ? 1 : value < -epsilon ? -1 : 0;
+  return Math.sign(value);
 }
 
 function clientPointOnSegment(a, b, point) {
-  const epsilon = 1e-10;
+  const epsilon = 0;
   return (
     point[0] >= Math.min(a[0], b[0]) - epsilon &&
     point[0] <= Math.max(a[0], b[0]) + epsilon &&
@@ -19375,7 +19712,7 @@ function clientPointOnSegment(a, b, point) {
 }
 
 function clientOrientation(a, b, c) {
-  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  return -globalThis.predicates.orient2d(a[0], a[1], b[0], b[1], c[0], c[1]);
 }
 
 function clientSamePoint(a, b) {
@@ -19455,59 +19792,47 @@ function renderCustomCoordinateControls(message = "") {
 }
 
 function renderCustomCoordinateList() {
-  if (!els.customCoordinateList) return;
-  els.customCoordinateList.replaceChildren();
+  const list = els.customCoordinateList;
+  if (!list) return;
   if (!state.customItems.length) {
+    customCoordinateRows.clear();
+    if (list.children.length === 1 && list.firstElementChild?.className === "custom-coordinate-empty") return;
     const empty = document.createElement("p");
     empty.className = "custom-coordinate-empty";
-    empty.textContent = "\u6682\u65e0\u81ea\u5b9a\u4e49\u5750\u6807";
-    els.customCoordinateList.appendChild(empty);
+    empty.textContent = "暂无自定义坐标";
+    list.replaceChildren(empty);
     return;
   }
-
-  const fragment = document.createDocumentFragment();
+  if (list.firstElementChild?.className === "custom-coordinate-empty") list.replaceChildren();
+  const present = new Set();
+  let cursor = list.firstElementChild;
   for (const item of state.customItems) {
-    const row = document.createElement("div");
-    row.className = "custom-coordinate-row";
-    row.classList.toggle("selected", item.id === state.selectedCustomId);
-
-    const main = document.createElement("button");
-    main.type = "button";
-    main.className = "custom-coordinate-main";
-    main.dataset.customSelect = item.id;
-
-    const title = document.createElement("span");
-    title.className = "custom-coordinate-name";
-    title.textContent = item.name || "\u672a\u547d\u540d\u5750\u6807";
-
-    const meta = document.createElement("span");
-    meta.className = "custom-coordinate-meta";
-    meta.textContent = customCoordinateListMeta(item);
-
-    const coords = document.createElement("span");
-    coords.className = "custom-coordinate-coords";
-    coords.textContent = customCoordinateListCoordinates(item);
-
-    main.append(title, meta, coords);
-
-    const actions = document.createElement("div");
-    actions.className = "custom-coordinate-actions";
-
-    const fitButton = document.createElement("button");
-    fitButton.type = "button";
-    fitButton.dataset.customFit = item.id;
-    fitButton.textContent = "\u5b9a\u4f4d";
-
-    const deleteButton = document.createElement("button");
-    deleteButton.type = "button";
-    deleteButton.dataset.customDelete = item.id;
-    deleteButton.textContent = "\u5220\u9664";
-
-    actions.append(fitButton, deleteButton);
-    row.append(main, actions);
-    fragment.appendChild(row);
+    present.add(item.id);
+    let entry = customCoordinateRows.get(item.id);
+    if (!entry) {
+      const row = document.createElement("div"); row.className = "custom-coordinate-row";
+      const main = document.createElement("button"); main.type = "button"; main.className = "custom-coordinate-main"; main.dataset.customSelect = item.id;
+      const title = document.createElement("span"); title.className = "custom-coordinate-name";
+      const meta = document.createElement("span"); meta.className = "custom-coordinate-meta";
+      const coords = document.createElement("span"); coords.className = "custom-coordinate-coords";
+      main.append(title, meta, coords);
+      const actions = document.createElement("div"); actions.className = "custom-coordinate-actions";
+      const fit = document.createElement("button"); fit.type = "button"; fit.dataset.customFit = item.id; fit.textContent = "定位";
+      const remove = document.createElement("button"); remove.type = "button"; remove.dataset.customDelete = item.id; remove.textContent = "删除";
+      actions.append(fit, remove); row.append(main, actions);
+      entry = { row, title, meta, coords }; customCoordinateRows.set(item.id, entry);
+    }
+    const values = [item.name || "未命名坐标", customCoordinateListMeta(item), customCoordinateListCoordinates(item)];
+    for (const [index, element] of [entry.title, entry.meta, entry.coords].entries()) {
+      // Compare source text, not translated DOM text, to preserve i18n and focus.
+      if (entry.values?.[index] !== values[index]) element.textContent = values[index];
+    }
+    entry.values = values;
+    entry.row.classList.toggle("selected", item.id === state.selectedCustomId);
+    if (entry.row !== cursor) list.insertBefore(entry.row, cursor);
+    cursor = entry.row.nextElementSibling;
   }
-  els.customCoordinateList.appendChild(fragment);
+  for (const [id, entry] of customCoordinateRows) if (!present.has(id)) { entry.row.remove(); customCoordinateRows.delete(id); }
 }
 
 function renderSelectedCustomCoordinateValue(item) {
@@ -19540,8 +19865,12 @@ function customCoordinateListCoordinates(item) {
     const [lon, lat] = item.geometry.coordinates;
     return `${formatDecimalPair(lat, lon)} · ${formatDmsPair(lat, lon)}`;
   }
-  const coords = flattenGeometryCoordinates(item.geometry);
-  return `${customGeometryLabel(item.geometry?.type)} · ${coords.length} \u4e2a\u9876\u70b9`;
+  let count = customCoordinateTextCache.get(item.geometry);
+  if (count === undefined) {
+    count = flattenGeometryCoordinates(item.geometry).length;
+    if (item.geometry && typeof item.geometry === "object") customCoordinateTextCache.set(item.geometry, count);
+  }
+  return `${customGeometryLabel(item.geometry?.type)} · ${count} \u4e2a\u9876\u70b9`;
 }
 
 function formatCustomPointInput(item) {
@@ -20489,6 +20818,15 @@ function clearTimeWindowHint() {
 function sameRestrictionTimeWindow(anchor, item) {
   if (!anchor?.id || !item?.id) return false;
   if (anchor.id === item.id) return true;
+  // D-field windows are actual activity periods, not the broad B/C envelope.
+  // Do not group a morning-only area with an evening-only area.
+  if (anchor.scheduleStatus === "unresolved" || item.scheduleStatus === "unresolved") return false;
+  if (anchor.timeIntervals?.length || item.timeIntervals?.length || anchor.scheduleParsed || item.scheduleParsed) {
+    const periods = row => (row.timeIntervals?.length ? row.timeIntervals : row.scheduleParsed ? [] : [{ start: row.beginsAt, end: row.endsAt }])
+      .map(p => [Date.parse(p.start), Date.parse(p.end)]).sort((a, b) => a[0] - b[0]);
+    const a = periods(anchor), b = periods(item);
+    return a.length > 0 && a.length === b.length && a.every((p, i) => p.every((t, j) => Number.isFinite(t) && Math.abs(t - b[i][j]) <= TIME_WINDOW_TOLERANCE_MS));
+  }
   const anchorWindow = anchor.timeWindow;
   const itemWindow = item.timeWindow;
   if (anchorWindow?.beijingKey && itemWindow?.beijingKey && anchorWindow.beijingKey === itemWindow.beijingKey) return true;
@@ -21453,15 +21791,17 @@ function formatTimeZoneDate(value, timeZone) {
   if (!value || /^(PERM|EST)$/i.test(String(value))) return value || "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  return new Intl.DateTimeFormat(window.AppI18n?.isEnglish ? "en-US" : "zh-CN", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date);
+  const locale = window.AppI18n?.isEnglish ? "en-US" : "zh-CN";
+  const key = `${locale}:${timeZone}`;
+  let formatter = dateTimeFormatterCache.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, {
+      timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+    });
+    if (dateTimeFormatterCache.size >= 32) dateTimeFormatterCache.delete(dateTimeFormatterCache.keys().next().value);
+    dateTimeFormatterCache.set(key, formatter);
+  }
+  return formatter.format(date);
 }
 
 function formatGeometryVertices(geometry) {
@@ -21535,6 +21875,7 @@ function escapeHtml(value) {
 }
 
 function normalizeLon(value) {
+  if (value >= -180 && value < 180) return value;
   return ((value + 540) % 360) - 180;
 }
 

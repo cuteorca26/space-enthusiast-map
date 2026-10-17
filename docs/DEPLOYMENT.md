@@ -120,12 +120,30 @@ node -e "const c=require('node:crypto');const s=c.randomBytes(32).toString('base
 
 1. 把代码提交并推送到 GitHub。
 2. 确认 GitHub Actions 检查通过。
-3. 打开 [当前 Render 服务页](https://dashboard.render.com/web/srv-db1dm4c9v7es73f34jkg)，选择 **Manual Deploy → Deploy latest commit**。
+3. 在 [当前 Render 服务页](https://dashboard.render.com/web/srv-db1dm4c9v7es73f34jkg)检查部署状态。当前服务设置为 `main` 提交自动部署；如果没有触发，再检查 Render 的 GitHub 连接。
 4. 等部署完成，检查地图、管理员登录和公共数据恢复状态。
 
 只改 README 或使用说明，无需重启地图后台。GitHub Pages 入口会按工作流发布。
 
-通过公开仓库网址创建的服务不支持自动部署；需要自动部署时，在 Render 关联自己的 GitHub 账号及仓库，再配置相应选项。[Render 部署官方说明](https://render.com/docs/deploys)
+新建服务时应在 Render 关联自己的 GitHub 账号及仓库，确认自动部署选项。[Render 部署官方说明](https://render.com/docs/deploys)
+
+## 每日全量刷新与历史保存
+
+仓库中的 **Daily full warning refresh** 工作流每天 **UTC 07:37／北京时间 15:37** 运行，也可以在 GitHub **Actions → Daily full warning refresh → Run workflow** 立即执行。它只更新 NOTAM、NAVAREA、HYDROPAC，中国航警、卫星和云图仍由管理员按需刷新。
+
+抓取和解析在 GitHub 的标准 Ubuntu 运行器完成，避免占用 Render 免费实例的抓取内存。公开仓库使用标准 GitHub 托管运行器的计算时间免费；本项目没有添加付费 Render 定时服务。[GitHub Actions 费用说明](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
+
+每个来源最多重试一次；NOTAM 不限制每个 FIR 的条数，必须完成全部已发现 FIR 的分页；NAVAREA 扫描 I–XXI；HYDROPAC 扫描当前活动通告的全部分页。任一来源不完整时，该来源本次不发布，保留网站以前的完整数据，并让工作流报告失败。成功来源仍可保存。
+
+每日结果按年度保存在 `scheduled-map-data-年份` GitHub Release 中，文件名带 SHA-256 校验值。网站启动或运行期间会检查新结果，工作流完成后也会唤醒网站进行同步。历史列表保存在服务器并进入现有长期备份；旧历史正文按需下载，避免每天重复打包所有历史，或持续挤占免费实例磁盘。自动历史不会因超出 500 条而被隐藏。
+
+管理员删除历史后，删除结果和已导入批次一起长期保存；下次同步不会把它重新加入左侧列表。删除失败会恢复原记录并提示错误。每日原始归档仍保留在 GitHub Release 中，网站删除的是共享列表中的记录。管理员手动刷新产生的新数据也不会被较早的自动批次覆盖。
+
+工作流使用 GitHub 每次运行自动签发的 `GITHUB_TOKEN`，不需要新建或公开个人 Token。Render 仍沿用已有 `PUBLIC_DATA_REPOSITORY` 和 `GITHUB_DATA_TOKEN`，用于保存历史列表、删除结果和其他公共数据。个人坐标、账号凭据和日志不会进入每日归档。
+
+在右侧“数据更新”查看自动刷新安排和最近同步批次；左侧“图层 → 刷新历史”选择来源、点击日期即可回放，自动记录带有“自动刷新”标记。网页持续打开时每分钟更新同步状态和历史列表，不会强制切换你正在回放的日期。
+
+GitHub 的定时任务可能排队、延后或在高负载时漏跑；公开仓库连续 60 天没有活动时，定时工作流可能被自动停用。遇到这种情况，在 Actions 重新启用工作流并手动运行一次。[GitHub 定时工作流规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 
 ## 部署到自己的服务器
 

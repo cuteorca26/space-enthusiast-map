@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, watch } from 'node:fs';
+import { createReadStream, createWriteStream, watch, readFileSync } from 'node:fs';
 import { mkdir, open, readdir, lstat, rename, rm } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -12,7 +12,7 @@ const MAX_TOTAL = 8 * 1024 * 1024 * 1024;
 const TAG = 'public-map-data';
 const CACHE_FILES = new Set(['faa_notam_cache.json', 'faa_fir_designators_cache.json', 'nga_hydropac_cache.json',
   'nga_hydropac_all_cache.json', 'msa_nav_warning_cache.json', 'navarea_warning_cache.json',
-  'satellite_catalog_cache.json', 'launch_forecast_cache.json', 'refresh_history_index.json', 'cloud_cache/gmgsi_timeline_cache.json']);
+  'satellite_catalog_cache.json', 'launch_forecast_cache.json', 'refresh_history_index.json', 'scheduled_refresh_state.json', 'cloud_cache/gmgsi_timeline_cache.json']);
 const SNAPSHOTS = /^(faa_notam_snapshots|hydropac_snapshots|msa_nav_warning_snapshots|navarea_warning_snapshots|satellite_catalog_snapshots)\/[\w.-]+\.json$/;
 export function isPublicDataPath(path) {
   return typeof path === 'string' && !path.includes('..') && !path.includes('\\') &&
@@ -30,7 +30,17 @@ async function publicFiles(directory, prefix = '') {
 }
 function sizePrefix(size) { const value = Buffer.alloc(4); value.writeUInt32BE(size); return value; }
 export async function packPublicData(directory, output) {
-  const paths = await publicFiles(directory);
+  // Daily bodies already have immutable, checksum-addressed Release assets.
+  // Back up their index/deletions and latest caches, not every historical body
+  // again in an ever-growing monolithic archive.
+  const external = new Set();
+  try {
+    const index = JSON.parse(readFileSync(join(directory, 'refresh_history_index.json'), 'utf8'));
+    const dirs = { notam: 'faa_notam_snapshots', hydropac: 'hydropac_snapshots', navarea: 'navarea_warning_snapshots' };
+    for (const [source, records] of Object.entries(index.sources || {}))
+      for (const record of records || []) if (dirs[source] && /^daily-\d{4}-\d{14}-\d+-\d+-[a-f0-9]{64}\.pack\.gz$/.test(record.dailyAsset || '')) external.add(`${dirs[source]}/${record.id}`);
+  } catch { /* A missing index never excludes legacy history files. */ }
+  const paths = (await publicFiles(directory)).filter(path => !external.has(path));
   if (paths.length > 3000) throw new Error('Public snapshot file limit reached');
   let total = 0;
   async function* records() {

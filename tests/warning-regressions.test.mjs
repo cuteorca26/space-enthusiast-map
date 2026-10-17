@@ -12,8 +12,8 @@ const count = geometry => geometry ? geometry.type === 'MultiPolygon' ? geometry
 
 for (const c of cases) test(`boundary: ${c.id}`, () => {
   const parsed = parseNotamText(c.text);
-  // Corridors remain explicitly unsupported in this release; do not invent a ring.
-  if (c.id === 'explicit-corridor') { assert.equal(parsed.geometry, null); return; }
+  // Corridor vertex counts are adaptive; exact shape is independently checked.
+  if (c.id === 'explicit-corridor') { assert.ok(parsed.geometry, parsed.geometryReason); return; }
   assert.equal(count(parsed.geometry), c.polygons, parsed.geometryReason);
   if (c.vertices != null) {
     const parts = parsed.geometry.type === 'MultiPolygon' ? parsed.geometry.coordinates : [parsed.geometry.coordinates];
@@ -54,8 +54,8 @@ test('a failed NAVAREA retains previous records, including text-only records, wi
 test('circle exclusions form an actual hole and radius sectors do not become full discs', () => {
   const p = parseNotamText('AREA BOUNDED BY 100000N0200000E-100000N0220000E-120000N0220000E-120000N0200000E EXCLUDING AREA CIRCLE CENTERED ON 110000N0210000E RADIUS 5 NM.');
   assert.equal(p.geometry?.coordinates.length, 2);
-  const unsupported = parseNotamText('SECTOR OF CIRCLE RADIUS 5-10KM CENTRE 110000N0210000E BTN AZM 020-112 DEG.');
-  assert.equal(unsupported.geometry, null);
+  const annular = parseNotamText('SECTOR OF CIRCLE RADIUS 5-10KM CENTRE 110000N0210000E BTN AZM 020-112 DEG.');
+  assert.ok(annular.geometry, annular.geometryReason);
 });
 
 test('reference volcano coordinates and route footnotes do not enter ash cloud rings', () => {
@@ -72,12 +72,12 @@ test('mixed real polygon/circle notices retain all independent areas', () => {
     assert.ok(p.geometryComplete, p.geometryReason);
   }
 });
-test('unresolved arcs and multi-point corridors remain clearly identified', () => {
-  for (const id of ['A5539/26', 'U3618/26']) {
-    const p = parseNotamText(real.find(c => c.id === id).text);
-    assert.equal(p.geometry, null);
-    assert.ok(p.geometryReason);
-  }
+test('inconsistent arc is rejected with measured evidence; real multi-point corridor is drawn', () => {
+  const arc = parseNotamText(real.find(c => c.id === 'A5539/26').text);
+  assert.equal(arc.geometry, null);
+  assert.match(arc.geometryReason, /1058.8/);
+  const corridor = parseNotamText(real.find(c => c.id === 'U3618/26').text);
+  assert.ok(corridor.geometryComplete, corridor.geometryReason);
   assert.match(parseNotamText(real.find(c => c.id === 'A5539/26').text).timeLabel, /MON-FRI 0900-2359/);
 });
 test('HYDROPAC each page keeps its own ID, body, date and authority link', () => {
@@ -120,4 +120,6 @@ test('unmapped marine records remain searchable with original text and reason', 
   assert.equal(rows[1].rawText, 'source');
   assert.equal(rows[1].geometry, null);
   assert.equal(rows[1].geometryReason, 'missing boundary');
+  const chinese=context.marineDisplayRecords({skipped:[{id:'cn',warningId:'津航警323/26',rawText:'原始坐标',reason:'点数矛盾'}]},'msa');
+  assert.equal(chinese[0].type,'中国航警');assert.equal(chinese[0].sourceKind,'msa');assert.equal(chinese[0].rawText,'原始坐标');assert.equal(chinese[0].geometryReason,'点数矛盾');
 });

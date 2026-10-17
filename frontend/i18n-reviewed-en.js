@@ -3,6 +3,7 @@
 
   // Human-reviewed terminology takes precedence over the legacy generated catalog.
   root.NOTAM_EN_REVIEWED_TRANSLATIONS = Object.freeze({
+    "正在计算完整弹道，请稍候。": "Calculating the complete trajectory. Please wait.",
     "已保存区域": "Saved areas",
     "原始 NOTAM": "Original NOTAM",
     "保存高亮区域": "Save highlighted areas",
@@ -1023,6 +1024,10 @@
     (s) => {
       const m = s.match(/^等待 (\d+) 个物体完成 NRLMSISE-00 传播计算$/);
       return m ? `Waiting for NRLMSISE-00 propagation for ${m[1]} ${m[1] === "1" ? "object" : "objects"}` : null;
+    },
+    (s) => {
+      const m = s.match(/^等待 (\d+) 个物体完成弹道计算$/);
+      return m ? `Waiting for trajectory calculations for ${m[1]} ${m[1] === "1" ? "object" : "objects"}` : null;
     },
     (s, t) => {
       const m = s.match(/^((?:\d+\.\s*)?)(\d+)\s*级残骸(.*)$/);

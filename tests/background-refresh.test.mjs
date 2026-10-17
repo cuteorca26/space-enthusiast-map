@@ -22,7 +22,7 @@ test('a slow maritime scan retries a disconnect, follows HTTP links, and publish
     import { syncBuiltinESMExports } from 'node:module';
     import { fileURLToPath } from 'node:url';
     const date = new Date().toISOString().slice(0,10);
-    const index = '<li class="nav_lv2_list"><a href="https://www.msa.gov.cn/test/index.jhtml"><div class="nav_lv2_text">上海海事局</div></a></li>'+
+    const index = '<script>pageParam.count=1;pageParam.limit=20;</script><li class="nav_lv2_list"><a href="https://www.msa.gov.cn/test/index.jhtml"><div class="nav_lv2_text">上海海事局</div></a></li>'+
       '<a href="http://www.msa.gov.cn/notice.jhtml"><span class="name">CNSEA10000/26 航警</span><span class="time">'+date+'</span></a>';
     const detail = '<meta name="ArticleTitle" content="CNSEA10000/26 航警"><meta name="PubDate" content="'+date+'"><meta name="ContentSource" content="上海海事局">'+
       '<p>航警区域 300000N 1100000E 300000N 1110000E 310000N 1110000E。SFC-UNL.</p>';

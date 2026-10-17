@@ -13,7 +13,9 @@
     "pngjs": "^7.0.0",
     "proj4": "^2.19.10",
     "satellite.js": "^7.0.0",
-    "three": "^0.184.0"
+    "three": "^0.184.0",
+    "polygon-clipping": "0.15.7",
+    "robust-predicates": "3.0.3"
   },
   "devDependencies": {
     "@xmldom/xmldom": "^0.9.10",

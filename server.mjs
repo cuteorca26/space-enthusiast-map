@@ -1,4 +1,7 @@
-import { explicitRadialBoundary, isolateAshCloudBoundary } from './boundary-primitives.mjs';
+import { orient2d } from 'robust-predicates';
+import { explicitClippedCircle, subtractExplicitAreas, explicitRadialBoundary, explicitArcBoundary, explicitCorridorBoundary, explicitCircleList, explicitLabeledCircles, explicitSharedSectors, normalizeBoundaryLanguage, extractChinesePrimitives, isolateAshCloudBoundary } from './boundary-primitives.mjs';
+import { parseNotamSchedule, validIcaoDate } from './notam-schedule.mjs';
+import { chineseDailyWindows, validChinaDate } from './msa-schedule.mjs';
 import {
   copyFileSync,
   createReadStream,
@@ -16,13 +19,16 @@ import { createServer, Agent as HttpAgent, get as httpGet } from "node:http";
 import { downloadCloudFile, publicFilePath, runtimeSettings, sameOriginWrite } from "./deployment.mjs";
 import { createAdminAccess, requiresAdministrator } from "./admin-access.mjs";
 import { createPublicDataPersistence } from "./public-data-persistence.mjs";
+import { createScheduledRefresh } from "./scheduled-refresh.mjs";
 import { Agent as HttpsAgent, get as httpsGet } from "node:https";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { ComputeWorkerClient } from "./compute-worker-client.mjs";
+import { HistoryDerivedCache } from "./history-derived-cache.mjs";
 import { arch, availableParallelism, cpus, platform, release, totalmem } from "node:os";
 import { basename, extname, join, normalize } from "node:path";
 import { createRequire } from "node:module";
-import { Worker } from "node:worker_threads";
+import { Worker, isMainThread } from "node:worker_threads";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import nrlmsiseModule from "nrlmsise-00";
@@ -35,14 +41,33 @@ import { MemoryBudgetQueue, dataResourceGroup } from "./memory-budget.mjs";
 import { SavedRegionStore, handleSavedRegionsApi } from "./saved-regions.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
+const { host, port, online: onlineDeployment, dataDirectory } = runtimeSettings(root);
 const require = createRequire(import.meta.url);
+const historyCompute = new ComputeWorkerClient("history");
+const cloudCompute = onlineDeployment ? historyCompute : new ComputeWorkerClient("cloud");
+const cloudImageInFlight = new Map();
+let historyIndexPreparation = null;
+let historyIndexNeedsScan = false;
+// Any parser/rule source change invalidates derived files, including temporal semantics.
+const historyDerivedVersion = createHash("sha256");
+for (const file of ["server.mjs", "boundary-primitives.mjs", "notam-schedule.mjs", "msa-schedule.mjs", "history-derived-cache.mjs"]) historyDerivedVersion.update(readFileSync(join(root, file)));
+const historyDerivedCache = new HistoryDerivedCache(root, historyDerivedVersion.digest("hex"), { dataDirectory, memoryBytes: onlineDeployment ? 8 * 1024 * 1024 : undefined });
 const BALLISTIC_ENGINE = require("./frontend/ballistics.js");
 const { Geodesic } = require("geographiclib-geodesic");
 const execFileAsync = promisify(execFile);
-const { host, port, online: onlineDeployment, dataDirectory } = runtimeSettings(root);
 const administrator = createAdminAccess({ enabled: onlineDeployment, secretHash: process.env.ADMIN_SECRET_SHA256 });
-const publicDataPersistence = createPublicDataPersistence({ directory: dataDirectory, enabled: onlineDeployment,
+const publicDataPersistence = createPublicDataPersistence({ directory: dataDirectory, enabled: onlineDeployment && isMainThread,
   repository: process.env.PUBLIC_DATA_REPOSITORY, token: process.env.GITHUB_DATA_TOKEN });
+const scheduledRefresh = createScheduledRefresh({ directory: dataDirectory, enabled: onlineDeployment && isMainThread,
+  repository: process.env.PUBLIC_DATA_REPOSITORY, token: process.env.GITHUB_DATA_TOKEN, ready: publicDataPersistence.ready,
+  beforeApply: async () => { await buildRefreshHistoryListAsync(); },
+  afterApply: async () => {
+    refreshHistoryIndexCache = null;
+    aggregateCache.clear(); hydropacCache.clear(); navareaWarningCache.clear();
+    publicDataPersistence.schedule();
+    if (publicDataPersistence.status().writable) await publicDataPersistence.flush();
+  },
+});
 const satelliteCatalogService = new SatelliteCatalogService(root, dataDirectory);
 const satelliteHistoryService = new SatelliteHistoryService(root, dataDirectory);
 const savedRegionStore = new SavedRegionStore(join(dataDirectory, "saved_regions.json"));
@@ -130,7 +155,7 @@ const FAA_GLOBAL_FIR_GROUP = {
   label: "FAA 全球 FIR/ARTCC",
 };
 
-const MSA_TEMPORAL_PARSE_VERSION = "msa-time-20260830-v3";
+const MSA_TEMPORAL_PARSE_VERSION = "msa-time-20261011-v5";
 
 const FAA_NOTAM_GROUPS = [
   {
@@ -370,10 +395,10 @@ const MSA_NAV_WARNING_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const NAVAREA_WARNING_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const LAUNCH_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const DETAIL_CACHE_TTL_MS = 30 * 60 * 1000;
-const FAA_NOTAM_PARSE_MIGRATION_VERSION = "parse-20261007-explicit-radial-v31";
-const AREA_PARSE_MIGRATION_VERSION = "area-20261007-explicit-radial-v34";
-const MARINE_TEMPORAL_PARSE_VERSION = "marine-time-20261007-v8";
-const REFRESH_HISTORY_LIST_LIMIT = 500;
+const FAA_NOTAM_PARSE_MIGRATION_VERSION = "parse-local-20261011-v38";
+const AREA_PARSE_MIGRATION_VERSION = "area-local-20261011-v41";
+const MARINE_TEMPORAL_PARSE_VERSION = "marine-time-local-20261007-v10";
+const REFRESH_HISTORY_LIST_LIMIT = Infinity;
 const AGGREGATE_CACHE_FILE = join(dataDirectory, "faa_notam_cache.json");
 const FAA_NOTAM_SNAPSHOT_DIR = join(dataDirectory, "faa_notam_snapshots");
 const HYDROPAC_SNAPSHOT_DIR = join(dataDirectory, "hydropac_snapshots");
@@ -572,6 +597,10 @@ const server = createServer(async (req, res) => {
 });
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/scheduled-refresh") {
+    if (url.searchParams.get("sync") === "1") await scheduledRefresh.check({ force: true });
+    sendJson(res, 200, scheduledRefresh.status()); return;
+  }
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, { status: "ok" });
     return;
@@ -631,31 +660,33 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/refresh-history") {
-    sendJson(res, 200, buildRefreshHistoryList());
+    sendJson(res, 200, await buildRefreshHistoryListAsync());
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/refresh-history/item") {
     const source = url.searchParams.get("source");
     const id = url.searchParams.get("id");
-    const snapshot = readRefreshHistoryItem(source, id);
+    const snapshot = await readRefreshHistoryResponse(source, id);
     if (!snapshot) {
       sendJson(res, 404, { error: "history_item_not_found" });
       return;
     }
-    sendJson(res, 200, snapshot);
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(Buffer.from(snapshot.body));
     return;
   }
 
   if (req.method === "DELETE" && url.pathname === "/api/refresh-history/item") {
     const source = url.searchParams.get("source");
     const id = url.searchParams.get("id");
+    await scheduledRefresh.ensureHistory(source, id);
     const deleted = await deleteRefreshHistoryItem(source, id);
     if (!deleted.ok) {
       sendJson(res, deleted.status || 400, { error: deleted.error || "history_delete_failed" });
       return;
     }
-    sendJson(res, 200, { deleted: { source: deleted.source, id: deleted.id }, history: buildRefreshHistoryList() });
+    sendJson(res, 200, { deleted: { source: deleted.source, id: deleted.id }, history: await buildRefreshHistoryListAsync() });
     return;
   }
 
@@ -1718,6 +1749,12 @@ function migrateCachedNotamParseResults(data) {
       ...item,
       beginsAt: parsed.beginAt || item.beginsAt || null,
       endsAt: parsed.endAt || item.endsAt || null,
+      timeIntervals: parsed.timeIntervals,
+      scheduleParsed: parsed.scheduleParsed,
+      scheduleStatus: parsed.scheduleStatus,
+      scheduleRawText: parsed.scheduleRawText,
+      scheduleReason: parsed.scheduleReason,
+      beijingTimeLabel: parsed.beijingTimeLabel || null,
       timeLabel: parsed.timeLabel || item.timeLabel || null,
       altitude: parsed.altitude || item.altitude || null,
       radiusNm: parsed.radiusNm || item.radiusNm || null,
@@ -1885,6 +1922,7 @@ function migrateCachedAreaParseResults(source, data) {
             beginsAt: marineSchedule.beginsAt,
             endsAt: marineSchedule.endsAt,
             timeIntervals: marineSchedule.intervals,
+            scheduleStatus: marineSchedule.scheduleStatus,
             longTerm: marineSchedule.longTerm,
             temporalParseVersion: marineSchedule.temporalParseVersion,
             timeLabel: marineSchedule.timeLabel,
@@ -2279,47 +2317,60 @@ function historyRecords(records) {
 function loadRefreshHistoryIndex() {
   if (refreshHistoryIndexCache) return refreshHistoryIndexCache;
   try {
-    if (existsSync(REFRESH_HISTORY_INDEX_FILE)) {
-      const parsed = JSON.parse(readFileSync(REFRESH_HISTORY_INDEX_FILE, "utf8"));
-      if ([2, 3].includes(parsed?.version) && parsed?.sources && ["notam", "hydropac", "msa", "navarea"].every((source) => Array.isArray(parsed.sources[source]))) {
-        if (!Array.isArray(parsed.sources.satellite)) {
-          seedSatelliteSnapshotFromCurrentCache();
-          parsed.sources.satellite = listSnapshotDirectory("satellite", SATELLITE_SNAPSHOT_DIR);
-        }
-        const summarySources = [
-          ["notam", FAA_NOTAM_SNAPSHOT_DIR, null],
-          ["hydropac", HYDROPAC_SNAPSHOT_DIR, HYDROPAC_CACHE_FILE],
-          ["msa", MSA_NAV_WARNING_SNAPSHOT_DIR, MSA_NAV_WARNING_CACHE_FILE],
-          ["navarea", NAVAREA_WARNING_SNAPSHOT_DIR, NAVAREA_WARNING_CACHE_FILE],
-        ];
-        for (const [source, dir, latestCacheFile] of summarySources) {
-          const expectedVersion = refreshHistorySummaryParseVersion(source);
-          if (parsed.sources[source].some((record) => record.summaryParseVersion !== expectedVersion)) {
-            parsed.sources[source] = listSnapshotDirectory(source, dir, latestCacheFile);
-          }
-        }
-        parsed.version = 3;
-        refreshHistoryIndexCache = parsed;
-        writeRefreshHistoryIndex();
-        return parsed;
-      }
+    const parsed = JSON.parse(readFileSync(REFRESH_HISTORY_INDEX_FILE, "utf8"));
+    if ([2, 3].includes(parsed?.version) && parsed?.sources && ["notam", "hydropac", "msa", "navarea"].every((source) => Array.isArray(parsed.sources[source]))) {
+      historyIndexNeedsScan = !Array.isArray(parsed.sources.satellite);
+      parsed.sources.satellite ||= [];
+      parsed.version = 3; refreshHistoryIndexCache = parsed;
+      return parsed;
     }
-  } catch {
-    // Rebuild the compact index from legacy snapshot files below.
-  }
-  refreshHistoryIndexCache = {
-    version: 3,
-    updatedAt: new Date().toISOString(),
-    sources: {
-      notam: listSnapshotDirectory("notam", FAA_NOTAM_SNAPSHOT_DIR),
-      hydropac: listSnapshotDirectory("hydropac", HYDROPAC_SNAPSHOT_DIR, HYDROPAC_CACHE_FILE),
-      msa: listSnapshotDirectory("msa", MSA_NAV_WARNING_SNAPSHOT_DIR, MSA_NAV_WARNING_CACHE_FILE),
-      navarea: listSnapshotDirectory("navarea", NAVAREA_WARNING_SNAPSHOT_DIR, NAVAREA_WARNING_CACHE_FILE),
-      satellite: (seedSatelliteSnapshotFromCurrentCache(), listSnapshotDirectory("satellite", SATELLITE_SNAPSHOT_DIR)),
-    },
-  };
-  writeRefreshHistoryIndex();
+  } catch { /* Missing/corrupt index is rebuilt asynchronously from immutable snapshots. */ }
+  historyIndexNeedsScan = true;
+  refreshHistoryIndexCache = { version: 3, updatedAt: new Date().toISOString(), sources: { notam: [], hydropac: [], msa: [], navarea: [], satellite: [] } };
   return refreshHistoryIndexCache;
+}
+
+async function buildRefreshHistoryListAsync() {
+  const index = loadRefreshHistoryIndex();
+  if (!historyIndexPreparation) {
+    const sourceDirectories = [["notam", FAA_NOTAM_SNAPSHOT_DIR, null], ["hydropac", HYDROPAC_SNAPSHOT_DIR, HYDROPAC_CACHE_FILE], ["msa", MSA_NAV_WARNING_SNAPSHOT_DIR, MSA_NAV_WARNING_CACHE_FILE], ["navarea", NAVAREA_WARNING_SNAPSHOT_DIR, NAVAREA_WARNING_CACHE_FILE], ["satellite", SATELLITE_SNAPSHOT_DIR, null]];
+    const pendingSources = sourceDirectories.filter(([source]) => historyIndexNeedsScan || index.sources[source].some(record => !record.dailyAsset && (record.summaryParseVersion || "") !== refreshHistorySummaryParseVersion(source)));
+    if (pendingSources.length) {
+      historyIndexPreparation = (async () => {
+        if (historyIndexNeedsScan) seedSatelliteSnapshotFromCurrentCache();
+        for (const [source, directory, latest] of pendingSources) {
+          const before = new Map(index.sources[source].map(record => [record.id, record]));
+          const records = [], candidates = existsSync(directory) ? readdirSync(directory).filter(name => name.endsWith(".json")).map(id => ({ source, path: join(directory, id), id, latest: false })) : [];
+          if (latest && existsSync(latest)) candidates.push({ source, path: latest, id: "latest-cache.json", latest: true });
+          for (const candidate of candidates) {
+            const record = await historyCompute.run("history-summary", candidate);
+            if (record && existsSync(candidate.path) && (!candidate.latest || !records.some(item => item.dataVersion === record.dataVersion || item.savedAt === record.savedAt))) records.push(record);
+          }
+          // A refresh or deletion may happen while the worker runs: preserve newer records.
+          const current = new Map(index.sources[source].map(record => [record.id, record]));
+          const merged = new Map(records.filter(record => historyItemFilePath(source, record.id)).map(record => [record.id, record]));
+          for (const [id, record] of current) {
+            if (record.dailyAsset) merged.set(id, { ...record, ...(merged.get(id) || {}), dailyAsset: record.dailyAsset, automatic: true });
+            else if (record !== before.get(id)) merged.set(id, record);
+          }
+          for (const id of before.keys()) if (!current.has(id)) merged.delete(id);
+          index.sources[source] = historyRecords([...merged.values()]);
+          index.updatedAt = new Date().toISOString(); writeRefreshHistoryIndex();
+        }
+        historyIndexNeedsScan = false;
+      })().finally(() => { historyIndexPreparation = null; });
+    }
+  }
+  if (historyIndexPreparation) await historyIndexPreparation;
+  return buildRefreshHistoryList();
+}
+
+async function readRefreshHistoryResponse(source, id) {
+  await scheduledRefresh.ensureHistory(source, id);
+  // Validate before queueing, and again after completion to respect concurrent deletion.
+  if (!historyItemFilePath(source, id)) return null;
+  const response = await historyCompute.run("history-item", { source, id }, 1);
+  return historyItemFilePath(source, id) ? response : null;
 }
 
 function recordRefreshHistorySnapshot(source, id, cacheKey, savedAt, data) {
@@ -2409,16 +2460,7 @@ function writeJsonFileAtomic(filePath, value, spacing = 0) {
 
 function readSnapshotSummary(source, filePath, id, latest = false) {
   try {
-    const wrapped = JSON.parse(readFileSync(filePath, "utf8"));
-    let data = wrapped.data || wrapped;
-    if (source === "notam") {
-      data = migrateCachedNotamParseResults(data).data;
-    } else if (["hydropac", "msa", "navarea"].includes(source)) {
-      data = migrateCachedAreaParseResults(source, data).data;
-    }
-    const savedAt = wrapped.savedAt || refreshHistorySourceMeta(source, data).fetchedAt || data.faaNotamFetchedAt || data.generatedAt || "";
-    const referenceTime = refreshHistoryReferenceTime(source, wrapped, data);
-    const filteredData = filterPayloadToReferenceTime(source, data, referenceTime, latest ? "latest-cache-history" : "history");
+    const { wrapped, data, savedAt, referenceTime, filteredData } = readHistoryDerivedPayload(source, filePath, id, latest);
     const sourceMeta = refreshHistorySourceMeta(source, filteredData);
     const satellites = Array.isArray(filteredData.satellites) ? filteredData.satellites : [];
     const restrictions = Array.isArray(filteredData.restrictions) ? filteredData.restrictions : [];
@@ -2567,6 +2609,7 @@ function filterPayloadToReferenceTime(source, data, referenceTime, mode = "refer
 function isRestrictionVisibleAtReference(item, referenceMs, { includeFutureAtReference = false, requireKnownSchedule = false } = {}) {
   if (!item || typeof item !== "object") return true;
   const intervals = Array.isArray(item.timeIntervals) ? item.timeIntervals : [];
+  if (item.scheduleParsed && !intervals.length) return false;
   if (intervals.length) {
     const intervalVisible = intervals.some((interval) => {
       const startMs = firstParsableTimeMs([interval?.start, interval?.beginsAt]);
@@ -2593,7 +2636,7 @@ function firstParsableTimeMs(values) {
   return NaN;
 }
 
-function readRefreshHistoryItem(source, id) {
+function historyItemFilePath(source, id) {
   const normalized = String(source || "").toLowerCase();
   const safeId = String(id || "");
   if (!/^[\w.-]+\.json$/.test(safeId)) return null;
@@ -2621,29 +2664,30 @@ function readRefreshHistoryItem(source, id) {
   const filePath = useLatest ? latestFile : dir ? join(dir, safeId) : null;
   const allowedBase = useLatest ? dataDirectory : dir || dataDirectory;
   if (!filePath || !existsSync(filePath) || !normalize(filePath).startsWith(normalize(allowedBase))) return null;
+  return filePath;
+}
+
+function readRefreshHistoryItem(source, id) {
+  const filePath = historyItemFilePath(source, id);
+  if (!filePath) return null;
+  const normalized = String(source || "").toLowerCase();
   try {
-    const wrapped = JSON.parse(readFileSync(filePath, "utf8"));
+    const result = readHistoryDerivedPayload(normalized, filePath, String(id), String(id) === "latest-cache.json");
+    return { source: normalized, id: String(id), savedAt: result.savedAt, referenceTime: result.referenceTime, data: result.filteredData };
+  } catch { return null; }
+}
+
+function readHistoryDerivedPayload(source, filePath, id, latest) {
+  return historyDerivedCache.read(filePath, `${source}:${id}:${latest ? "latest" : "history"}`, (wrapped) => {
     let data = wrapped.data || wrapped;
-    if (normalized === "satellite") {
-      // Satellite catalog snapshots contain no restriction geometry migration.
-    } else if (normalized === "notam") {
-      data = migrateCachedNotamParseResults(data).data;
-    } else {
-      data = migrateCachedAreaParseResults(normalized, data).data;
-    }
-    const savedAt = wrapped.savedAt || refreshHistorySourceMeta(normalized, data).fetchedAt || data.faaNotamFetchedAt || data.generatedAt || "";
-    const referenceTime = refreshHistoryReferenceTime(normalized, wrapped, data);
-    const filteredData = filterPayloadToReferenceTime(normalized, data, referenceTime, useLatest ? "latest-cache-history" : "history");
-    return {
-      source: normalized,
-      id: safeId,
-      savedAt,
-      referenceTime,
-      data: filteredData,
-    };
-  } catch {
-    return null;
-  }
+    if (source === "notam") data = migrateCachedNotamParseResults(data).data;
+    else if (["hydropac", "msa", "navarea"].includes(source)) data = migrateCachedAreaParseResults(source, data).data;
+    const savedAt = wrapped.savedAt || refreshHistorySourceMeta(source, data).fetchedAt || data.faaNotamFetchedAt || data.generatedAt || "";
+    const referenceTime = refreshHistoryReferenceTime(source, wrapped, data);
+    const filteredData = filterPayloadToReferenceTime(source, data, referenceTime, latest ? "latest-cache-history" : "history");
+    // Retain metadata needed by the compact summary, without duplicating the full payload.
+    return { wrapped: { savedAt: wrapped.savedAt, cacheKey: wrapped.cacheKey, historyDate: wrapped.historyDate }, data: { historyDate: data.historyDate }, savedAt, referenceTime, filteredData };
+  });
 }
 
 async function deleteRefreshHistoryItem(source, id) {
@@ -3409,7 +3453,7 @@ function firstFiniteNumber(values) {
   return NaN;
 }
 
-async function getMsaNavWarnings({ refresh, waitForRefresh = false }) {
+async function getMsaNavWarnings({ refresh, waitForRefresh = false, fullScan = false, detailObserver = null }) {
   const cacheKey = `v2:msa-nav-warning:pages:${MSA_NAV_WARNING_MAX_PAGES_PER_BUREAU}:lookback:${MSA_NAV_WARNING_LOOKBACK_DAYS}`;
   const cached = msaWarningCache.get(cacheKey);
   if (refresh && memoryBudget.enabled && !waitForRefresh) {
@@ -3430,7 +3474,7 @@ async function getMsaNavWarnings({ refresh, waitForRefresh = false }) {
   const inFlight = msaWarningInFlight.get(cacheKey);
   if (inFlight) return inFlight;
 
-  const request = buildMsaNavWarningPayload(cacheKey)
+  const request = buildMsaNavWarningPayload(cacheKey, { fullScan, detailObserver })
     .catch((error) => {
       const stale = cached?.data || readMsaNavWarningDiskCache(cacheKey, { allowExpired: true });
       if (!stale) throw error;
@@ -3521,11 +3565,11 @@ function writeMsaNavWarningDiskCache(cacheKey, data, savedAtOverride = null) {
   }
 }
 
-async function buildMsaNavWarningPayload(cacheKey) {
+async function buildMsaNavWarningPayload(cacheKey, { fullScan = false, detailObserver = null } = {}) {
   const generatedAt = new Date().toISOString();
   const sourceErrors = [];
   const refreshBaseline = readMsaRefreshBaseline(cacheKey);
-  const baselineSavedAtMs = Date.parse(refreshBaseline?.savedAt || "");
+  const baselineSavedAtMs = fullScan ? NaN : Date.parse(refreshBaseline?.savedAt || "");
   const incrementalCutoffMs = Number.isFinite(baselineSavedAtMs)
     ? baselineSavedAtMs - 3 * 24 * 60 * 60 * 1000
     : Date.now() - MSA_NAV_WARNING_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
@@ -3545,7 +3589,9 @@ async function buildMsaNavWarningPayload(cacheKey) {
     const fetchedDetails = (
       await mapLimit(uniqueItems, MSA_NAV_WARNING_DETAIL_CONCURRENCY, async (item) => {
         try {
-          return await fetchMsaWarningDetail(item);
+          const record=await fetchMsaWarningDetail(item);
+          if(detailObserver)await detailObserver(record);
+          return record;
         } catch (error) {
           sourceErrors.push(`${item.bureau || "MSA"} ${item.title || item.url}: ${error instanceof Error ? error.message : String(error)}`);
           return null;
@@ -3604,7 +3650,7 @@ async function buildMsaNavWarningPayload(cacheKey) {
       scannedListItems: listItems.length,
       scannedDetailPages: fetchedDetailPages,
       reusedCachedDetails: refreshBaseline?.records?.length || 0,
-      refreshMode: refreshBaseline ? "incremental-from-complete-cache" : "full-lookback",
+      refreshMode: refreshBaseline && !fullScan ? "incremental-from-complete-cache" : "full-lookback",
       baselineSavedAt: refreshBaseline?.savedAt || null,
       bureauCount: columns.length,
       maxPagesPerBureau: MSA_NAV_WARNING_MAX_PAGES_PER_BUREAU,
@@ -3702,7 +3748,7 @@ function msaCachedItemToDetailRecord(item) {
 function mergeMsaDetailRecords(cachedRecords, fetchedRecords) {
   const merged = new Map();
   for (const record of [...(cachedRecords || []), ...(fetchedRecords || [])]) {
-    const key = record?.officialPageUrl || record?.warningId || `${record?.title || ""}:${record?.publishDate || ""}`;
+    const key = canonicalMsaUrl(record?.officialPageUrl) || record?.warningId || `${record?.title || ""}:${record?.publishDate || ""}`;
     if (key) merged.set(key, record);
   }
   return [...merged.values()];
@@ -3728,12 +3774,13 @@ function discoverMsaWarningColumns(indexHtml) {
     });
   }
   if (!columns.length) {
-    columns.push({ bureau: "上海海事局", url: MSA_NAV_WARNING_URL, paged: true });
+    throw new Error('MSA bureau navigation could not be recognized; refresh must not claim nationwide coverage.');
   }
   return columns;
 }
 
 async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}) {
+  const fetchPage=options.fetchPage||fetchMsaText;
   const configuredCutoffMs = Number(options.cutoffMs);
   const cutoffMs = Number.isFinite(configuredCutoffMs)
     ? configuredCutoffMs
@@ -3758,11 +3805,14 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
     coverage.push(entry);
     let page = 1;
     let pageCount = 1;
+    const seenPages=new Set();
+    const seenItems=new Set();
+    let initialTotal=null;
     while (page <= pageCount && page <= MSA_NAV_WARNING_MAX_PAGES_PER_BUREAU) {
       const pageUrl = msaColumnPageUrl(column, page);
       let html = "";
       try {
-        html = await fetchMsaText(pageUrl, 45000);
+        html = await fetchPage(pageUrl, 45000);
       } catch (error) {
         const message = `${column.bureau || "MSA"} list page ${page}: ${error instanceof Error ? error.message : String(error)}`;
         entry.errors.push(message);
@@ -3773,6 +3823,24 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
       if (page === 1) pageCount = column.paged ? parseMsaListPageCount(html) : 1;
       entry.availablePages = pageCount;
       const items = parseMsaWarningListPage(html, column, pageUrl);
+      const pageKey=items.map(i=>canonicalMsaUrl(i.url)).sort().join('\n');
+      const advertised=Number(String(html).match(/pageParam\.count\s*=\s*(\d+)/i)?.[1]);
+      if(page===1)initialTotal=advertised;
+      const overlap=items.some(i=>seenItems.has(canonicalMsaUrl(i.url)));
+      if(overlap||(Number.isFinite(initialTotal)&&advertised!==initialTotal)){
+        const message=`${column.bureau} list page ${page}: ${overlap?'overlapping page items':'pagination total changed during refresh'}`;
+        sourceErrors.push(message);entry.errors.push(message);entry.stopReason='invalid-pagination';break;
+      }
+      if((!items.length&&advertised!==0)||(pageKey&&seenPages.has(pageKey))){
+        const message=`${column.bureau} list page ${page}: ${!items.length?'unrecognized or unexpectedly empty list':'duplicate pagination response'}`;
+        sourceErrors.push(message);entry.errors.push(message);entry.stopReason='invalid-page';break;
+      }
+      if(column.paged&&!/pageParam\.count\s*=\s*\d+/i.test(html)){
+        const message=`${column.bureau} list page ${page}: pagination total missing`;
+        sourceErrors.push(message);entry.errors.push(message);entry.stopReason='invalid-pagination';break;
+      }
+      seenPages.add(pageKey);
+      for(const item of items)seenItems.add(canonicalMsaUrl(item.url));
       const pageDates = mergeMsaCoverageDates(entry, items);
       entry.scannedPages += 1;
       entry.scannedItems += items.length;
@@ -3803,6 +3871,8 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
       }
       if (page >= MSA_NAV_WARNING_MAX_PAGES_PER_BUREAU) {
         entry.stopReason = "max-pages";
+        const message=`${column.bureau}: page limit reached before requested lookback was covered`;
+        sourceErrors.push(message);entry.errors.push(message);
         break;
       }
       page += 1;
@@ -3861,11 +3931,16 @@ function parseMsaWarningListPage(html, column, pageUrl) {
   return rows;
 }
 
+function canonicalMsaUrl(value) {
+  if(!value)return '';
+  try{const url=new URL(value);url.searchParams.delete('hav');url.hash='';return url.href;}catch{return String(value);}
+}
+
 function dedupeMsaListItems(items) {
   const seen = new Set();
   const output = [];
   for (const item of items || []) {
-    const key = item.url || `${item.bureau}:${item.title}:${item.publishDateText}`;
+    const key = canonicalMsaUrl(item.url) || `${item.bureau}:${item.title}:${item.publishDateText}`;
     if (seen.has(key)) continue;
     seen.add(key);
     output.push(item);
@@ -3890,11 +3965,22 @@ function parseMsaWarningDetail(html, item) {
   const pubDate = getHtmlMeta(source, "PubDate") || item.publishDateText;
   const bureau = getHtmlMeta(source, "ContentSource") || item.bureau;
   const warningId = ownText(extractMsaWarningId(`${title} ${source}`) || title);
+  const articleStart=/<div\b[^>]*\bid=["']ch_p["'][^>]*>/i.exec(source);
+  let bodyHtml='';
+  if(articleStart){
+    const start=articleStart.index+articleStart[0].length;let depth=1;
+    for(const tag of source.slice(start).matchAll(/<\/?div\b[^>]*>/gi)){
+      depth+=/^<\//.test(tag[0])?-1:1;
+      if(!depth){bodyHtml=source.slice(start,start+tag.index);break;}
+    }
+    const footer=/<div\b[^>]*class=["'][^"']*\bfoot_but\b/i.exec(bodyHtml);if(footer)bodyHtml=bodyHtml.slice(0,footer.index);
+  }
   const paragraphs = [...source.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)]
     .map((match) => stripHtml(match[1]).replace(/\s+/g, " ").trim())
     .filter(Boolean)
-    .filter((line) => !/收藏|打印本页|关闭窗口|下载PDF|分享到/.test(line));
-  const bodyText = ownText(paragraphs.join("\n") || stripHtml(source).replace(/\s+/g, " ").trim());
+    .filter((line) => !/收藏|打印本页|关闭窗口|下载PDF|分享到|打开微信|扫一扫|朋友圈/.test(line));
+  const bodyText = ownText(bodyHtml ? stripHtml(bodyHtml.replace(/<!--[\s\S]*?-->/g,'').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'')) : paragraphs.join("\n"));
+  if(!bodyText||(!articleStart&&!getHtmlMeta(source,'ArticleTitle')))throw new Error('MSA detail body was not recognized; empty/error pages cannot replace the previous warning.');
   const publishIso = parseMsaPublishDate(pubDate);
   const schedule = parseMsaWarningSchedule(bodyText, publishIso);
   return {
@@ -3994,6 +4080,19 @@ function parseMsaPublishDate(value) {
 }
 
 function parseMsaWarningSchedule(rawText, publishIso) {
+  const daily=chineseDailyWindows(String(rawText||''),Number(beijingDateTimeParts(publishIso)?.year)||new Date().getFullYear());
+  const base=parseMsaWarningScheduleBase(daily.remaining,publishIso);
+  if(!daily.recognized)return base;
+  const intervals=[...base.intervals,...daily.intervals].sort((a,b)=>String(a.start).localeCompare(String(b.start)));
+  const beginsAt=earliestIso(intervals.map(i=>i.start).filter(Boolean)),endsAt=latestIso(intervals.map(i=>i.end).filter(Boolean));
+  const labels=intervals.slice(0,3).map(i=>formatBeijingRangeCompact(i.start,i.end));
+  if(intervals.length>3)labels.push(`…共 ${intervals.length} 个时段`,formatBeijingRangeCompact(intervals.at(-1).start,intervals.at(-1).end));
+  return {...base,issuedAt:publishIso||base.issuedAt,beginsAt,endsAt,intervals,longTerm:false,timeLabel:[...daily.labels,base.timeLabel].filter(Boolean).join('；'),
+    scheduleStatus:daily.errors.length?'unresolved':'parsed',scheduleReason:daily.errors.join('；'),
+    beijingTimeLabel:daily.errors.length?daily.errors.join('；'):labels.join('；')+' 北京时间'};
+}
+
+function parseMsaWarningScheduleBase(rawText, publishIso) {
   const text = String(rawText || "");
   const publish = beijingDateTimeParts(publishIso);
   const fallbackYear = Number(publish?.year) || new Date().getFullYear();
@@ -4135,6 +4234,8 @@ function normalizeMsaTemporalItem(item, inForceWarningKeys = null) {
     beginsAt: schedule.beginsAt || null,
     endsAt: schedule.endsAt || null,
     timeIntervals: schedule.intervals,
+    scheduleStatus: schedule.scheduleStatus || null,
+    scheduleReason: schedule.scheduleReason || null,
     longTerm: Boolean(schedule.longTerm),
     timeLabel: schedule.timeLabel || makeParsedTimeLabel(schedule.beginsAt, schedule.endsAt),
     beijingTimeLabel: schedule.beijingTimeLabel || formatBeijingDateTime(schedule.issuedAt || item.issuedAt || item.modifiedAt),
@@ -4143,14 +4244,7 @@ function normalizeMsaTemporalItem(item, inForceWarningKeys = null) {
 }
 
 function chinaLocalDateToIso(year, month, day, hour = 0, minute = 0) {
-  let h = Number(hour);
-  let d = Number(day);
-  if (h === 24) {
-    h = 0;
-    d += 1;
-  }
-  const date = new Date(Date.UTC(Number(year), Number(month) - 1, d, h - 8, Number(minute || 0), 0));
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  return validChinaDate(Number(year),Number(month),Number(day),Number(hour),Number(minute));
 }
 
 function normalizeMsaEndIso(start, end) {
@@ -4232,6 +4326,26 @@ function buildMsaNavWarningRestriction(record, index) {
 }
 
 function parseMsaWarningGeometry(rawText) {
+  const source=normalizeMsaCoordinateText(rawText);
+  if(/灯浮标|虚拟AIS航标|灯桩/.test(source)&&!/连线|所围|围成|为圆心|半径|BOUNDED|RADIUS/i.test(source))return {
+    geometry:null,coordinateCount:extractCoordinates(source).length,geometryComplete:false,geometryReason:'航标设置、撤除或移位的独立位置，不构成作业区域边界。',
+  };
+  const primitives=extractChinesePrimitives(source,extractCoordinateTokens);
+  if(!primitives.polygons.length&&!primitives.rejected.length)return parseMsaPolygonGeometry(source);
+  const remainder=parseMsaPolygonGeometry(primitives.remaining);
+  const parts=[...primitives.polygons,...(remainder.geometry ? (remainder.geometry.type==='Polygon'?[remainder.geometry.coordinates]:remainder.geometry.coordinates).map(coordinates=>({type:'Polygon',coordinates})) : [])];
+  const reasons=[...primitives.rejected,...(remainder.polygonGroupValidationReasons||[])];
+  const valid=[];
+  for(const p of parts){const reason=validateParsedGeometry(p);if(reason)reasons.push(reason);else valid.push(p);}
+  const geometry=valid.length>1?{type:'MultiPolygon',coordinates:valid.map(p=>p.coordinates)}:valid[0]||null;
+  if(!remainder.geometry&&!reasons.includes(remainder.geometryReason)&&extractCoordinates(primitives.remaining).length>=3&&hasMsaBoundaryGeometryIntent(primitives.remaining))reasons.push(remainder.geometryReason);
+  return {...remainder,geometry,coordinateCount:extractCoordinates(source).length,boundaryCoordinateCount:geometry?geometryUniqueCoordinateCount(geometry):0,
+    polygonGroupCount:valid.length+reasons.length,rejectedPolygonGroupCount:reasons.length,polygonGroupValidationReasons:reasons,
+    geometryComplete:!!geometry&&!reasons.length,geometrySource:geometry?'中国航警明确多边形、圆形或等宽走廊':null,
+    geometryReason:geometry?`中国航警 ${valid.length} 个区域已绘制${reasons.length?'；部分区域未绘制：'+reasons.join('；'):''}`:reasons.join('；')};
+}
+
+function parseMsaPolygonGeometry(rawText) {
   const source = removeMsaCenterCoordinates(normalizeMsaCoordinateText(rawText));
   const rejected = [];
   const groups = extractMsaCoordinateGroups(source, rejected);
@@ -4245,7 +4359,7 @@ function parseMsaWarningGeometry(rawText) {
   }
   const englishParsed = parseNotamText(source);
   const englishParts = englishParsed.geometry?.type === "MultiPolygon" ? englishParsed.geometry.coordinates.length : englishParsed.geometry ? 1 : 0;
-  if (!rejected.length && englishParsed.geometry && groups.filter((group) => group.length >= 3).length <= englishParts) {
+  if (englishParsed.geometry && groups.filter((group) => group.length >= 3).length <= englishParts) {
     return {
       geometry: englishParsed.geometry,
       coordinateCount: englishParsed.coordinateCount || extractCoordinates(source).length,
@@ -4322,16 +4436,15 @@ function isMsaLinearRouteWarning(text) {
   const source = String(text || "");
   if (/(?:围成|所围|闭合|首尾相连)|\b(?:TO\s+POINT\s+OF\s+ORIGIN|CLOSES?\s+AT)\b/i.test(source)) return false;
   if (/(?:连线|线路|测线)\s*(?:两侧|每侧)\s*(?:各\s*)?\d+(?:\.\d+)?\s*(?:米|公里|海里|M|KM|NM)/i.test(source)) return true;
-  if (/沿[\s\S]{0,1500}?(?:连线|线路|航线)/i.test(source)) return true;
-  return /\b(?:LINEAR\s+STRETCH|ALONG\s+(?:THE\s+)?(?:LINE|TRACKLINE)|TRACKLINE\s+JOINING|PIPELINE\s+ROUTE)\b/i.test(source) ||
+  if (/(?<!前)沿[\s\S]{0,1500}?(?:连线|线路|航线)/i.test(source)) return true;
+  return /\b(?:LINEAR\s+STRETCH|NEAR\s+BY\s+THE\s+LINE\s+JOINING|ALONG\s+(?:THE\s+)?(?:LINE|TRACKLINE)|TRACKLINE\s+JOINING|PIPELINE\s+ROUTE)\b/i.test(source) ||
     /在[\s\S]{0,220}?(?:连线|线路|航线)(?:附近|一带)[\s\S]{0,160}?(?:电缆|管线|测量|敷设|作业|施工)/i.test(source);
 }
 
 function normalizeMsaCoordinateText(text) {
   return normalizeNotamCoordinateText(String(text || ""))
     .replace(/[，、]/g, " ")
-    .replace(/[；;]/g, "\n")
-    .replace(/和\s*(?=\d{1,2}-\d{1,2})/g, " ");
+    .replace(/[；;]/g, "\n");
 }
 
 function extractMsaCoordinateGroups(text, rejected = []) {
@@ -4343,6 +4456,11 @@ function extractMsaCoordinateGroups(text, rejected = []) {
       ? extractMsaCoordinateGroups(clause, rejected) : []);
   }
   const starts = [
+    ...source.matchAll(/\bAND\s+NEAR\s+BY\s+THE\s+LINE\s+JOINING\b/gi),
+    ...source.matchAll(/在\s*(?=成山角|[^\d\s，,。]{1,40}航路以东)/g),
+    ...source.matchAll(/[在至]\s*(?=\d{1,3}-\d)/g),
+    ...source.matchAll(/(?:水域|区域)[一二三四五六七八九十\d]+\s*(?=\d{1,2}-\d|成山角)/g),
+    ...source.matchAll(/\bAREA\s+NO\.\s*\d+\s*[,，:：]?/gi),
     ...source.matchAll(/(?:^|[\n。；;,.，])\s*(?:区域|水域|作业区|施工区|禁航区|警戒区|AREA)\s*[一二三四五六七八九十\dA-Z]*\s*[：:]/gi),
     ...source.matchAll(/(?:^|[\n。,.，])\s*(?:IN\s+)?(?:WORKING\s+)?AREAS?\s+BOUNDED\s+BY(?:\s+THE\s+LINES?\s+JOINING)?\s*:?\s*/gi),
     ...source.matchAll(/\bAREA\s+[A-Z0-9]+\s+BOUNDED\s+BY(?:\s+THE\s+LINES?\s+JOINING)?\s*:?\s*/gi),
@@ -4361,15 +4479,19 @@ function extractMsaCoordinateGroups(text, rejected = []) {
       : [source];
   return sections.flatMap((section, index) => {
     if (isMsaLinearRouteWarning(section)) return [];
+    if (/航经/.test(section) && !hasMsaBoundaryGeometryIntent(section)) return [];
     if (hasInvalidBoundaryCoordinate(section)) {
       rejected.push({ index, reason: "Invalid coordinate field in MSA boundary; vertices were not skipped or guessed." });
       return [];
     }
     const groups = splitCoordinateGroupsAtCompletedBoundaries(section, extractCoordinates(section))
       .flatMap((group) => splitMsaConjoinedBoundaryGroups(section, group)).filter((group) => group.length);
-    const declared = section.match(/([三四五六七八九十]|\d{1,3})\s*(?:个)?点\s*(?:依次)?连线/)?.[1];
-    const count = /^\d+$/.test(declared || "") ? Number(declared) : ({ 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 })[declared];
-    if (count && groups.length === 1 && normalizePolygonGroupCoordinates(groups[0]).length !== count) {
+    const declared = section.match(/([一二三四五六七八九十百]+|\d{1,3})\s*(?:个)?点\s*(?:依次)?连线/)?.[1];
+    const digit={一:1,二:2,三:3,四:4,五:5,六:6,七:7,八:8,九:9};
+    const count = /^\d+$/.test(declared || "") ? Number(declared) : declared?.includes('十') ? (digit[declared.split('十')[0]]||1)*10+(digit[declared.split('十')[1]]||0) : digit[declared];
+    const listed=extractCoordinates(section);
+    const closureCount=listed.length>3&&sameCoordinatePair(listed[0],listed.at(-1))?listed.length:0;
+    if (count && groups.length === 1 && normalizePolygonGroupCoordinates(groups[0]).length !== count && closureCount !== count) {
       rejected.push({ index, reason: `MSA text declares ${count} vertices but lists ${normalizePolygonGroupCoordinates(groups[0]).length}; boundary requires source clarification.` });
       return [];
     }
@@ -4379,14 +4501,18 @@ function extractMsaCoordinateGroups(text, rejected = []) {
 
 function splitMsaConjoinedBoundaryGroups(section, group) {
   if (!Array.isArray(group) || group.length < 6) return [group];
-  for (const conjunction of String(section || "").matchAll(/\bAND\b|及/gi)) {
+  for (const conjunction of String(section || "").matchAll(/\bAND\b|及|和/gi)) {
     const splitAt = Number(conjunction.index);
     const left = group.filter((coordinate) => Number(coordinate.sourceIndex) < splitAt);
     const right = group.filter((coordinate) => Number(coordinate.sourceIndex) >= splitAt);
     if (left.length < 3 || right.length < 3) continue;
     const leftPolygon = polygonFromCoordinates(normalizePolygonGroupCoordinates(left));
     const rightPolygon = polygonFromCoordinates(normalizePolygonGroupCoordinates(right));
-    if (!validateParsedGeometry(leftPolygon) && !validateParsedGeometry(rightPolygon)) return [left, right];
+    const leftValid=!validateParsedGeometry(leftPolygon),rightValid=!validateParsedGeometry(rightPolygon);
+    if (leftValid && rightValid) return [left, right];
+    // Explicitly conjoined Chinese areas can contain one erroneous boundary.
+    // Retain the independently valid area and report the bad part separately.
+    if (/及|和/.test(conjunction[0]) && (leftValid || rightValid) && validateParsedGeometry(polygonFromCoordinates(normalizePolygonGroupCoordinates(group)))) return [left,right];
   }
   return [group];
 }
@@ -4642,11 +4768,15 @@ async function fetchSeaLagomNavareaRegion(region, fetchPage = fetchTextOfficial)
   const totalPages = Math.max(1, parseSeaLagomTotalPages(firstHtml));
   const pagesToFetch = Math.min(NAVAREA_MAX_PAGES_PER_REGION, totalPages);
   const pages = [{ page: 1, url: firstUrl, html: firstHtml }];
+  const pageErrors = [];
   for (let page = 2; page <= pagesToFetch; page += 1) {
     const url = navareaMessagesUrl(region.id, page);
     try {
-      pages.push({ page, url, html: await fetchPage(url, 60000) });
-    } catch {
+      const html = await fetchPage(url, 60000);
+      if (/Could not load messages/i.test(html)) throw new Error("Source could not load messages");
+      pages.push({ page, url, html });
+    } catch (error) {
+      pageErrors.push(`Page ${page}: ${error instanceof Error ? error.message : String(error)}`);
       // A later page failure should not discard earlier active warnings.
     }
   }
@@ -4659,7 +4789,7 @@ async function fetchSeaLagomNavareaRegion(region, fetchPage = fetchTextOfficial)
       scannedPages: pages.length,
       totalPages,
       records: records.length,
-      errors: pages.length < totalPages ? [`Fetched ${pages.length}/${totalPages} active pages`] : [],
+      errors: [...pageErrors, ...(pages.length < totalPages ? [`Fetched ${pages.length}/${totalPages} active pages`] : [])],
     },
   };
 }
@@ -5002,7 +5132,10 @@ function buildNavareaWarningRestrictionItem(
     beginsAt: schedule.beginsAt,
     endsAt: schedule.endsAt,
     timeIntervals: schedule.intervals,
+    scheduleStatus: schedule.scheduleStatus || null,
+    scheduleReason: schedule.scheduleReason || null,
     longTerm: schedule.longTerm,
+    scheduleStatus: schedule.scheduleStatus,
     temporalParseVersion: schedule.temporalParseVersion,
     timeLabel: schedule.timeLabel,
     beijingTimeLabel: schedule.beijingTimeLabel,
@@ -5121,7 +5254,18 @@ async function fetchHydropacCurrentTextWarnings(fetchPage = fetchTextOfficial) {
       throw new Error(`HYDROPAC current page incomplete (${url}): ${error.message}`);
     }
   }
-  return pages.flatMap(({ html, url }) => parseHydropacCurrentTextPage(html, url));
+  const seen = new Set(), records = [];
+  for (const {html, url} of pages) {
+    if (/Could not load messages|Access Denied|captcha/i.test(stripHtml(html))) throw new Error(`HYDROPAC current page incomplete (${url}): upstream error page.`);
+    const rows = parseHydropacCurrentTextPage(html, url);
+    if (!rows.length && !/\b(?:No (?:active )?messages|No warnings found)\b/i.test(stripHtml(html))) throw new Error(`HYDROPAC current page incomplete (${url}): no recognizable warning cards.`);
+    for (const row of rows) {
+      const key = `${row.msgYear}:${row.msgNumber}`;
+      if (seen.has(key)) throw new Error(`HYDROPAC current pages overlap at ${key}; previous cache retained.`);
+      seen.add(key); records.push(row);
+    }
+  }
+  return records;
 }
 
 async function fetchHydropacArchiveTextWarningsForDate(historyDate) {
@@ -5135,9 +5279,9 @@ async function fetchHydropacArchiveTextWarningsForDate(historyDate) {
     async (url) => {
       try {
         return { url, html: await fetchTextOfficial(url, 60000) };
-      } catch {
-        // SeaLagom archive is a supplement; one failed archive page should not block NGA history.
-        return null;
+      } catch (error) {
+        // The caller can retain NGA history but must report missing archive data.
+        throw new Error(`Archive page incomplete (${url}): ${error.message}`);
       }
     },
   );
@@ -5152,11 +5296,13 @@ function discoverHydropacTextPageUrls(html) {
   const source = String(html || "");
   for (const match of source.matchAll(/href="([^"]*\/coastal\/21\/messages\/\?page=(\d+)[^"]*)"/gi)) {
     const page = Number(match[2]);
-    if (!Number.isFinite(page) || page < 1 || page > 12) continue;
+    if (!Number.isFinite(page) || page < 1) continue;
+    if (page > 200) throw new Error("HYDROPAC page count exceeds the verified retrieval limit; snapshot incomplete.");
     urls.add(absoluteHydropacTextUrl(match[1]));
   }
   const pageCountMatch = stripHtml(source).match(/\bPage\s+\d+\s+of\s+(\d+)\b/i);
-  const pageCount = pageCountMatch ? Math.min(12, Math.max(1, Number(pageCountMatch[1]))) : 1;
+  const pageCount = pageCountMatch ? Math.max(1, Number(pageCountMatch[1])) : 1;
+  if (pageCount > 200) throw new Error("HYDROPAC page count exceeds the verified retrieval limit; snapshot incomplete.");
   for (let page = 2; page <= pageCount; page += 1) {
     urls.add(`${HYDROPAC_CURRENT_TEXT_URL}?page=${page}`);
   }
@@ -5324,7 +5470,10 @@ function buildHydropacRestriction(warning, index) {
     beginsAt: schedule.beginsAt,
     endsAt: schedule.endsAt,
     timeIntervals: schedule.intervals,
+    scheduleStatus: schedule.scheduleStatus || null,
+    scheduleReason: schedule.scheduleReason || null,
     longTerm: schedule.longTerm,
+    scheduleStatus: schedule.scheduleStatus,
     temporalParseVersion: schedule.temporalParseVersion,
     timeLabel: schedule.timeLabel,
     beijingTimeLabel: schedule.beijingTimeLabel,
@@ -5405,6 +5554,7 @@ function parseMarineSchedule(rawText, warning) {
   const seenIntervals = new Set();
   const activityText = maskMarineAdministrativeTimes(text);
   const explicitGroups = new Map();
+  let unresolvedActivityTime = false;
   let previousExplicitGroup = null;
   let previousExplicitEnd = -1;
 
@@ -5430,6 +5580,7 @@ function parseMarineSchedule(rawText, warning) {
       end = marineDatePartsToIso(match[6], match[7], match[8], endMonth, endYear + 1);
     }
     const occurrence = addUniqueMarineInterval(seenIntervals, start, end);
+    if (!start || !end || Date.parse(end) < Date.parse(start)) unresolvedActivityTime = true;
     if (!occurrence) continue;
     const gap = previousExplicitEnd >= 0 ? activityText.slice(previousExplicitEnd, match.index ?? previousExplicitEnd) : "";
     const continuesPreviousGroup = previousExplicitGroup && /^[\s,;]*(?:AND\s*)?$/i.test(gap);
@@ -5456,11 +5607,12 @@ function parseMarineSchedule(rawText, warning) {
     const year = marineFullYear(block.year || context?.year, defaultYear);
     const dates = expandMarineDateList(block.dayExpression, monthToken, year);
     const excludedWeekdays = marineExcludedWeekdays(block.dayExpression);
-    if (!dates.length || !block.windows.length) continue;
+    if (!dates.length || !block.windows.length) { unresolvedActivityTime = true; continue; }
     const occurrences = [];
     for (const date of dates) {
       const dayProbe = new Date(Date.UTC(date.year, date.month, date.day));
-      if (dayProbe.getUTCMonth() !== date.month || excludedWeekdays.has(dayProbe.getUTCDay())) continue;
+      if (dayProbe.getUTCMonth() !== date.month) { unresolvedActivityTime = true; continue; }
+      if (excludedWeekdays.has(dayProbe.getUTCDay())) continue;
       for (const window of block.windows) {
         const start = marineDatePartsToIso(date.day, window.startHour, window.startMinute, date.month, date.year);
         let end = marineDatePartsToIso(date.day, window.endHour, window.endMinute, date.month, date.year);
@@ -5562,15 +5714,15 @@ function parseMarineSchedule(rawText, warning) {
   const sortedEntries = entries.sort((a, b) => a.sourceIndex - b.sourceIndex);
   const sortedCancels = cancels.sort((a, b) => a.sourceIndex - b.sourceIndex);
   const intervals = sortedEntries.flatMap((item) => item.occurrences).sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+  unresolvedActivityTime ||= !intervals.length && /\b\d{4,6}\s*(?:Z|UTC)?\s*(?:TO|THRU|-|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(activityText);
   let inferredIssueToCancel = false;
-  if (!intervals.length && issuedAt && untilDate) intervals.push({ start: issuedAt, end: untilDate });
-  if (!intervals.length && issuedAt && sortedCancels.length) {
+  if (!unresolvedActivityTime && !intervals.length && issuedAt && untilDate) intervals.push({ start: issuedAt, end: untilDate });
+  if (!unresolvedActivityTime && !intervals.length && issuedAt && sortedCancels.length) {
     intervals.push({ start: issuedAt, end: sortedCancels[sortedCancels.length - 1].at });
     inferredIssueToCancel = true;
   }
-  const unresolvedActivityTime = !intervals.length && /\b\d{6}\s*(?:Z|UTC)?\s*(?:TO|THRU|-|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(activityText);
   const openEndedFromIssue = Boolean(!unresolvedActivityTime && !intervals.length && issuedAt && !sortedCancels.length && !untilDate);
-  const longTerm = Boolean((untilFurtherNotice || (inProgress && !untilDate && !intervals.length) || openEndedFromIssue) && !sortedCancels.length);
+  const longTerm = Boolean(!unresolvedActivityTime && (untilFurtherNotice || (inProgress && !untilDate && !intervals.length) || openEndedFromIssue) && !sortedCancels.length);
   const beginsAt = earliestIso([...intervals.map((item) => item.start), inProgress || longTerm || openEndedFromIssue ? issuedAt : null]);
   const endsAt = longTerm
     ? null
@@ -5604,6 +5756,7 @@ function parseMarineSchedule(rawText, warning) {
     beginsAt,
     endsAt,
     intervals,
+    scheduleStatus: unresolvedActivityTime ? "unresolved" : "parsed",
     longTerm,
     temporalParseVersion: MARINE_TEMPORAL_PARSE_VERSION,
     timeLabel: timeParts.join("; ") || null,
@@ -6434,8 +6587,7 @@ async function probeFaaNotamGateway(fir) {
           cookie: "fnsDisclaimer=agreed",
           origin: "https://notams.aim.faa.gov",
           referer: "https://notams.aim.faa.gov/notamSearch/nsapp.html",
-          "user-agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+          "user-agent": "Mozilla/5.0 FAA-NOTAM-map/1.0",
         },
         body: new URLSearchParams(params),
       });
@@ -6445,6 +6597,7 @@ async function probeFaaNotamGateway(fir) {
       JSON.parse(body || "{}");
       return { transport: "fetch", browserSession: null };
     } catch (error) {
+      if (isFaaAccessDenied(error)) throw new Error("FAA 当前拒绝访问（HTTP 403 / Access Denied），已停止刷新并保留上次完整缓存。请在来源恢复后重试。");
       errors.push(`direct ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       clearTimeout(timeout);
@@ -6458,6 +6611,7 @@ async function probeFaaNotamGateway(fir) {
       return { transport: "browser", browserSession };
     } catch (error) {
       await browserSession?.close();
+      if (isFaaAccessDenied(error)) throw error;
       errors.push(`browser ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -6519,6 +6673,7 @@ async function fetchFaaNotamFirs(firs, gateway = null) {
       });
       results = mergeFaaBatchRecoveryResults(results, adaptiveResults);
     } catch (error) {
+      if (isFaaAccessDenied(error)) throw error;
       adaptiveError = error instanceof Error ? error.message : String(error);
     }
 
@@ -6562,6 +6717,7 @@ async function fetchFaaNotamFirs(firs, gateway = null) {
       },
     };
   } catch (error) {
+    if (isFaaAccessDenied(error)) throw error;
     if (FAA_NOTAM_TRANSPORT !== "auto") throw error;
     const results = await recoverFaaNotamFirs(firs);
     return {
@@ -6587,6 +6743,7 @@ function faaFirResultNeedsRecovery(result) {
 }
 
 async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
+  let accessDeniedError = null;
   const batchSize = clampNumber(Number(options.batchSize || FAA_NOTAM_BATCH_SIZE), 1, FAA_NOTAM_BATCH_SIZE);
   const concurrency = clampNumber(Number(options.concurrency || FAA_NOTAM_FIR_CONCURRENCY), 1, FAA_NOTAM_FIR_CONCURRENCY);
   const retryConcurrency = clampNumber(Number(options.retryConcurrency || FAA_NOTAM_RETRY_CONCURRENCY), 1, FAA_NOTAM_RETRY_CONCURRENCY);
@@ -6597,8 +6754,10 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
   const queries = buildFaaNotamQueryBatches(firs, batchSize);
   let results = await mapLimit(queries, concurrency, async (fir) => {
     try {
+      if (accessDeniedError) throw accessDeniedError;
       return await fetchFaaNotamFir(fir, jar);
     } catch (error) {
+      if (isFaaAccessDenied(error)) accessDeniedError = error;
       return {
         fir,
         memberFirs: fir.memberFirs || [fir],
@@ -6609,6 +6768,7 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
       };
     }
   });
+  if (accessDeniedError) throw accessDeniedError;
   const retryable = results.filter(isRetryableFaaFirFailure);
   if (retryable.length) {
     if (FAA_NOTAM_RETRY_DELAY_MS > 0) await sleep(FAA_NOTAM_RETRY_DELAY_MS);
@@ -6694,6 +6854,7 @@ function resolveFaaNotamSourceFir(notam, memberFirs) {
 }
 
 function isRetryableFaaFirFailure(result) {
+  if (isFaaAccessDenied(result?.error)) return false;
   return /\b(403|429|503)\b|Access Denied|Too Many Requests|fetch failed|aborted|timeout|pagination incomplete|repeated a page|worker returned no result/i.test(
     String(result?.error || ""),
   );
@@ -6995,7 +7156,11 @@ async function createFaaNotamBrowserSession() {
               const payload = await pacedPost(params);
               const page = Array.isArray(payload?.notamList) ? payload.notamList : Array.isArray(payload) ? payload : [];
               pagesFetched += 1;
-              totalAvailable = Number(payload?.totalNotamCount || totalAvailable || page.length);
+              if (!Array.isArray(payload) && !Array.isArray(payload?.notamList) && !(payload?.totalNotamCount != null && Number(payload.totalNotamCount) === 0)) throw new Error("FAA response does not contain a valid NOTAM list.");
+              const reportedTotal = payload?.totalNotamCount == null ? null : Number(payload.totalNotamCount);
+              if (reportedTotal != null && (!Number.isInteger(reportedTotal) || reportedTotal < 0 || (pagesFetched > 1 && reportedTotal !== totalAvailable))) throw new Error("FAA total changed or is invalid while paging; retry required.");
+              totalAvailable = reportedTotal ?? (totalAvailable || page.length);
+              if (offset + page.length > totalAvailable) throw new Error("FAA page exceeds its advertised total; snapshot rejected.");
               if (!page.length) break;
               const signature = page
                 .map((item) => item?.transactionID || item?.notamNumber || String(item?.icaoMessage || item?.text || "").slice(0, 80))
@@ -7176,6 +7341,7 @@ function Expand-JsonRows($value) {
 
 foreach ($fir in $firs) {
   $notams = New-Object System.Collections.Generic.List[object]
+  $rowKeys = New-Object 'System.Collections.Generic.HashSet[string]'
   $offset = 0
   $totalAvailable = 0
   $pagesFetched = 0
@@ -7238,11 +7404,21 @@ foreach ($fir in $firs) {
       if ($payload -is [array]) {
         $page = @(Expand-JsonRows $payload)
       } else {
+        if ($null -eq $payload.notamList -and $payload.totalNotamCount -ne 0) { throw 'FAA response does not contain a valid NOTAM list.' }
         $page = @(Expand-JsonRows $payload.notamList)
-        if ($null -ne $payload.totalNotamCount) { $totalAvailable = [int]$payload.totalNotamCount }
+        if ($null -ne $payload.totalNotamCount) {
+          $nextTotal = [int]$payload.totalNotamCount
+          if ($pagesFetched -gt 1 -and $nextTotal -ne $totalAvailable) { throw 'FAA total changed while paging; retry required.' }
+          $totalAvailable = $nextTotal
+        }
       }
       if ($page.Count -eq 0) { break }
-      foreach ($item in $page) { $notams.Add($item) }
+      foreach ($item in $page) {
+        $key = [string]$item.transactionID
+        if ([string]::IsNullOrWhiteSpace($key)) { $key = $item | ConvertTo-Json -Depth 30 -Compress }
+        if (-not $rowKeys.Add($key)) { throw 'FAA NOTAM pagination overlaps; incomplete snapshot rejected.' }
+        $notams.Add($item)
+      }
       $offset += $page.Count
       if ($offset -ge $totalAvailable) { break }
       if ($page.Count -lt $pageSize) { break }
@@ -7577,7 +7753,11 @@ async function fetchFaaNotamFir(fir, jar) {
     const payload = await fetchFaaNotamForm(FAA_NOTAM_SEARCH_ENDPOINT, jar, buildFaaNotamSearchParams(fir, offset));
     const page = Array.isArray(payload?.notamList) ? payload.notamList : Array.isArray(payload) ? payload : [];
     pagesFetched += 1;
-    totalAvailable = Number(payload?.totalNotamCount || totalAvailable || page.length);
+    if (!Array.isArray(payload) && !Array.isArray(payload?.notamList) && !(payload?.totalNotamCount != null && Number(payload.totalNotamCount) === 0)) throw new Error("FAA response does not contain a valid NOTAM list.");
+    const reportedTotal = payload?.totalNotamCount == null ? null : Number(payload.totalNotamCount);
+    if (reportedTotal != null && (!Number.isInteger(reportedTotal) || reportedTotal < 0 || (pagesFetched > 1 && reportedTotal !== totalAvailable))) throw new Error("FAA total changed or is invalid while paging; retry required.");
+    totalAvailable = reportedTotal ?? (totalAvailable || page.length);
+    if (offset + page.length > totalAvailable) throw new Error("FAA page exceeds its advertised total; snapshot rejected.");
     if (!page.length) break;
 
     const pageSignature = page
@@ -7760,7 +7940,12 @@ function deferFaaNotamRequests(error, attempt) {
   faaNotamNextRequestAt = Math.max(faaNotamNextRequestAt, Date.now() + delayMs);
 }
 
+function isFaaAccessDenied(error) {
+  return /\b403\b|Access Denied/i.test(error instanceof Error ? error.message : String(error || ""));
+}
+
 function isRetryableFaaRequestError(error) {
+  if (isFaaAccessDenied(error)) return false;
   return /\b(403|429|500|502|503|504)\b|Access Denied|Too Many Requests|fetch failed|aborted|timeout|HTML gate/i.test(
     error instanceof Error ? error.message : String(error),
   );
@@ -7994,6 +8179,12 @@ function buildImportedNotamRestriction(item, index) {
     issuedAt,
     beginsAt,
     endsAt,
+    timeIntervals: parsed.timeIntervals,
+    scheduleParsed: parsed.scheduleParsed,
+    scheduleStatus: parsed.scheduleStatus,
+    scheduleRawText: parsed.scheduleRawText,
+    scheduleReason: parsed.scheduleReason,
+    beijingTimeLabel: parsed.beijingTimeLabel || null,
     timeLabel: parsed.timeLabel || makeParsedTimeLabel(beginsAt, endsAt),
     altitude: parsed.altitude || null,
     radiusNm: parsed.radiusNm || null,
@@ -8030,6 +8221,7 @@ function parseNotamText(text) {
   const beginAt = parseIcaoDate(plain.match(/\bB\)\s*([0-9]{10})(?:\s*EST)?\b/i)?.[1]);
   const endAt = parseIcaoDate(plain.match(/\bC\)\s*([0-9]{10})(?:\s*EST)?\b/i)?.[1]);
   const dailySchedule = plain.match(/\bD\)\s*([\s\S]*?)(?=\bE\)|$)/i)?.[1]?.trim();
+  const schedule = parseNotamSchedule(dailySchedule, beginAt, endAt);
   const lower = plain.match(/\bF\)\s*([^\n]+?)(?=\s+[GQEA-]\)|$)/i)?.[1]?.trim();
   const upper = plain.match(/\bG\)\s*([^\n]+?)(?=\s+[QEA-]\)|$)/i)?.[1]?.trim();
   const altitude = [lower, upper].filter(Boolean).join(" - ") || parseQLineAltitude(qLine) || extractAltitudeFromText(plain);
@@ -8064,7 +8256,7 @@ function parseNotamText(text) {
     : parseIndependentBoundarySections(geometryText, purpose, qCenter);
   geometry = sectionResult.geometry;
   geometrySource = geometry ? describeNotamGeometrySource(sectionResult.polygons, sectionResult.polygons.length > 1 ? "sections" : "sequence") : null;
-  if (sectionResult.polygons.some(polygon => polygon.boundaryMethod)) geometrySource += "; 正文明示的圆形/扇形按 WGS84 测地线计算";
+  if (geometry && sectionResult.polygons.some(polygon => polygon.boundaryMethod)) geometrySource += "; " + [...new Set(sectionResult.polygons.map(polygon => polygon.boundaryMethod).filter(Boolean))].join("; ");
   rejectedPolygonGroupCount = sectionResult.rejected.length;
   polygonGroupValidationReasons = sectionResult.rejected.map((section) => section.reason);
   let geometryReason = geometry
@@ -8107,7 +8299,8 @@ function parseNotamText(text) {
     purpose,
     beginAt,
     endAt,
-    timeLabel: [makeParsedTimeLabel(beginAt, endAt), dailySchedule ? `活动时段（UTC，原文）：${dailySchedule}` : null].filter(Boolean).join("; "),
+    ...schedule,
+    timeLabel: [makeParsedTimeLabel(beginAt, endAt), schedule.scheduleLabel].filter(Boolean).join("; "),
     altitude,
     radiusNm: geometry?.boundaryRadiusMeters ? geometry.boundaryRadiusMeters / 1852 : radiusNm,
     coordinates: sourceCoordinates,
@@ -8128,6 +8321,8 @@ function parseNotamText(text) {
 }
 
 function hasUnresolvedAirspaceExclusion(text) {
+  const trailingExclusions=[...text.matchAll(/\b(?:M?CTR|FIR|UIR|TMA|ATZ|CTA|AIRSPACE)\b[^.;\n]{0,40}\bEXCLUDED\b/gi)];
+  if(trailingExclusions.some(m=>!/\b(?:DEPARTING|LANDING|FLYING|OPERATING|TRANSITING)\b[^.;]{0,160}$/i.test(text.slice(Math.max(0,m.index-220),m.index))))return true;
   const pattern = /\b(?:EXC|EXCEPT(?:ING)?|EXCLUDING)\.?\s+(?:[A-Z][A-Z0-9.'/-]*\s+){0,9}(?:FIR|UIR|TMA|CTR|ATZ|CTA|AIRSPACE)\b/gi;
   return [...String(text).matchAll(pattern)].some((match) => {
     if (/\b(?:ACFT|AIRCRAFT|FLTS?|FLIGHTS?|PERMISSION)\b/i.test(match[0])) return false;
@@ -8146,6 +8341,8 @@ function parseIndependentBoundarySections(text, purpose = "", qCenter = null) {
     if (results.every((result) => result.polygons.length === 1 && !result.rejected.length)) {
       const polygon = { type: "Polygon", coordinates: results.map((result) => result.polygons[0].coordinates[0]) };
       if (!validateParsedGeometry(polygon)) return { geometry: polygon, polygons: [polygon], rejected: [] };
+      const difference=subtractExplicitAreas(results[0].polygons[0],results.slice(1).map(r=>r.polygons[0]));
+      if(difference&&!validateParsedGeometry(difference))return {geometry:difference,polygons:(difference.type==='Polygon'?[difference.coordinates]:difference.coordinates).map(coordinates=>({type:'Polygon',coordinates,boundaryMethod:'扣除正文明确排除区，保留相交裁切边界'})),rejected:[]};
     }
     return { geometry: null, polygons: [], rejected: [{ index: 0, reason: "Area exclusion is not a complete, contained boundary; the excluded area was not filled." }] };
   }
@@ -8153,15 +8350,42 @@ function parseIndependentBoundarySections(text, purpose = "", qCenter = null) {
   const rejected = [];
   const generalIntent = hasBoundaryGeometryIntent(text, purpose);
   for (const [index, original] of extractCoordinateSections(text).entries()) {
-    const section = original;
+    const remark=/(?:^|[\r\n])\s*(?:\d+[.)]\s*)?(?:RMK|REMARKS?)\s*[:.]/i.exec(original);
+    const section = remark && !extractCoordinates(original.slice(remark.index)).length ? original.slice(0,remark.index) : original;
     const tokens = extractCoordinateTokens(section);
     const coordinates = extractCoordinates(section);
-    if (!tokens.length) continue;
+    if (!tokens.length) {
+      if(hasInvalidBoundaryCoordinate(section))rejected.push({index,reason:'区域仅给出部分经纬度或缺少边界坐标，未绘制。'});
+      continue;
+    }
+    if (/\bNEAR\s+BY\s+THE\s+LINE\s+JOINING\b/i.test(section)) {
+      rejected.push({index,reason:'通告给出线状活动及附近水域，但未提供宽度，未补成多边形。'});
+      continue;
+    }
+    if (isExplicitNonAreaCoordinateList(section)) {
+      rejected.push({ index, reason: "正文明确表示独立点位清单，不构成活动区域边界；未绘制。" });
+      continue;
+    }
+    if (hasInvalidBoundaryCoordinate(section)) {
+      rejected.push({ index, reason: "Invalid coordinate field in boundary; vertices were not skipped or guessed." });
+      continue;
+    }
+    const complex = explicitClippedCircle(section,tokens) || explicitArcBoundary(section, tokens) || explicitCorridorBoundary(section, tokens) || explicitSharedSectors(section,tokens) || explicitLabeledCircles(section,tokens) || explicitCircleList(section, tokens);
+    if (complex) {
+      const reason = complex.reason || (isExplicitNonAreaCoordinateList(section) ? "正文坐标不表示活动区域，未绘制。" : null)
+        || validateParsedGeometry(complex.geometry) || validateGeometryAgainstQLine(complex.geometry, qCenter);
+      if (reason) rejected.push({ index, reason });
+      else {
+        const parts = complex.geometry.type === "MultiPolygon" ? complex.geometry.coordinates : [complex.geometry.coordinates];
+        polygons.push(...parts.map(coordinates => ({ type: "Polygon", coordinates, boundaryMethod: complex.method })));
+      }
+      continue;
+    }
     const radial = explicitRadialBoundary(section, tokens);
     if (radial && !isExplicitNonAreaCoordinateList(section) && !hasInvalidBoundaryCoordinate(section)) {
-      const reason = validateParsedGeometry(radial) || validateGeometryAgainstQLine(radial, qCenter);
+      const reason = radial.boundaryError || validateParsedGeometry(radial) || validateGeometryAgainstQLine(radial, qCenter);
       if (reason) rejected.push({ index, reason });
-      else { radial.boundaryMethod = "WGS84 explicit radius/sector, adaptive samples"; polygons.push(radial); }
+      else { radial.boundaryMethod = "正文圆形/扇形按 WGS84 测地线计算"; polygons.push(radial); }
       continue;
     }
     const corridorWidthNm = parseCorridorWidthNm(section);
@@ -8208,6 +8432,7 @@ function hasInvalidBoundaryCoordinate(text) {
   // A recognisable half-coordinate must not silently disappear from a ring.
   const halves = /(?<![\d.])\d{4,7}(?:\.\d+)?\s*[NSEW](?![A-Z])|\b(?:[NS]\s*\d{4,6}(?:\.\d+)?|[EW]\s*\d{5,7}(?:\.\d+)?)(?![\d.])|(?<![\d.])\d{1,3}-\d{1,2}(?:\.\d+)?(?:-\d{1,2}(?:\.\d+)?)?\s*[NSEW](?![A-Z])|(?<![\d.])\d{1,3}(?:\.\d+)?[°度][\s\d.′'分″"秒]*[NSEW北南东西](?![A-Z])|(?<![\d.])\d{1,3}\.\d+\s*[NSEW](?![A-Z])/gi;
   return [...String(text).matchAll(halves)]
+    .filter(match=>!(/^[NS]\s*\d{4,6}(?:\.\d+)?$/i.test(match[0])&&!/^\s*[EW]\s*\d/i.test(text.slice(match.index+match[0].length))))
     .some((match) => !tokens.some((token) => match.index >= token.sourceIndex && match.index + match[0].length <= token.sourceEnd));
 }
 
@@ -8243,7 +8468,7 @@ function explainMissingGeometry({
     return "\u8fb9\u754c\u5305\u542b\u5f27\u7ebf\u3001\u56fd\u754c/FIR \u8fb9\u754c\u6216\u6d77\u5cb8\u7ebf\u63cf\u8ff0\uff0c\u5f53\u524d\u4e0d\u7528\u76f4\u7ebf\u7c97\u7565\u95ed\u5408";
   }
   if (centerRadiusList) {
-    return "\u6b63\u6587\u662f\u591a\u4e2a\u5706\u5fc3/\u534a\u5f84\u533a\u57df\u6e05\u5355\uff0c\u6309\u8981\u6c42\u4e0d\u63a8\u5bfc\u5706\u5f62\u8fb9\u754c";
+    return "圆形或扇形的参数、分组或附加边界限制未能完整解析，未猜测范围";
   }
   if (count >= 3 && unsupportedLineCorridor) {
     return "\u6b63\u6587\u662f\u591a\u70b9\u7ebf\u72b6\u8d70\u5eca\uff0c\u9700\u8981\u7f13\u51b2\u7ebf\u8ba1\u7b97\uff0c\u4e0d\u4f5c\u666e\u901a\u591a\u8fb9\u5f62\u7ed8\u5236";
@@ -8255,7 +8480,7 @@ function explainMissingGeometry({
     return "正文含多个坐标，但缺少 AREA/BOUNDED/SECTOR 等边界语义，按航路点/参考点列表处理";
   }
   if (count === 0) {
-    if (qCenter?.center || radiusNm) return "仅有 Q-line/中心半径信息；按要求不把中心半径推导成圆形边界";
+    if (qCenter?.center || radiusNm) return "仅有 Q 行参考范围或缺少正文圆心坐标，不能据此确定活动边界";
     return geometryText?.trim() ? "E) 正文未包含可解析的 DMS 边界坐标" : "NOTAM 正文缺少可解析的 E) 边界描述";
   }
   if (count === 1) return "E) 正文只有 1 个坐标，通常是参考点，不能构成区域";
@@ -8269,7 +8494,7 @@ function hasBoundaryGeometryIntent(text, purpose = "") {
   const boundaryWords =
     /\bHORIZONTAL\s+LIMITS?\b|\bYATAY\s+LIMITLER\b|\b(?:RESTRICTED|DANGER|RESERVED)\s+AREA\s+(?:ACT|ACTIVATED)\s*:|\bAREA\s+(?=\d{4,6}(?:\.\d+)?[NS])/i.test(source) ||
     /\bWI(?:THIN)?\s+(?:THE\s+)?(?:AREA\s+(?:WITH\s+)?)?(?:FLW\s+|FOLLOWING\s+)?COORD(?:S|INATES)?\b|\b(?:BACK\s+)?TO\s+(?:THE\s+)?POINT\s+OF\s+ORIGIN\b/i.test(source) ||
-    /\b(?:ARAE|BOUND(?:ED)?|BUNDED|BOUNDARY|BDRY(?:\s+EDGE)?|HORIZONTAL\s+BOUNDAR(?:Y|IES)|DEFINED|DELINEATED|LATERAL\s+LIMITS|SECTOR|ZONE|POLYGON|AS\s+FLW|AS\s+FOLLOWS|FOLLOWING\s+POINTS?)\b/i.test(source) ||
+    /\b(?:ARAE|BOUND(?:ED)?|BUNDED|BOUNDARY|BDRY(?:\s+EDGE)?|HORIZONTAL\s+BOUNDAR(?:Y|IES)|DEFINED|DELINEATED|DELIMITED|LATERAL\s+LIMITS|SECTOR|ZONE|POLYGON|AS\s+FLW|AS\s+FOLLOWS|FOLLOWING\s+POINTS?)\b/i.test(source) ||
     /\bAREA\s*(?:\d{1,2}|[A-Z])?\s*:/i.test(source) ||
     /\bAREA\s+(?:\d{1,2}|[A-Z])\b(?=\s*(?:[.:]|[\r\n]|$))/i.test(source) ||
     /\bWI(?:THIN)?\s+(?:THE\s+)?(?:FLW\s+)?AREA(?:\s+PSN)?\s*:/i.test(source) ||
@@ -8297,6 +8522,10 @@ function isExplicitNonAreaCoordinateList(text) {
   if (/\bRIG\s*LIST\b|\bRIGLIST\b/i.test(source)) return true;
   if (/\bNOT\s+FORMING\s+(?:A\s+)?(?:LINE\s*[,]?\s*)?(?:POLYGON\s*(?:OR|\/)\s*)?(?:CIRCLE|POLYGON|LINE)\b/i.test(source)) return true;
   if (/\bAREA\s+(?:FLW|FOLLOWING)\s+POINTS?\s*:/i.test(source) && (source.match(/\bPROVINCE\b/gi) || []).length >= 2) return true;
+  if (/\bCIRCLE\s*,?\s*(?:PSN|CENT(?:ER|RE))\b/i.test(source)) {
+    const radial=explicitRadialBoundary(source,extractCoordinateTokens(source));
+    if(radial&&!radial.boundaryError)return false;
+  }
   if (/\b(?:NEW\s+)?OBST\b|\bOBSTACLE\b|\bAEOLIC\s+PROPELLER\b|\bWIND\s+TURBINES?\b/i.test(source)) {
     return /\b(?:ELEV|HEIGHT|SITE)\b/i.test(source) && !hasStrongBoundaryLanguage(source);
   }
@@ -8329,6 +8558,7 @@ function hasCoordinateOnlyLineSequence(text) {
 
 function isRouteProcedureCoordinateList(text) {
   const source = String(text || "");
+  if (hasStrongBoundaryLanguage(source) && hasClosedCoordinateSequence(source)) return false;
   if (/\bTRIGGER\s+NOTAM\b/i.test(source) && /\bAIP\s+(?:SUP|SUPPLEMENT)\b/i.test(source)) return true;
   if (/\bAIR\s+CIRCUIT\b/i.test(source) && (extractCoordinates(source).length >= 3 || /\bAPRX\s+(?:FM|TO)\b/i.test(source))) return true;
   if (
@@ -8353,6 +8583,7 @@ function isRouteProcedureCoordinateList(text) {
 }
 
 function hasStrongBoundaryLanguage(text) {
+  if (/\bAREAS?\s+DELIMITED\s+BY\b/i.test(text)) return true;
   if (/\bWI(?:THIN)?\s+(?:A\s+)?LINE\s+JOINING\s+(?:THE\s+)?(?:FOLLOWING\s+)?POINTS\b/i.test(text) && hasClosedCoordinateSequence(text)) return true;
   return /\b(AREA\s+(?:IS\s+)?(?:BOUND(?:ED)?|BUNDED)|(?:BOUND(?:ED)?|BUNDED)\s+BY|BOUNDARY|BDRY(?:\s+EDGE)?|HORIZONTAL\s+BOUNDAR(?:Y|IES)|LATERAL\s+LIMITS|POLYGON(?:AL)?|AREA\s+WI(?:THIN)?\b[^:\r\n]{0,80}\bCOORD|TEMP(?:ORARY|O)\s+(?:DANGER|RESTRICTED|RESERVED)\s+AREA|DANGER\s+AREA\s+(?:ACT|ACTIVE|ACTIVATED)|RESTRICTED\s+AREA\s+(?:ACT|ACTIVE|ACTIVATED)|AIRSPACE\s+(?:CLSD|CLOSED)\s+WI(?:THIN)?(?:\s+AREA)?|(?:DEFINED|DELINEATED)\s+BY\s+(?:THE\s+)?(?:FOLLOWING\s+)?(?:COORD|POINTS)|WI(?:THIN)?\s+(?:THE\s+)?(?:FLW\s+)?AREA(?:\s+PSN)?\s*:|(?:RESTRICTED|DANGER|TRAINING|RESERVED)\s+AREA\b[^\r\n]{0,80}\bCOORD)\b/i.test(
     String(text || ""),
@@ -8371,7 +8602,7 @@ function describeNotamGeometrySource(polygons, kind) {
 }
 
 function hasAirspaceClosureCue(text) {
-  return /\b(TEMP(?:ORARY|O)\s+(?:DANGER|RESTRICTED|RESERVED)\s+AREA|DANGER\s+AREA\s+(?:ACT|ACTIVE|ACTIVATED)|RESTRICTED\s+AREA\s+(?:ACT|ACTIVE|ACTIVATED)|AERIAL\s+ACT|AIR\s+ACT|UA\s+ACT|TRAINING\s+(?:FLIGHT|AREA)|MIL(?:ITARY)?\s+(?:EXERCISE|ACT)|AIRSPACE\s+(?:BLOCKED|CLSD|CLOSED|RESTRICTED|PROHIBITED|RESERVED)|FLT\s+OF\s+[^\r\n]{0,40}\bPROHIBITED|FRNG|FIRING|MISSILE|ROCKET|UAS|UAV|DRONE|UNMANNED|PJE|PARACHUTE|GUN|WEAPON)\b/i.test(
+  return /\b(TEMP(?:ORARY|O)\s+(?:DANGER|RESTRICTED|RESERVED)\s+AREA|DANGER\s+AREA\s+(?:ACT|ACTIVE|ACTIVATED)|RESTRICTED\s+AREA\s+(?:ACT|ACTIVE|ACTIVATED)|AERIAL\s+ACT|AIR\s+ACT|UA\s+ACT|TRAINING\s+(?:FLIGHT|AREA)|MIL(?:ITARY)?\s+(?:EXERCISE|EXER|ACT)|AIRSPACE\s+(?:BLOCKED|CLSD|CLOSED|RESTRICTED|PROHIBITED|RESERVED)|FLT\s+OF\s+[^\r\n]{0,40}\bPROHIBITED|FRNG|FIRING|MISSILE|ROCKET|UAS|UAV|DRONE|UNMANNED|PJE|PARACHUTE|GUN|WEAPON)\b/i.test(
     String(text || ""),
   );
 }
@@ -8409,6 +8640,7 @@ function isUnsupportedLineCorridor(text, coordinates, corridorWidthNm) {
   const source = String(text || "");
   const count = Array.isArray(coordinates) ? coordinates.length : 0;
   if (count < 3) return false;
+  if (hasStrongBoundaryLanguage(source) && hasClosedCoordinateSequence(source) && !Number.isFinite(corridorWidthNm) && !/\b(?:EITHER|EACH)\s+SIDE\b/i.test(source)) return false;
   if (hasClosedPolygonSequenceCue(source)) return false;
   return (
     Number.isFinite(corridorWidthNm) ||
@@ -8458,6 +8690,7 @@ function cleanNotamGeometryText(text) {
 function focusBoundaryCoordinateText(text) {
   const source = String(text || "");
   const starts = [
+    ...source.matchAll(/\bAREA\s+NO\.\s*\d+\s*[,，:：]?/gi),
     ...source.matchAll(
       /\b(?:IN\s+AREAS?\s+BOUND(?:ED)?\s+BY|AREAS?\s+BOUND(?:ED)?\s+BY|AREA\s+(?:WI|WITHIN|BOUND(?:ED)?|DEFINED|AS\s+FLW|AS\s+FOLLOWS)|FLW\s+AREA\s+WI|FOLLOWING\s+AREA\s+WI|WI\s+COORDS?:|WITHIN\s+COORDS?:|LATERAL\s+LIMITS)\b/gi,
     ),
@@ -8505,7 +8738,13 @@ function normalizeExplicitGeometry(geometry) {
 }
 
 function normalizeNotamCoordinateText(text) {
-  return String(text || "")
+  return normalizeBoundaryLanguage(String(text || ""))
+    .replace(/[\u200b-\u200f\u2060\ufeff]/g, '')
+    .replace(/[\uFF01-\uFF5E]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xfee0))
+    .replace(/\bAREAS?\s+ARE\s+BOUNDED\s+BY\b/gi, 'AREAS BOUNDED BY')
+    .replace(/(\d),(\d+)(?=[NSWE]\b|[NSWE](?=\d))/gi,'$1.$2')
+    .replace(/\b(OF|AND|BY|JOINING)(?=\d{1,3}-\d)/gi,'$1 ')
+    .replace(/([EW])(?=\d{1,3}(?:个)?(?:坐标)?点)/g,'$1 ')
     .replace(/(^|[\r\n])([\t ]*\d{1,3}\.)(?=\d{4,6}(?:\.\d+)?[NS][\s,/-]*\d{5,7}(?:\.\d+)?[EW])/gim, "$1$2 ")
     .replace(/(\d{1,3})\s*-[\t\r\n ]*(\d{1,2}(?:\.[\t\r\n ]*\d+)?)(?:[\t ]*-[\t\r\n ]*(\d{1,2}(?:\.[\t\r\n ]*\d+)?))?[\t\r\n ]*([NSEW])/gi,
       (match, degree, minute, second, hemisphere) => `${degree}-${minute.replace(/\s/g, "")}${second === undefined ? "" : `-${second.replace(/\s/g, "")}`}${hemisphere}`)
@@ -8596,6 +8835,11 @@ function isCircleRadiusCoordinateLine(line) {
 function extractCoordinateSections(text) {
   const source = String(text || "");
   const sectionStarts = [
+    ...source.matchAll(/\bTEMPORARY\s+RESTRICTED\s+AREA\s*-\s*TRA\s+\d+\b/gi),
+    ...source.matchAll(/(?:^|[\r\n])\s*FM\s+(?:SFC|\d+FT\s+AMSL|FL\d+)\s+TO\s+(?:\d+FT\s+AMSL|FL\d+)\s+(?=\d+(?:\.\d+)?\s*NM\s+RADIUS)/gi),
+    ...source.matchAll(/\bSEA\s+TRIAL\s+IN\s+EAST\s+OF\b|\bAND\s+NEAR\s+BY\s+THE\s+LINE\s+JOINING\b/gi),
+    ...source.matchAll(/\bAREA\s+NO\.\s*\d+\s*[,，:：]?/gi),
+    ...source.matchAll(/(?:^|[.。\r\n])\s*(?:AND\s+)?WITHIN\s+\d+(?:\.\d+)?\s*(?:MILES?|NM|KM|M)\s+RADIUS\s+OF\b/gi),
     ...source.matchAll(
       /(?:^|[\r\n])\s*(?:\(?\d{1,2}\)?\s*[\).:-]?\s*AREAS?\b|AREAS?\s*\d{1,2}\b|AREA\s+[A-Z]\b|ZONE\s*\d{1,2}\b|PART\.\s*\d+\s*[-:])/gi,
     ),
@@ -8603,7 +8847,12 @@ function extractCoordinateSections(text) {
     (match) => match.index + match[0].search(/\S/),
   );
   sectionStarts.push(
-    ...[...source.matchAll(/(?:^|[\r\n])\s*(?:ROTA\s+\d+\s*:|\d+(?:ST|ND|RD|TH)\s+ROUTE\s*:|LATERAL\s+LIMITS\s*:)/gi)]
+    ...[...source.matchAll(/\b(?:IN\s+)?AREA\s+WITHIN\s+\d+(?:\.\d+)?\s*(?:M|KM|NM|NAUTICAL\s+MILES?|METERS?)\s+RADIUS\b/gi)].map(m=>m.index),
+    ...[...source.matchAll(/(?:^|[\r\n])\s*\d{1,2}[.)]\s*(?:(?:WI\s+)?CIRCLE\b|RADIUS\b|\d+(?:\.\d+)?\s*(?:M|KM|NM)\s+RADIUS\b)/gi)].map(m=>m.index+m[0].search(/\S/)),
+    ...[...source.matchAll(/(?:^|[\r\n])\s*PSN\s+[^\r\n]*?\bRADIUS\b/gi)].map(m=>m.index+m[0].search(/\S/)),
+  );
+  sectionStarts.push(
+    ...[...source.matchAll(/(?:^|[\r\n])\s*(?:ROTA\s+\d+\s*:|\d+(?:ST|ND|RD|TH)\s+(?:ROUTE|AREA)\s*:|LATERAL\s+LIMITS\s*:)/gi)]
       .map((match) => match.index + match[0].search(/\S/)),
   );
   sectionStarts.push(
@@ -8669,7 +8918,7 @@ function extractCoordinateSections(text) {
   let prefix = "";
   for (const section of sections) {
     prefix += section;
-    if (extractCoordinateTokens(section).length) {
+    if (extractCoordinateTokens(section).length || hasInvalidBoundaryCoordinate(section)) {
       contextual.push(prefix);
       prefix = "";
     }
@@ -8731,6 +8980,10 @@ function extractCoordinates(text) {
 
 function extractCoordinateTokens(text) {
   const coords = [];
+  const shortLongitude=/(?<!\d)(\d{2})(\d{2})(\d{2}(?:\.\d+)?)\s*([NS])[\s,/-]*([1-9]\d)(\d{2})(\d{2}(?:\.\d+)?)\s*([EW])(?!\d)/gi;
+  for(const match of text.matchAll(shortLongitude))pushExtractedCoordinate(coords,match.index,{
+    matchedText:match[0],lat:signedDms(match[1],match[2],match[3],match[4]),lon:signedDms(match[5],match[6],match[7],match[8]),
+  });
   const compact =
     /(?<!\d)(\d{2})(\d{2})(\d{2}(?:\.\d+)?)?\s*([NS])[\s,/-]*(\d{3})(\d{2})(\d{2}(?:\.\d+)?)?\s*([EW])(?!\d)/gi;
   for (const match of text.matchAll(compact)) {
@@ -8781,6 +9034,12 @@ function extractCoordinateTokens(text) {
     });
   }
 
+  // Some official MSA tables print longitude before latitude.
+  const lonFirstDash=/\b(\d{1,3})-(\d{1,2}(?:\.\d+)?)(?:-(\d{1,2}(?:\.\d+)?))?\s*([EW])[\s,;/-]*(\d{1,2})-(\d{1,2}(?:\.\d+)?)(?:-(\d{1,2}(?:\.\d+)?))?\s*([NS])\b/gi;
+  for(const match of text.matchAll(lonFirstDash))pushExtractedCoordinate(coords,match.index,{
+    matchedText:match[0],lon:signedDms(match[1],match[2],match[3]||0,match[4]),lat:signedDms(match[5],match[6],match[7]||0,match[8]),
+  });
+
   const spaced =
     /\b([NS])\s*(\d{1,2})[\s-]+(\d{1,2})(?:[\s-]+(\d{1,2}(?:\.\d+)?))?\s+([EW])\s*(\d{1,3})[\s-]+(\d{1,2})(?:[\s-]+(\d{1,2}(?:\.\d+)?))?\b/gi;
   for (const match of text.matchAll(spaced)) {
@@ -8830,7 +9089,7 @@ function extractCoordinateTokens(text) {
       consumedEnd = coordinate.sourceEnd;
       return true;
     })
-    .map(({ lat, lon, sourceIndex, sourceEnd }) => ({ lat, lon, sourceIndex, sourceEnd }));
+    .map(({ lat, lon, sourceIndex, sourceEnd, matchedText }) => ({ lat, lon, sourceIndex, sourceEnd, matchedText }));
 }
 
 function pushExtractedCoordinate(target, sourceIndex, coordinate) {
@@ -9416,6 +9675,7 @@ function ringSelfIntersects(points) {
 }
 
 function segmentsIntersect(a, b, c, d) {
+  if (Math.max(a[0],b[0])<Math.min(c[0],d[0]) || Math.max(c[0],d[0])<Math.min(a[0],b[0]) || Math.max(a[1],b[1])<Math.min(c[1],d[1]) || Math.max(c[1],d[1])<Math.min(a[1],b[1])) return false;
   const o1 = orientation(a, b, c);
   const o2 = orientation(a, b, d);
   const o3 = orientation(c, d, a);
@@ -9433,12 +9693,11 @@ function segmentsIntersect(a, b, c, d) {
 }
 
 function orientationSign(value) {
-  const epsilon = 1e-14;
-  return value > epsilon ? 1 : value < -epsilon ? -1 : 0;
+  return Math.sign(value);
 }
 
 function pointOnSegment(a, b, point) {
-  const epsilon = 1e-10;
+  const epsilon = 0;
   return (
     point[0] >= Math.min(a[0], b[0]) - epsilon &&
     point[0] <= Math.max(a[0], b[0]) + epsilon &&
@@ -9448,7 +9707,7 @@ function pointOnSegment(a, b, point) {
 }
 
 function orientation(a, b, c) {
-  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  return -orient2d(a[0], a[1], b[0], b[1], c[0], c[1]);
 }
 
 function samePoint(a, b) {
@@ -9570,10 +9829,7 @@ function parseFaaCompactDate(value) {
 }
 
 function parseIcaoDate(value) {
-  if (!value) return null;
-  const year = Number(value.slice(0, 2));
-  const fullYear = year >= 70 ? 1900 + year : 2000 + year;
-  return `${fullYear}-${value.slice(2, 4)}-${value.slice(4, 6)}T${value.slice(6, 8)}:${value.slice(8, 10)}:00Z`;
+  return validIcaoDate(value);
 }
 
 function getNotamIdFromGeoFeature(feature) {
@@ -10328,8 +10584,7 @@ async function fetchCloudSatelliteTile(z, y, x, options = {}) {
   const cached = cloudTileCache.get(key);
   if (options.preferCache !== false && cached && cached.expiresAt > Date.now()) return cached.tile;
 
-  const dataset = await loadGmgsiDataset(selected);
-  const tile = renderGmgsiTile(dataset, z, y, x);
+  const tile = await renderCloudImageInWorker(key, { item: selected, kind: "tile", z, y, x });
   cloudTileCache.set(key, { expiresAt: Date.now() + CLOUD_TILE_CACHE_TTL_MS, tile });
   trimMapToSize(cloudTileCache, CLOUD_TILE_CACHE_MAX_ITEMS);
   return tile;
@@ -10343,11 +10598,22 @@ async function fetchCloudSatelliteGlobeTexture(options = {}) {
   const cached = cloudTileCache.get(key);
   if (options.preferCache !== false && cached && cached.expiresAt > Date.now()) return cached.tile;
 
-  const dataset = await loadGmgsiDataset(selected);
-  const texture = renderGmgsiGlobeTexture(dataset);
+  const texture = await renderCloudImageInWorker(key, { item: selected, kind: "globe" });
   cloudTileCache.set(key, { expiresAt: Date.now() + CLOUD_TILE_CACHE_TTL_MS, tile: texture });
   trimMapToSize(cloudTileCache, CLOUD_TILE_CACHE_MAX_ITEMS);
   return texture;
+}
+
+async function renderCloudImageInWorker(key, payload) {
+  const existing = cloudImageInFlight.get(key);
+  if (existing) return existing;
+  const pending = cloudCompute.run("cloud-image", payload).then(image => ({ ...image, buffer: Buffer.from(image.buffer) })).finally(() => cloudImageInFlight.delete(key));
+  cloudImageInFlight.set(key, pending);
+  return pending;
+}
+
+async function closePerformanceWorkers() {
+  await Promise.all([historyCompute.close(), cloudCompute.close()]);
 }
 
 async function loadGmgsiDataset(item) {
@@ -11211,6 +11477,7 @@ function roundCoord(value) {
 }
 
 function normalizeLon(value) {
+  if (value >= -180 && value < 180) return value;
   return ((value + 540) % 360) - 180;
 }
 
@@ -11223,6 +11490,18 @@ function toDeg(value) {
 }
 
 export {
+  readSnapshotSummary, readRefreshHistoryItem, historyItemFilePath, buildRefreshHistoryListAsync, readRefreshHistoryResponse,
+  loadGmgsiDataset, readGmgsiDatasetFile, renderGmgsiTile, renderGmgsiGlobeTexture, renderCloudImageInWorker, closePerformanceWorkers,
+  fetchMsaText,
+  getMsaNavWarnings,
+  parseMsaWarningDetail,
+  fetchMsaWarningListItems,
+  discoverMsaWarningColumns,
+  buildMsaNavWarningRestriction,
+  probeFaaNotamGateway,
+  getRestrictions,
+  getHydropacWarnings,
+  getNavareaWarnings,
   retainFailedNavareaRegions,
   buildHydropacRestriction,
   parseHydropacCurrentListPage,
@@ -11230,9 +11509,7 @@ export {
   fetchSeaLagomNavareaRegion,
   fetchFaaNotamFir,
   NAVAREA_WARNING_REGIONS,
-  parseMsaWarningDetail,
-  parseMsaWarningListPage,
-  recoverFaaNotamFirs,
+  parseMsaWarningListPage, recoverFaaNotamFirs,
   extractCoordinateSections,
   hasUnsupportedBoundaryInstruction,
   hasUnsupportedNaturalBoundaryInstruction,
@@ -11266,6 +11543,7 @@ const isMainModule = Boolean(
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)),
 );
 if (isMainModule) {
+  scheduledRefresh.start();
   server.listen(port, host, () => {
     console.log(`Serving Space Enthusiast Map at http://${host}:${port}`);
     console.log("Press Ctrl+C to stop.");

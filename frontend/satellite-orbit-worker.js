@@ -1,3 +1,4 @@
+import "/frontend/satellite-reference.js?v=satellite-reference-4";
 import {
   degreesLat,
   degreesLong,
@@ -133,12 +134,26 @@ function buildOrbitSamples({ startMs, periodMs, maxSegments, sampleAtTime, adapt
 
 self.addEventListener("message", (event) => {
   const message = event.data || {};
+  if (message.type === "catalog-delta") { updateCatalog(message); return; }
   if (message.type === "catalog") {
     initializeCatalog(message);
     return;
   }
   if (message.type === "propagate") propagateSelection(message);
 });
+
+function updateCatalog(message) {
+  const changedIds = new Set([...(message.removeIds || []).map(String), ...(message.satellites || []).map(item => String(item.id))]);
+  for (const id of changedIds) { satrecs.delete(id); metadata.delete(id); }
+  for (const key of inertialPathCache.keys()) if (changedIds.has(key.slice(0, key.indexOf(":")))) inertialPathCache.delete(key);
+  for (const item of message.satellites || []) {
+    if (!item?.id || !item.omm) continue;
+    try { const series = createSatrecSeries(item); if (!series.length) continue; const id = String(item.id); metadata.set(id, item); satrecs.set(id, series); } catch {}
+  }
+  catalogIds = (message.catalogIds || []).map(id => metadata.has(String(id)) ? String(id) : "");
+  const accepted = catalogIds.filter(Boolean).length;
+  self.postMessage({ type: "catalog-ready", requestId: message.requestId, generation: message.generation, accepted, rejected: catalogIds.length - accepted });
+}
 
 function initializeCatalog(message) {
   satrecs.clear();
@@ -254,13 +269,35 @@ function propagateSelection(message) {
     }
   }
   const packedPaths = packOrbitPaths(paths);
-  const transfer = [positionData.buffer];
+  // Use the already packed Float32 ECI input, exactly as the main-thread renderer did.
+  // Return Float64 scene states so no extra rounding changes position or velocity.
+  const sceneData = new Float64Array(catalogIds.length * 24); sceneData.fill(NaN);
+  for (let index = 0; index < catalogIds.length; index += 1) {
+    for (let step = 0; step < 2; step += 1) {
+      const source = index * POSITION_STRIDE + (step ? 11 : 5), target = index * 24 + step * 12;
+      const point = { x: positionData[source], y: positionData[source + 1], z: positionData[source + 2] };
+      if (![point.x, point.y, point.z].every(Number.isFinite)) continue;
+      const velocity = { x: positionData[source + 3], y: positionData[source + 4], z: positionData[source + 5] };
+      const value = globalThis.NotamSatelliteReference.eciStateToScene(point, velocity, {
+        sampleTimeMs: requestedAt + step * interpolationDurationSec * 1000,
+        referenceFrame: message.referenceFrame, referenceEpochMs: message.referenceEpochMs, scale: 1 / 6371.0088,
+      });
+      if (!value) continue;
+      sceneData.set([value.position.x, value.position.y, value.position.z,
+        value.velocity?.x ?? NaN, value.velocity?.y ?? NaN, value.velocity?.z ?? NaN,
+        value.geodetic.lonDeg, value.geodetic.latDeg, value.geodetic.altitudeKm, value.rotationTimeMs, value.gmstDeg, 1], target);
+    }
+  }
+  const transfer = [positionData.buffer, sceneData.buffer];
   if (packedPaths.buffer.byteLength) transfer.push(packedPaths.buffer);
   self.postMessage({
     type: "frame",
     requestId: message.requestId,
     timeMs: requestedAt,
     positionBuffer: positionData.buffer,
+    sceneBuffer: sceneData.buffer,
+    referenceFrame: message.referenceFrame,
+    referenceEpochMs: message.referenceEpochMs,
     positionCount: catalogIds.length,
     positionStride: POSITION_STRIDE,
     interpolationDurationSec,
