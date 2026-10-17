@@ -66,7 +66,7 @@ test('an entirely failed day publishes its outcome without replacing any saved d
   assert.deepEqual(result.sources, []);
   assert.deepEqual(await readFile(join(f.target, DAILY_SOURCES.notam.cache)), old);
   const state = JSON.parse(await readFile(join(f.target, 'scheduled_refresh_state.json')));
-  assert.equal(state.lastResults.length, 3);
+  assert.equal(state.lastResults.length, 4);
   assert.equal(state.lastResults[0].status, 'failed');
   assert.ok(state.lastRunAt);
   assert.equal(applyDailyArchive(f.target, f.original, f.name).applied, false);
@@ -88,9 +88,9 @@ test('restart retains all daily history and can load an evicted body; deleted hi
   await writeFile(indexFile, JSON.stringify(index));
   await rm(join(f.target, DAILY_SOURCES.navarea.directory, deletedId));
   const backup = join(f.root, 'backup.gz'), saved = await packPublicData(f.target, backup);
-  // Three latest caches, a small index and an import ledger; historical bodies
+  // Four latest caches, a small index and an import ledger; historical bodies
   // live in their immutable assets and do not inflate every public backup.
-  assert.equal(saved.files, 5);
+  assert.equal(saved.files, 6);
   const restored = join(f.root, 'restored'); await mkdir(restored);
   await unpackPublicData(createReadStream(backup), restored, saved.sha256);
   const client = f.client(restored); f.advance(); await client.check();
@@ -131,4 +131,78 @@ test('invalid snapshot metadata is rejected before any file is applied', async t
   await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(invalid));
   assert.throws(() => applyDailyArchive(f.target, f.original, f.name), /Invalid daily snapshot/);
   await assert.rejects(readFile(join(f.target, 'faa_notam_cache.json')));
+});
+
+function retryReport(source, { attempt = 1, status = 'failed', cycleId = '12345-1',
+  cycleStartedAt = '2026-10-17T07:37:00.000Z', finishedAt = '2026-10-17T07:40:00.000Z' } = {}) {
+  const retry = status === 'failed' && attempt < 3;
+  return { version: 2, cycleId, cycleStartedAt, results: [{ source, status, attempt, maxAttempts: 3,
+    startedAt: new Date(Date.parse(finishedAt) - 60000).toISOString(), finishedAt,
+    nextRetryAt: retry ? new Date(Date.parse(finishedAt) + 3600000).toISOString() : null,
+    retryExhausted: status === 'failed' && !retry }] };
+}
+
+test('independent source outcomes merge and MSA history survives backup and lazy restoration', async t => {
+  const first = await fixture(t, { sources: ['msa'] });
+  first.index.dailyReport = retryReport('msa', { status: 'success' });
+  await writeFile(join(first.original, 'refresh_history_index.json'), JSON.stringify(first.index));
+  applyDailyArchive(first.target, first.original, first.name);
+  const second = await fixture(t, { sources: [], date: '2026-10-17T07:41:00.000Z' });
+  second.index.dailyReport = retryReport('notam');
+  await writeFile(join(second.original, 'refresh_history_index.json'), JSON.stringify(second.index));
+  applyDailyArchive(first.target, second.original, second.name);
+  const state = JSON.parse(await readFile(join(first.target, 'scheduled_refresh_state.json')));
+  assert.deepEqual(state.lastSources, ['msa']); assert.equal(state.lastResults.length, 2);
+  assert.equal(state.lastResults.find(row => row.source === 'notam').attempt, 1);
+  const backup = join(first.root, 'msa-backup.gz'), packed = await packPublicData(first.target, backup);
+  assert.equal(packed.files, 3); // Latest MSA cache, index and retry state; no growing history body.
+  const restored = join(first.root, 'restored'); await mkdir(restored);
+  await unpackPublicData(createReadStream(backup), restored, packed.sha256);
+  assert.deepEqual(first.client(restored).status().lastResults, state.lastResults);
+  const id = first.index.sources.msa[0].id;
+  await first.client(restored).ensureHistory('msa', id);
+  const originalBody = JSON.parse(await readFile(join(restored, DAILY_SOURCES.msa.directory, id)));
+  assert.equal(originalBody.data.restrictions[0].geometry.type, 'MultiPolygon');
+});
+
+test('out-of-order retries cannot regress source status, and late previous cycles cannot replace a new day', async t => {
+  const base = await fixture(t, { sources: [] });
+  for (const [i, options] of [
+    { attempt: 3, finishedAt: '2026-10-17T09:42:00.000Z' },
+    { attempt: 1 },
+    { cycleId: '22222-1', cycleStartedAt: '2026-10-18T07:37:00.000Z', finishedAt: '2026-10-18T07:40:00.000Z' },
+    { attempt: 2, finishedAt: '2026-10-17T08:41:00.000Z' },
+  ].entries()) {
+    const f = await fixture(t, { sources: [] });
+    f.index.dailyReport = retryReport('notam', options);
+    await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(f.index));
+    const name = dailyAssetName({ at: new Date('2026-10-18T10:00:00Z'), runId: 99900 + i, sha256: f.packed.sha256 });
+    applyDailyArchive(base.target, f.original, name);
+    const state = JSON.parse(await readFile(join(base.target, 'scheduled_refresh_state.json')));
+    assert.equal(state.lastResults[0].attempt, i < 2 ? 3 : 1);
+    if (i >= 2) assert.equal(state.cycleId, '22222-1');
+  }
+});
+
+test('legacy three-source outcome archives are still readable after enabling MSA', async t => {
+  const f = await fixture(t, { sources: ['notam', 'hydropac', 'navarea'] });
+  delete f.index.sources.msa;
+  f.index.dailyReport = { version: 1, results: ['notam', 'hydropac', 'navarea'].map(source => ({ source, status: 'success' })) };
+  await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(f.index));
+  const result = applyDailyArchive(f.target, f.original, f.name);
+  assert.equal(result.sources.length, 3);
+});
+
+test('invalid retry times, counters and unreported snapshots are rejected before changing data', async t => {
+  for (const change of [row => { row.attempt = 4; }, row => { row.nextRetryAt = row.finishedAt; },
+    row => { row.retryExhausted = true; }, row => { row.startedAt = 'invalid'; }]) {
+    const f = await fixture(t, { sources: [] }); f.index.dailyReport = retryReport('notam');
+    change(f.index.dailyReport.results[0]);
+    await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(f.index));
+    assert.throws(() => applyDailyArchive(f.target, f.original, f.name), /retry outcome/);
+    await assert.rejects(readFile(join(f.target, 'refresh_history_index.json')));
+  }
+  const f = await fixture(t, { sources: ['msa'] }); f.index.dailyReport = retryReport('notam');
+  await writeFile(join(f.original, 'refresh_history_index.json'), JSON.stringify(f.index));
+  assert.throws(() => applyDailyArchive(f.target, f.original, f.name), /does not match/);
 });

@@ -20,6 +20,7 @@ import { downloadCloudFile, publicFilePath, runtimeSettings, sameOriginWrite } f
 import { createAdminAccess, requiresAdministrator } from "./admin-access.mjs";
 import { createPublicDataPersistence } from "./public-data-persistence.mjs";
 import { createScheduledRefresh } from "./scheduled-refresh.mjs";
+import { isFaaAccessDenied, faaResponseError, faaFailureDetails } from './faa-access.mjs';
 import { Agent as HttpsAgent, get as httpsGet } from "node:https";
 import { execFile } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
@@ -1673,6 +1674,7 @@ async function buildRestrictionsPayload({ includeDetails, includeGlobalNotams, i
     } catch (error) {
       console.warn(`[FAA NOTAM refresh] ${error instanceof Error ? error.message : String(error)}`);
       faaNotamPayload = cachedFaaNotamPayload(cacheKey, error) || faaNotamPayload;
+      faaNotamPayload.source.failureDetails = faaFailureDetails(error);
       if (!faaNotamPayload.source.cacheFallback) {
         faaNotamPayload.source.message = error instanceof Error ? error.message : String(error);
       }
@@ -6633,12 +6635,13 @@ async function probeFaaNotamGateway(fir) {
         body: new URLSearchParams(params),
       });
       const body = await response.text();
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${body.slice(0, 120)}`);
+      const failure = faaResponseError(response, body);
+      if (failure) throw failure;
       if (/^\s*</.test(body) || body.includes("redirectToDisclaimer")) throw new Error("FAA returned an HTML access gate.");
       JSON.parse(body || "{}");
       return { transport: "fetch", browserSession: null };
     } catch (error) {
-      if (isFaaAccessDenied(error)) throw new Error("FAA 当前拒绝访问（HTTP 403 / Access Denied），已停止刷新并保留上次完整缓存。请在来源恢复后重试。");
+      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
       errors.push(`direct ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       clearTimeout(timeout);
@@ -6652,7 +6655,7 @@ async function probeFaaNotamGateway(fir) {
       return { transport: "browser", browserSession };
     } catch (error) {
       await browserSession?.close();
-      if (isFaaAccessDenied(error)) throw error;
+      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
       errors.push(`browser ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -6714,7 +6717,7 @@ async function fetchFaaNotamFirs(firs, gateway = null) {
       });
       results = mergeFaaBatchRecoveryResults(results, adaptiveResults);
     } catch (error) {
-      if (isFaaAccessDenied(error)) throw error;
+      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
       adaptiveError = error instanceof Error ? error.message : String(error);
     }
 
@@ -6758,7 +6761,7 @@ async function fetchFaaNotamFirs(firs, gateway = null) {
       },
     };
   } catch (error) {
-    if (isFaaAccessDenied(error)) throw error;
+    if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
     if (FAA_NOTAM_TRANSPORT !== "auto") throw error;
     const results = await recoverFaaNotamFirs(firs);
     return {
@@ -6798,7 +6801,7 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
       if (accessDeniedError) throw accessDeniedError;
       return await fetchFaaNotamFir(fir, jar);
     } catch (error) {
-      if (isFaaAccessDenied(error)) accessDeniedError = error;
+      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') accessDeniedError = error;
       return {
         fir,
         memberFirs: fir.memberFirs || [fir],
@@ -6818,8 +6821,10 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
       retryConcurrency,
       async (fir) => {
         try {
+          if (accessDeniedError) throw accessDeniedError;
           return await fetchFaaNotamFir(fir, jar);
         } catch (error) {
+          if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') accessDeniedError = error;
           return {
             fir,
             memberFirs: fir.memberFirs || [fir],
@@ -6833,6 +6838,7 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
     );
     results = mergeFaaFirRetryResults(results, retryResults);
   }
+  if (accessDeniedError) throw accessDeniedError;
   return results;
 }
 
@@ -7945,13 +7951,17 @@ async function fetchFaaNotamForm(url, jar, params) {
       });
       mergeSetCookies(jar, response.headers);
       const text = await response.text();
-      if (!response.ok) throw new Error(`FAA NOTAM Search ${response.status}: ${text.slice(0, 180)}`);
+      const failure = faaResponseError(response, text);
+      if (failure) throw failure;
       if (/^\s*</.test(text) || text.includes("redirectToDisclaimer")) {
         throw new Error("FAA NOTAM Search returned an HTML gate instead of NOTAM JSON.");
       }
       return text ? JSON.parse(text) : {};
     } catch (error) {
       lastError = error;
+      // Long upstream cool-downs belong to the outer scheduled attempt, not a
+      // blocked request worker. Preserve the source's requested retry time.
+      if (Date.parse(error.retryAfterAt) > Date.now() + 60000) throw error;
       if (attempt >= FAA_NOTAM_REQUEST_RETRY_ATTEMPTS || !isRetryableFaaRequestError(error)) throw error;
       deferFaaNotamRequests(error, attempt);
       await sleep(FAA_NOTAM_REQUEST_RETRY_BASE_DELAY_MS * attempt);
@@ -7978,11 +7988,7 @@ function deferFaaNotamRequests(error, attempt) {
   const delayMs = rateLimited
     ? FAA_NOTAM_REQUEST_RETRY_BASE_DELAY_MS * Math.max(1, attempt)
     : Math.max(1000, FAA_NOTAM_REQUEST_RETRY_BASE_DELAY_MS * Math.max(1, attempt) * 0.5);
-  faaNotamNextRequestAt = Math.max(faaNotamNextRequestAt, Date.now() + delayMs);
-}
-
-function isFaaAccessDenied(error) {
-  return /\b403\b|Access Denied/i.test(error instanceof Error ? error.message : String(error || ""));
+  faaNotamNextRequestAt = Math.max(faaNotamNextRequestAt, Date.now() + delayMs, Date.parse(error?.retryAfterAt) || 0);
 }
 
 function isRetryableFaaRequestError(error) {

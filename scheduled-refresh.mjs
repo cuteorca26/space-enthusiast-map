@@ -4,11 +4,13 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { unpackPublicData } from './public-data-persistence.mjs';
+import { DAILY_RETRY_DELAY_MS, MAX_DAILY_ATTEMPTS } from './daily-refresh-policy.mjs';
 
 export const DAILY_SOURCES = {
   notam: { cache: 'faa_notam_cache.json', directory: 'faa_notam_snapshots' },
   hydropac: { cache: 'nga_hydropac_cache.json', directory: 'hydropac_snapshots' },
   navarea: { cache: 'navarea_warning_cache.json', directory: 'navarea_warning_snapshots' },
+  msa: { cache: 'msa_nav_warning_cache.json', directory: 'msa_nav_warning_snapshots' },
 };
 export const DAILY_START_YEAR = 2026;
 const ASSET = /^daily-(\d{4})-(\d{14})-(\d+)-(\d+)-([a-f0-9]{64})\.pack\.gz$/;
@@ -27,6 +29,45 @@ export function validDailyAsset(asset) {
   return asset?.state === 'uploaded' && ASSET.test(asset.name) && Number.isSafeInteger(asset.size) && asset.size > 0 && asset.size < 1900 * 1024 * 1024;
 }
 
+function validateDailyReport(report) {
+  if (report === undefined) return;
+  const rows = report?.results;
+  if (!Array.isArray(rows) || !rows.length || rows.length > Object.keys(DAILY_SOURCES).length ||
+    new Set(rows.map(row => row?.source)).size !== rows.length ||
+    rows.some(row => !Object.hasOwn(DAILY_SOURCES, row?.source) || !['success', 'failed'].includes(row.status)))
+    throw new Error('Invalid daily outcome report');
+  // Keep already-published three-source archives readable.
+  if (report.version === 1 && [3, 4].includes(rows.length)) return;
+  if (report.version !== 2 || !/^\d+-\d+$/.test(report.cycleId) || !Number.isFinite(Date.parse(report.cycleStartedAt)))
+    throw new Error('Invalid daily cycle');
+  for (const row of rows) {
+    const start = Date.parse(row.startedAt), end = Date.parse(row.finishedAt);
+    const retry = row.status === 'failed' && row.attempt < MAX_DAILY_ATTEMPTS;
+    if (!Number.isInteger(row.attempt) || row.attempt < 1 || row.attempt > MAX_DAILY_ATTEMPTS ||
+      row.maxAttempts !== MAX_DAILY_ATTEMPTS || !Number.isFinite(start) || !Number.isFinite(end) || end < start ||
+      (retry ? !Number.isFinite(Date.parse(row.nextRetryAt)) || Date.parse(row.nextRetryAt) < end + DAILY_RETRY_DELAY_MS : row.nextRetryAt !== null) ||
+      row.retryExhausted !== (row.status === 'failed' && !retry)) throw new Error('Invalid hourly retry outcome');
+  }
+}
+
+function mergeDailyStatus(state, report, imported, at) {
+  const cycleAt = report?.version === 2 ? report.cycleStartedAt : at;
+  const cycleId = report?.version === 2 ? report.cycleId : `legacy-${at}`;
+  if (Date.parse(cycleAt) < Date.parse(state.cycleStartedAt || state.lastRunAt || '1970-01-01')) return;
+  const rows = report?.results || Object.keys(DAILY_SOURCES).map(source => ({ source, status: imported.includes(source) ? 'success' : 'failed' }));
+  const previous = state.cycleId === cycleId ? state.lastResults || [] : [];
+  const merged = new Map(previous.map(row => [row.source, row]));
+  for (const row of rows) {
+    const old = merged.get(row.source);
+    // Sources finish independently. Ignore an older retry arriving out of order,
+    // and never downgrade a source that already succeeded in this cycle.
+    if (!old || (old.status !== 'success' && (row.attempt || 0) >= (old.attempt || 0))) merged.set(row.source, row);
+  }
+  state.cycleId = cycleId; state.cycleStartedAt = cycleAt;
+  state.lastResults = [...merged.values()];
+  state.lastSources = state.lastResults.filter(row => row.status === 'success').map(row => row.source);
+}
+
 // Commit already-validated downloads in one synchronous section. A concurrent
 // manual refresh or deletion cannot interleave index updates with this section.
 // Applied asset identities are saved with the normal durable public backup.
@@ -38,14 +79,12 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
   const incoming = readJson(join(staging, INDEX_FILE), null);
   if (incoming?.version !== 3 || !incoming.sources) throw new Error('Daily archive has no valid history index');
   const results = incoming.dailyReport?.results;
-  if (results !== undefined && (!Array.isArray(results) || results.length !== 3 ||
-    new Set(results.map(row => row.source)).size !== 3 || results.some(row => !DAILY_SOURCES[row.source] || !['success', 'failed'].includes(row.status))))
-    throw new Error('Invalid daily outcome report');
+  validateDailyReport(incoming.dailyReport);
   const index = readJson(join(directory, INDEX_FILE), { version: 3, sources: { notam: [], hydropac: [], navarea: [], msa: [], satellite: [] } });
   if (index.version !== 3 || !index.sources) throw new Error('Existing history index needs migration before daily import');
   const operations = [], imported = [];
   for (const [source, config] of Object.entries(DAILY_SOURCES)) {
-    const records = incoming.sources[source];
+    const records = incoming.sources[source] ?? (source === 'msa' ? [] : undefined);
     if (!Array.isArray(records) || records.length > 1) throw new Error(`Invalid ${source} daily history`);
     if (!records.length) continue;
     const record = records[0];
@@ -64,7 +103,8 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
     imported.push(source);
   }
   if (!imported.length && !results) throw new Error('Daily archive has no successful sources');
-  if (results?.some(row => (row.status === 'success') !== imported.includes(row.source))) throw new Error('Daily outcome does not match saved sources');
+  if (results && (results.some(row => (row.status === 'success') !== imported.includes(row.source)) ||
+    imported.some(source => !results.some(row => row.source === source && row.status === 'success')))) throw new Error('Daily outcome does not match saved sources');
   for (const item of operations) {
     mkdirSync(join(item.to, '..'), { recursive: true });
     renameSync(item.from, item.to);
@@ -72,9 +112,9 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
   index.updatedAt = now;
   atomicJson(join(directory, INDEX_FILE), index);
   state.applied.push(assetName); state.lastImportedAt = now;
-  state.lastRunAt = assetName.match(ASSET)[2].replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3T$4:$5:$6Z');
-  state.lastSources = imported;
-  state.lastResults = results || Object.keys(DAILY_SOURCES).map(source => ({ source, status: imported.includes(source) ? 'success' : 'failed' }));
+  const at = assetName.match(ASSET)[2].replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3T$4:$5:$6Z');
+  mergeDailyStatus(state, incoming.dailyReport, imported, at);
+  state.lastRunAt = !state.lastRunAt || at > state.lastRunAt ? at : state.lastRunAt;
   atomicJson(join(directory, STATE_FILE), state);
   trimDailyBodies(directory, index);
   return { applied: true, sources: imported };
@@ -105,7 +145,9 @@ export function createScheduledRefresh({ directory, repository, enabled = false,
     const state = readJson(join(directory, STATE_FILE), {});
     return { enabled: Boolean(configured), active: Boolean(running), schedule: '每天北京时间 15:37（UTC 07:37）',
       sources: Object.keys(DAILY_SOURCES), lastCheckAt: lastCheck ? new Date(lastCheck).toISOString() : null,
-      lastImportedAt: state.lastImportedAt || null, lastRunAt: state.lastRunAt || null, lastSources: state.lastSources || [], lastResults: state.lastResults || [], error: Boolean(error) };
+      lastImportedAt: state.lastImportedAt || null, lastRunAt: state.lastRunAt || null,
+      cycleStartedAt: state.cycleStartedAt || null, retryDelayMinutes: 60, maxRetries: 2,
+      lastSources: state.lastSources || [], lastResults: state.lastResults || [], error: Boolean(error) };
   };
   async function api(path) {
     const headers = { accept: 'application/vnd.github+json', 'user-agent': 'space-enthusiast-map' };

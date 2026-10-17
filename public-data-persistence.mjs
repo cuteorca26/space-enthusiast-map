@@ -36,7 +36,7 @@ export async function packPublicData(directory, output) {
   const external = new Set();
   try {
     const index = JSON.parse(readFileSync(join(directory, 'refresh_history_index.json'), 'utf8'));
-    const dirs = { notam: 'faa_notam_snapshots', hydropac: 'hydropac_snapshots', navarea: 'navarea_warning_snapshots' };
+    const dirs = { notam: 'faa_notam_snapshots', hydropac: 'hydropac_snapshots', navarea: 'navarea_warning_snapshots', msa: 'msa_nav_warning_snapshots' };
     for (const [source, records] of Object.entries(index.sources || {}))
       for (const record of records || []) if (dirs[source] && /^daily-\d{4}-\d{14}-\d+-\d+-[a-f0-9]{64}\.pack\.gz$/.test(record.dailyAsset || '')) external.add(`${dirs[source]}/${record.id}`);
   } catch { /* A missing index never excludes legacy history files. */ }

@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  actions: read
 concurrency:
   group: daily-full-warning-refresh
   cancel-in-progress: false
@@ -13,7 +14,12 @@ jobs:
   refresh:
     if: github.repository == 'cuteorca26/space-enthusiast-map'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    # 3 x 45 min collection + 2 x 60 min waiting, with room for publishing.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [notam, navarea, hydropac, msa]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -23,13 +29,13 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci --ignore-scripts
-      - name: Locate Chrome for the official FAA fallback
-        run: echo "FAA_NOTAM_BROWSER_EXECUTABLE=$(command -v google-chrome)" >> "$GITHUB_ENV"
-      - name: Refresh all three sources and publish durable history
-        run: node scripts/refresh-daily.mjs
+      - name: Collect source with up to two hourly retries and save each outcome
+        run: node scripts/refresh-daily.mjs "${{ matrix.source }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_URL: ${{ vars.APP_URL || 'https://space-enthusiast-map.onrender.com' }}
-          FAA_NOTAM_FIR_CONCURRENCY: '8'
-          FAA_NOTAM_BROWSER_CONCURRENCY: '2'
-          NAVAREA_FETCH_CONCURRENCY: '4'
+          FAA_NOTAM_TRANSPORT: 'fetch'
+          FAA_NOTAM_FIR_CONCURRENCY: '2'
+          FAA_NOTAM_REQUEST_INTERVAL_MS: '1000'
+          NAVAREA_FETCH_CONCURRENCY: '2'
+          MSA_NAV_WARNING_DETAIL_CONCURRENCY: '4'

@@ -10,6 +10,18 @@ test('explicit FAA access denial stops the gateway without trying another transp
   await assert.rejects(probeFaaNotamGateway({code:'TEST'}),/403.*保留/);
   assert.equal(requests,1);
 });
+
+test('FAA denial hidden in an HTTP 200 page and rate limiting stop before switching transports', async t => {
+  const old = globalThis.fetch; t.after(() => { globalThis.fetch = old; });
+  for (const status of [200, 429]) {
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; return new Response('<html>Access Denied Reference #18.test</html>', { status }); };
+    await assert.rejects(probeFaaNotamGateway({ code: 'TEST' }), error => error.code === 'FAA_ACCESS_DENIED');
+    assert.equal(requests, 1);
+  }
+  globalThis.fetch = async () => new Response('{}', { status: 429, headers: { 'retry-after': '7200' } });
+  await assert.rejects(probeFaaNotamGateway({ code: 'TEST' }), error => error.code === 'FAA_RATE_LIMITED' && Boolean(error.retryAfterAt));
+});
 test('FAA empty lists accept numeric or string zero totals',async t=>{
   const old=globalThis.fetch;t.after(()=>globalThis.fetch=old);
   for(const total of [0,'0']) {globalThis.fetch=async()=>new Response(JSON.stringify({notamList:null,totalNotamCount:total}));const d=await fetchFaaNotamFir({code:'TEST'},new Map());assert.equal(d.loadedCount,0);}
