@@ -26,7 +26,7 @@ import { execFile } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { ComputeWorkerClient } from "./compute-worker-client.mjs";
 import { HistoryDerivedCache } from "./history-derived-cache.mjs";
-import { streamNotamResponse } from './streamed-notam-history.mjs';
+import { streamNotamResponse, readNotamMetadata } from './streamed-notam-history.mjs';
 import { pipeline } from 'node:stream/promises';
 import { arch, availableParallelism, cpus, platform, release, totalmem } from "node:os";
 import { basename, extname, join, normalize } from "node:path";
@@ -406,7 +406,7 @@ const MSA_NAV_WARNING_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const NAVAREA_WARNING_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const LAUNCH_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const DETAIL_CACHE_TTL_MS = 30 * 60 * 1000;
-const FAA_NOTAM_PARSE_MIGRATION_VERSION = "parse-cloud-20261025-v39";
+const FAA_NOTAM_PARSE_MIGRATION_VERSION = "parse-cloud-20261025-v40";
 const AREA_PARSE_MIGRATION_VERSION = "area-local-20261011-v41";
 const MARINE_TEMPORAL_PARSE_VERSION = "marine-time-local-20261007-v10";
 const REFRESH_HISTORY_LIST_LIMIT = Infinity;
@@ -630,6 +630,17 @@ async function handleApi(req, res, url) {
     const includeTfr = url.searchParams.get("tfr") === "1";
     if (statusOnly) {
       sendJson(res, 200, getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr }));
+      return;
+    }
+    if (memoryBudget.enabled && refresh && !waitForRefresh) {
+      // Starting a refresh must not synchronously decode and migrate the entire
+      // previous archive. The browser keeps its current map while polling.
+      const cacheKey = restrictionsCacheKey({ includeDetails, includeGlobalNotams, includeTfr });
+      const started = startBackgroundRestrictionsRefresh(cacheKey, { includeDetails, includeGlobalNotams, includeTfr });
+      sendJson(res, 202, { refreshAccepted: true, dataVersion: cacheKey,
+        sources: { faaNotamSearch: { status: 'warn', backgroundRefresh: {
+          active: true, status: started ? 'started' : 'running', startedAt: aggregateRefreshStartedAt.get(cacheKey),
+        } } } });
       return;
     }
     if (memoryBudget.enabled && !refresh && existsSync(AGGREGATE_CACHE_FILE)) {
@@ -1677,6 +1688,9 @@ async function buildRestrictionsPayload({ includeDetails, includeGlobalNotams, i
       faaNotamPayload = await fetchFaaNotamSearchPayload();
     } catch (error) {
       console.warn(`[FAA NOTAM refresh] ${error instanceof Error ? error.message : String(error)}`);
+      // On a small host the old archive is served by the streaming read path.
+      // Reading it here duplicates the full dataset and blocks the web thread.
+      if (onlineDeployment && memoryBudget.enabled) throw error;
       faaNotamPayload = cachedFaaNotamPayload(cacheKey, error) || faaNotamPayload;
       faaNotamPayload.source.failureDetails = faaFailureDetails(error);
       if (!faaNotamPayload.source.cacheFallback) {
@@ -6441,7 +6455,7 @@ async function loadFaaTfrRestrictions(includeDetails) {
 async function fetchFaaNotamSearchPayload() {
   const startedAt = Date.now();
   const previouslyKnownFirs = readFaaFirDesignatorCache();
-  const expectedFirCount = expectedFaaFirCountFromCaches();
+  const expectedFirCount = await expectedFaaFirCountFromCaches();
   let gateway = null;
   try {
     gateway = await probeFaaNotamGateway({ code: FAA_NOTAM_GROUPS[0]?.codes?.[0] || "KZNY" });
@@ -6479,9 +6493,13 @@ async function fetchFaaNotamSearchPayload() {
       }
     }
 
-  const restrictions = [...deduped.values()]
-    .map((item, index) => buildImportedNotamRestriction(item, index))
-    .filter(Boolean);
+  const restrictions = [];
+  let noticeIndex = 0;
+  for (const item of deduped.values()) {
+    const restriction = buildImportedNotamRestriction(item, noticeIndex++);
+    if (restriction) restrictions.push(restriction);
+    if (memoryBudget.enabled && noticeIndex % 8 === 0) await new Promise(resolve => setImmediate(resolve));
+  }
   const drawableCount = restrictions.filter((item) => item.hasGeometry).length;
   const airspaceRestrictionCount = restrictions.filter((item) => isAirspaceRestrictionRestriction(item)).length;
   const nonDrawableReasons = countBy(
@@ -7675,12 +7693,13 @@ function writeFaaFirDesignatorCache(firs) {
   }
 }
 
-function expectedFaaFirCountFromCaches() {
+async function expectedFaaFirCountFromCaches() {
   const firCacheCount = readFaaFirDesignatorCache().length;
   if (firCacheCount) return firCacheCount;
   try {
     if (!existsSync(AGGREGATE_CACHE_FILE)) return 0;
-    const cached = JSON.parse(readFileSync(AGGREGATE_CACHE_FILE, "utf8"));
+    const cached = memoryBudget.enabled ? await readNotamMetadata(AGGREGATE_CACHE_FILE)
+      : JSON.parse(readFileSync(AGGREGATE_CACHE_FILE, "utf8"));
     return Number(cached?.data?.sources?.faaNotamSearch?.firCount || 0);
   } catch {
     return 0;
@@ -8367,6 +8386,11 @@ function parseNotamText(text) {
   }
   const sourceBoundaryCoordinateCount = uniqueCoordinates(polygonGroups.flat()).length;
   const boundaryCoordinateCount = geometry ? geometryUniqueCoordinateCount(geometry) : sourceBoundaryCoordinateCount;
+  const radialBoundaries = sectionResult.polygons.filter(p => p.boundaryCenter && p.boundaryRadiusMeters);
+  const commonRadialCenter = radialBoundaries.length === sectionResult.polygons.length && radialBoundaries.length
+    && radialBoundaries.every(p => Math.abs(p.boundaryCenter.lon - radialBoundaries[0].boundaryCenter.lon) < 1e-9
+      && Math.abs(p.boundaryCenter.lat - radialBoundaries[0].boundaryCenter.lat) < 1e-9)
+    ? radialBoundaries[0].boundaryCenter : null;
 
   return {
     notamId,
@@ -8386,7 +8410,7 @@ function parseNotamText(text) {
     rejectedPolygonGroupCount,
     polygonGroupValidationReasons,
     geometryComplete: Boolean(geometry) && !rejectedPolygonGroupCount,
-    center: geometry?.boundaryCenter || centroidFromGeometry(geometry) || qCenter?.center || allCoordinates[0] || null,
+    center: geometry?.boundaryCenter || commonRadialCenter || centroidFromGeometry(geometry) || qCenter?.center || allCoordinates[0] || null,
     geometry,
     geometrySource,
     geometryReason,
@@ -8690,7 +8714,7 @@ function hasUnsupportedBoundaryInstruction(text) {
 }
 
 function hasUnsupportedNaturalBoundaryInstruction(text) {
-  return /\b(?:(?:CLOCKWISE|COUNTERCLOCKWISE|ANTI-CLOCKWISE)\s+ALONG\s+(?:AN?\s+)?ARC|ALONG\s+(?:AN?\s+)?(?:CLOCKWISE|COUNTERCLOCKWISE|ANTI-CLOCKWISE)\s+ARC|ARC\s+(?:CW|CCW)|(?:CW|CCW)\s+ARC|FOLLOWING\s+ARC|SEMICIRCLE|(?:STATE|NATIONAL|FIR|UIR)\s+(?:BORDER|BOUNDARY)|ALONG\s+(?:THE\s+)?(?:COMMON\s+)?[A-Z\/\s-]{0,80}?(?:STATE|NATIONAL|FIR|UIR|CTA|TMA|BORDER|BDRY|BOUNDARY|COAST|COASTL\s*INE|SHORELINE|RIVER|ROAD|RAILWAY)|THEN\s+ALONG\s+(?:THE\s+)?(?:COMMON\s+)?[A-Z\/\s-]{0,80}?(?:STATE|NATIONAL|FIR|UIR|BORDER|BDRY|BOUNDARY|COAST|COASTL\s*INE)|COAST\s*LINE|SHORELINE|AND\s+BY\s+(?:THE\s+)?SHORE)\b/i.test(String(text || ""));
+  return /\b(?:(?:CLOCKWISE|COUNTERCLOCKWISE|ANTI-CLOCKWISE)\s+ALONG\s+(?:AN?\s+)?ARC|ALONG\s+(?:AN?\s+)?(?:CLOCKWISE|COUNTERCLOCKWISE|ANTI-CLOCKWISE)\s+ARC|ARC\s+(?:CW|CCW)|(?:CW|CCW)\s+ARC|FOLLOWING\s+ARC|SEMICIRCLE|(?:STATE|NATIONAL|FIR|UIR)\s+(?:BORDER|BOUNDARY)|ALONG\s+(?:THE\s+)?(?:COMMON\s+)?[A-Z\/\s-]{0,80}?(?:STATE|NATIONAL|FIR|UIR|CTA|TMA|BORDER|BDRY|BOUNDARY|COAST|COASTL\s*INE|SHORELINE|RIVER|ROAD|RAILWAY)|THEN\s+ALONG\s+(?:THE\s+)?(?:COMMON\s+)?[A-Z\/\s-]{0,80}?(?:STATE|NATIONAL|FIR|UIR|BORDER|BDRY|BOUNDARY|COAST|COASTL\s*INE)|COAST(?:AL)?\s*LINE|SHORELINE|AND\s+BY\s+(?:THE\s+)?SHORE)\b/i.test(String(text || ""));
 }
 
 function isCenterRadiusList(text, coordinates) {
@@ -8715,7 +8739,7 @@ function isUnsupportedLineCorridor(text, coordinates, corridorWidthNm) {
   const source = String(text || "");
   const count = Array.isArray(coordinates) ? coordinates.length : 0;
   if (count < 3) return false;
-  if (hasStrongBoundaryLanguage(source) && hasClosedCoordinateSequence(source) && !Number.isFinite(corridorWidthNm) && !/\b(?:EITHER|EACH)\s+SIDE\b/i.test(source)) return false;
+  if ((hasStrongBoundaryLanguage(source) || /\bWI(?:THIN)?\s*:/i.test(source)) && hasClosedCoordinateSequence(source) && !Number.isFinite(corridorWidthNm) && !/\b(?:EITHER|EACH)\s+SIDE\b/i.test(source)) return false;
   if (hasClosedPolygonSequenceCue(source)) return false;
   return (
     Number.isFinite(corridorWidthNm) ||
@@ -8742,7 +8766,9 @@ function extractNotamGeometryText(text) {
   const messageId = original.match(/\b([A-Z]\d{1,4}\/\d{2,4})\s+NOTAM[NR]/i)?.[1];
   const source = original.replace(
     /\bEND\s+PART\s+\d+\s+OF\s+\d+\s+([A-Z]\d{1,4}\/\d{2,4})\s+NOTAM[NR][\s\S]*?\bE\)\s*/gi,
-    (match, id) => id === messageId ? " " : match,
+    // Preserve the line boundary: the next part can begin with a numbered
+    // independent area. A space joins it to the previous circle's altitude.
+    (match, id) => id.toUpperCase() === messageId?.toUpperCase() ? "\n" : match,
   ).replace(/\bEND\s+PART\s+\d+\s+OF\s+\d+\b/gi, " ");
   const eMatch = /(?<![\w(/-])\bE\)\s*/i.exec(source);
   if (eMatch) {
@@ -8916,6 +8942,14 @@ function extractCoordinateSections(text) {
     ...source.matchAll(/\bTEMPORARY\s+RESTRICTED\s+AREA\s*-\s*TRA\s+\d+\b/gi),
     ...source.matchAll(/(?:^|[\r\n])\s*FM\s+(?:SFC|\d+FT\s+AMSL|FL\d+)\s+TO\s+(?:\d+FT\s+AMSL|FL\d+)\s+(?=\d+(?:\.\d+)?\s*NM\s+RADIUS)/gi),
     ...source.matchAll(/\bSEA\s+TRIAL\s+IN\s+EAST\s+OF\b|\bAND\s+NEAR\s+BY\s+THE\s+LINE\s+JOINING\b/gi),
+    // Repeated width declarations describe independent corridors. In particular
+    // Australian F3491/26 has two disconnected 1000 m corridors, not one route.
+    ...source.matchAll(/\b(?:WI|WITHIN)\s+\d+(?:\.\d+)?\s*(?:M|KM|NM)\s+EITHER\s+SIDE\s+OF\s+(?:A\s+)?LINE\b/gi),
+    // Only a width followed by a centreline starts a new corridor. Widths
+    // printed after the coordinates must remain with the preceding route.
+    ...[...source.matchAll(/(?:^|[\r\n])\s*\d+(?:\.\d+)?\s*(?:M|KM|NM)\s+(?:ON\s+)?(?:EITHER|EACH)\s+SIDE\s+(?:OF\s+)?(?:(?:A|THE)\s+)?(?:STRAIGHT\s+)?(?:LINE|ROUTE|TRACK|CENT(?:ER|RE)\s*LINE)\b/gi)]
+      .filter(m => /^\s*(?:(?:JOINING|CONNECTING)\s+(?:(?:THE|FLW|FOLLOWING)\s+)*POINTS?\s*)?[:\-]?\s*\d{4,6}(?:\.\d+)?\s*[NS]/i.test(source.slice(m.index + m[0].length))),
+    ...source.matchAll(/(?:^|[\r\n])\s*(?:WI\s+)?CIRCLE\s+RADIUS\b/gi),
     ...source.matchAll(/\bAREA\s+NO\.\s*\d+\s*[,，:：]?/gi),
     ...source.matchAll(/(?:^|[.。\r\n])\s*(?:AND\s+)?WITHIN\s+\d+(?:\.\d+)?\s*(?:MILES?|NM|KM|M)\s+RADIUS\s+OF\b/gi),
     ...source.matchAll(
@@ -8926,7 +8960,7 @@ function extractCoordinateSections(text) {
   );
   sectionStarts.push(
     ...[...source.matchAll(/\b(?:IN\s+)?AREA\s+WITHIN\s+\d+(?:\.\d+)?\s*(?:M|KM|NM|NAUTICAL\s+MILES?|METERS?)\s+RADIUS\b/gi)].map(m=>m.index),
-    ...[...source.matchAll(/(?:^|[\r\n])\s*\d{1,2}[.)]\s*(?:(?:WI\s+)?CIRCLE\b|RADIUS\b|\d+(?:\.\d+)?\s*(?:M|KM|NM)\s+RADIUS\b)/gi)].map(m=>m.index+m[0].search(/\S/)),
+    ...[...source.matchAll(/(?:^|[\r\n])\s*\d{1,2}[.)](?!\d)\s*(?:(?:WI\s+)?CIRCLE\b|RADIUS\b|\d+(?:\.\d+)?\s*(?:M|KM|NM)\s+RADIUS\b)/gi)].map(m=>m.index+m[0].search(/\S/)),
     ...[...source.matchAll(/(?:^|[\r\n])\s*PSN\s+[^\r\n]*?\bRADIUS\b/gi)].map(m=>m.index+m[0].search(/\S/)),
   );
   sectionStarts.push(

@@ -2372,8 +2372,18 @@ async function loadRestrictions(refresh, options = {}) {
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    state.payload = await response.json();
-    state.faaRestrictions = (state.payload.restrictions || []).map(enrichRestriction);
+    const payload = await response.json();
+    if (payload.refreshAccepted) {
+      // The server acknowledged the job without sending another huge copy of
+      // the previous archive. Preserve all visible notices and selections.
+      state.payload ||= { restrictions: [], sources: {} };
+      state.payload.sources ||= {};
+      state.payload.sources.faaNotamSearch = { ...state.payload.sources.faaNotamSearch,
+        ...payload.sources?.faaNotamSearch };
+    } else {
+      state.payload = payload;
+      state.faaRestrictions = (state.payload.restrictions || []).map(enrichRestriction);
+    }
     syncCombinedRestrictions();
     renderSourceStatus();
     renderFilters();

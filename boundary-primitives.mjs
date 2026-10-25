@@ -170,7 +170,7 @@ export function explicitArcBoundary(text, tokens) {
 // A corridor is a union of geodesic segment buffers, not a polygon through its
 // centreline. Union preserves holes and handles sharp turns and self-crossings.
 export function explicitCorridorBoundary(text, tokens) {
-  const width = text.match(new RegExp('\\b' + distancePattern + '\\s+(?:ON\\s+)?(?:EITHER|EACH)\\s+SIDE\\s+OF\\s+(?:A\\s+|THE\\s+)?(?:STRAIGHT\\s+)?(?:LINE|ROUTE|TRACK|CENTERLINE|CENTRELINE)\\b', 'i'))
+  const width = text.match(new RegExp('\\b' + distancePattern + '\\s+(?:ON\\s+)?(?:EITHER|EACH)\\s+SIDE\\s+(?:OF\\s+)?(?:A\\s+|THE\\s+)?(?:STRAIGHT\\s+)?(?:LINE|ROUTE|TRACK|CENT(?:ER|RE)\\s*LINE)\\b', 'i'))
     || text.match(new RegExp('\\bWITHIN\\s+' + distancePattern + '\\s+OF\\s+(?:THE\\s+)?TRACKLINES?\\s+JOINING\\b', 'i'))
     || text.match(new RegExp('\\b' + distancePattern + '\\s+WIDE\\s+(?:SEA\\s+)?(?:STRIP|ZONE|CORRIDOR)\\s+ALONG\\s+(?:THE\\s+)?CENT(?:RE|ER)LINE\\b', 'i'));
   if (!width) return null;
@@ -238,6 +238,7 @@ export function explicitCorridorBoundary(text, tokens) {
 export function explicitRadialBoundary(text, tokens) {
   const source = String(text).replace(/\b(?:EXC|EXCEPT|EXCLUDING)\s+(?:(?:ACFT|AIRCRAFT|SKED|CIV|MIL|MILITARY|SAR|HOSP|STATE|HEL|EMERG)\b)[^.\n]*/gi,' ')
     .replace(/\bEXCEPT\s+(?:PARTICIPATING\s+ACFT|WHEN\s+(?:AUTHORISED|AUTHORIZED|AUTORISED)\s+BY\s+ATC)[^.\n]*/gi,' ')
+    .replace(/\bEXCEPT\s+(?:REAL\s+)?AIR\s+POLICING\b(?:[\s,]+(?:HUMANITARIAN|SAR|AND|EMERG|FLTS?|FLIGHTS?)\b)*/gi,' ')
     .replace(/\bSIZE\s*:[^\r\n]*\bDIAMETER\b/gi,' ')
     .replace(/\bDIAMETER\s*:?\s*\d+(?:\.\d+)?\s*(?:FT|FEET|IN|M)\b/gi,' ')
     .replace(/\b\d+(?:\.\d+)?\s*(?:FT|FEET|IN|INCHES?)\s+DIAMETER(?=\s+(?:ALUMINUM\s+)?(?:SPHERE|BALLOON))/gi,' ');
