@@ -9,5 +9,5 @@ for(const row of cases)test(`live cloud ${row.notamId}: preserve all verified lo
  assert.equal(validateParsedGeometry(geometry),null);
  assert.equal(geometry.type,row.expected.type);
  assert.equal(geometry.type==='MultiPolygon'?geometry.coordinates.length:1,row.expected.regions);
- assert.equal(parsed.geometryComplete,true);
+ assert.equal(parsed.geometryComplete,row.expected.complete,'retain explicit warnings for inconsistent source arc radii');
 });

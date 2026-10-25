@@ -20,6 +20,7 @@ import { downloadCloudFile, publicFilePath, runtimeSettings, sameOriginWrite } f
 import { createAdminAccess, requiresAdministrator } from "./admin-access.mjs";
 import { createPublicDataPersistence } from "./public-data-persistence.mjs";
 import { createScheduledRefresh } from "./scheduled-refresh.mjs";
+import { createCloudNotamRefresh } from './cloud-notam-refresh.mjs';
 import { faaFailureDetails } from './faa-access.mjs';
 import { Agent as HttpsAgent, get as httpsGet } from "node:https";
 import { execFile } from "node:child_process";
@@ -79,6 +80,11 @@ const scheduledRefresh = createScheduledRefresh({ directory: dataDirectory, enab
   },
 });
 const satelliteCatalogService = new SatelliteCatalogService(root, dataDirectory);
+const cloudNotamRefresh = createCloudNotamRefresh({ directory: dataDirectory,
+  repository: process.env.PUBLIC_DATA_REPOSITORY, token: process.env.GITHUB_DATA_TOKEN,
+  enabled: onlineDeployment && isMainThread, ready: publicDataPersistence.ready,
+  sync: () => scheduledRefresh.check({ force: true }), persist: () => publicDataPersistence.schedule(),
+});
 const satelliteHistoryService = new SatelliteHistoryService(root, dataDirectory);
 const savedRegionStore = new SavedRegionStore(join(dataDirectory, "saved_regions.json"));
 
@@ -629,7 +635,15 @@ async function handleApi(req, res, url) {
     const includeGlobalNotams = url.searchParams.get("globalNotams") !== "0";
     const includeTfr = url.searchParams.get("tfr") === "1";
     if (statusOnly) {
+      cloudNotamRefresh.check();
       sendJson(res, 200, getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr }));
+      return;
+    }
+    if (refresh && cloudNotamRefresh.enabled) {
+      const progress = await cloudNotamRefresh.start();
+      sendJson(res, 202, { refreshAccepted: true,
+        dataVersion: restrictionsCacheKey({ includeDetails, includeGlobalNotams, includeTfr }),
+        sources: { faaNotamSearch: { status: 'warn', backgroundRefresh: progress } } });
       return;
     }
     if (memoryBudget.enabled && refresh && !waitForRefresh) {
@@ -1540,16 +1554,18 @@ function getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr
   const cached = aggregateCache.get(cacheKey)?.data || (!memoryBudget.enabled && readAggregateDiskCache(cacheKey, { allowExpired: true, allowStaleVersion: true }));
   const metadata = cached ? restrictionStatusMetadata(cached, cacheKey) : aggregateStatusMetadata.get(cacheKey) || restrictionStatusMetadata(null, cacheKey);
   const refreshStartedAt = aggregateRefreshStartedAt.get(cacheKey) || "";
+  const remoteRefresh = cloudNotamRefresh.enabled ? cloudNotamRefresh.status() : null;
 
   return {
     ...metadata,
-    backgroundRefresh: {
+    backgroundRefresh: remoteRefresh?.requestId ? remoteRefresh : {
       active: aggregateInFlight.has(cacheKey),
       status: aggregateInFlight.has(cacheKey) ? "running" : "idle",
       startedAt: refreshStartedAt,
       elapsedMs: refreshStartedAt ? Math.max(0, Date.now() - Date.parse(refreshStartedAt)) : 0,
     },
     refreshConfig: {
+      execution: cloudNotamRefresh.enabled ? 'github-actions' : 'server',
       transport: FAA_NOTAM_TRANSPORT,
       officialExportEnabled: FAA_NOTAM_EXPORT_ENABLED,
       directConcurrency: FAA_NOTAM_FIR_CONCURRENCY,
@@ -1565,7 +1581,7 @@ function getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr
       maxFailedFirs: FAA_NOTAM_MAX_FAILED_FIRS,
       publishOnlyWhenComplete: FAA_NOTAM_MAX_FAILED_FIRS === 0,
     },
-    lastBackgroundRefresh: aggregateRefreshResults.get(cacheKey) || null,
+    lastBackgroundRefresh: remoteRefresh?.lastRefresh || aggregateRefreshResults.get(cacheKey) || null,
   };
 }
 
@@ -2406,7 +2422,7 @@ async function buildRefreshHistoryListAsync({ wait = true } = {}) {
           const current = new Map(index.sources[source].map(record => [record.id, record]));
           const merged = new Map(records.filter(record => historyItemFilePath(source, record.id)).map(record => [record.id, record]));
           for (const [id, record] of current) {
-            if (record.dailyAsset) merged.set(id, { ...record, ...(merged.get(id) || {}), dailyAsset: record.dailyAsset, automatic: true });
+            if (record.dailyAsset) merged.set(id, { ...record, ...(merged.get(id) || {}), dailyAsset: record.dailyAsset, automatic: record.automatic !== false });
             else if (record !== before.get(id)) merged.set(id, record);
           }
           for (const id of before.keys()) if (!current.has(id)) merged.delete(id);

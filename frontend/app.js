@@ -2384,6 +2384,20 @@ async function loadRestrictions(refresh, options = {}) {
       state.payload = payload;
       state.faaRestrictions = (state.payload.restrictions || []).map(enrichRestriction);
     }
+    if (window.APP_DEPLOYMENT?.online && !payload.refreshAccepted) {
+      // Reopening the page must reconnect to an existing remote job.
+      try {
+        const progressResponse = await fetch('/api/restrictions?status=1&details=0&tfr=0', { signal: controller.signal });
+        if (progressResponse.ok) {
+          const progress = await progressResponse.json();
+          if (progress.backgroundRefresh?.active) {
+            state.payload.sources ||= {};
+            state.payload.sources.faaNotamSearch ||= {};
+            state.payload.sources.faaNotamSearch.backgroundRefresh = progress.backgroundRefresh;
+          }
+        }
+      } catch { /* A status outage must not discard successfully loaded data. */ }
+    }
     syncCombinedRestrictions();
     renderSourceStatus();
     renderFilters();
@@ -2442,6 +2456,7 @@ function scheduleFaaRefreshPoll(delayMs = FAA_REFRESH_POLL_INTERVAL_MS) {
 }
 
 function faaRefreshProgressMessage(refreshState = {}) {
+  if (refreshState.remote && refreshState.message) return refreshState.message;
   const explicitElapsed = Number(refreshState.elapsedMs || 0);
   const startedAtMs = Date.parse(refreshState.startedAt || "");
   const elapsedMs = explicitElapsed > 0

@@ -142,6 +142,29 @@ function retryReport(source, { attempt = 1, status = 'failed', cycleId = '12345-
     retryExhausted: status === 'failed' && !retry }] };
 }
 
+test('manual result imports preserve daily outcomes and history identity through success, late retry, and backup',async t=>{
+ const first=await fixture(t,{sources:['msa']});
+ first.index.dailyReport=retryReport('msa',{status:'success'});
+ await writeFile(join(first.original,'refresh_history_index.json'),JSON.stringify(first.index));
+ applyDailyArchive(first.target,first.original,first.name);
+ const requestId='12345678-1234-4567-8901-123456789abc';
+ for(const [i,status] of ['failed','success','failed'].entries()){
+  const next=await fixture(t,{sources:status==='success'?['notam']:[],date:`2026-10-17T0${8+i}:40:00Z`.replace('T010','T10')});
+  next.index.dailyReport={...retryReport('notam',{status,attempt:i===1?2:1}),manualRequestId:requestId};
+  await writeFile(join(next.original,'refresh_history_index.json'),JSON.stringify(next.index));
+  applyDailyArchive(first.target,next.original,next.name);
+  const state=JSON.parse(await readFile(join(first.target,'scheduled_refresh_state.json')));
+  assert.deepEqual(state.lastSources,['msa']);assert.equal(state.lastResults.length,1);
+  assert.equal(state.manualResults[0].result.status,i===0?'failed':'success');
+ }
+ const index=JSON.parse(await readFile(join(first.target,'refresh_history_index.json')));
+ assert.equal(index.sources.notam[0].automatic,false);assert.equal(index.sources.msa[0].automatic,true);
+ const backup=join(first.root,'backup-manual.gz'),packed=await packPublicData(first.target,backup);
+ const restored=join(first.root,'restored');await mkdir(restored);await unpackPublicData(createReadStream(backup),restored,packed.sha256);
+ assert.deepEqual(JSON.parse(await readFile(join(restored,'refresh_history_index.json'))),index);
+ assert.equal(JSON.parse(await readFile(join(restored,'scheduled_refresh_state.json'))).manualResults[0].result.status,'success');
+});
+
 test('independent source outcomes merge and MSA history survives backup and lazy restoration', async t => {
   const first = await fixture(t, { sources: ['msa'] });
   first.index.dailyReport = retryReport('msa', { status: 'success' });

@@ -1,5 +1,8 @@
 name: Daily full warning refresh
+run-name: ${{ github.event_name == 'repository_dispatch' && format('Manual NOTAM {0}', github.event.client_payload.requestId) || 'Daily full warning refresh' }}
 on:
+  repository_dispatch:
+    types: [manual-notam-refresh]
   schedule:
     # UTC 07:37 = Beijing 15:37, every 24 hours.
     - cron: '37 7 * * *'
@@ -14,7 +17,7 @@ permissions:
   contents: write
   actions: read
 concurrency:
-  group: daily-full-warning-refresh-${{ inputs.source || 'all' }}
+  group: daily-full-warning-refresh-${{ github.event_name == 'repository_dispatch' && 'notam' || inputs.source || 'all' }}
   cancel-in-progress: false
 jobs:
   refresh:
@@ -25,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: ${{ fromJSON(inputs.source != '' && inputs.source != 'all' && format('["{0}"]', inputs.source) || '["notam","navarea","hydropac","msa"]') }}
+        source: ${{ fromJSON(github.event_name == 'repository_dispatch' && '["notam"]' || inputs.source != '' && inputs.source != 'all' && format('["{0}"]', inputs.source) || '["notam","navarea","hydropac","msa"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -39,6 +42,7 @@ jobs:
         run: node scripts/refresh-daily.mjs "${{ matrix.source }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_REFRESH_REQUEST_ID: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.requestId || '' }}
           APP_URL: ${{ vars.APP_URL || 'https://space-enthusiast-map.onrender.com' }}
           FAA_NOTAM_TRANSPORT: 'auto'
           FAA_NOTAM_FIR_CONCURRENCY: '2'

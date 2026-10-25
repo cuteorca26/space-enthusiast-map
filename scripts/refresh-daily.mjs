@@ -44,6 +44,8 @@ try {
   const cycleId = `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT || 1}`;
   const cycleStartedAt = run?.run_started_at;
   if (!/^\d+-\d+$/.test(cycleId) || !Number.isFinite(Date.parse(cycleStartedAt))) throw new Error('Invalid daily cycle');
+  const manualRequestId=process.env.MANUAL_REFRESH_REQUEST_ID||undefined;
+  if(manualRequestId&&(!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(manualRequestId)||source!=='notam'))throw Error('Invalid manual request');
   const result = await runDailySource({ source,
     async collect(attempt) {
       console.log(`Full ${source} refresh, attempt ${attempt}/3`);
@@ -64,7 +66,7 @@ try {
       const bundle = join(temporary, `bundle-${outcome.attempt}`); await mkdir(bundle);
       const combined = { version: 3, updatedAt: outcome.finishedAt,
         sources: { notam: [], hydropac: [], navarea: [], msa: [], satellite: [] },
-        dailyReport: { version: 2, cycleId, cycleStartedAt, results: [outcome] } };
+        dailyReport: { version: 2, cycleId, cycleStartedAt, ...(manualRequestId?{manualRequestId}:{}), results: [outcome] } };
       if (outcome.status === 'success') {
         combined.sources[source] = [record];
         await copyFile(join(currentDirectory, config.cache), join(bundle, config.cache));

@@ -40,6 +40,8 @@ function validateDailyReport(report) {
   if (report.version === 1 && [3, 4].includes(rows.length)) return;
   if (report.version !== 2 || !/^\d+-\d+$/.test(report.cycleId) || !Number.isFinite(Date.parse(report.cycleStartedAt)))
     throw new Error('Invalid daily cycle');
+  if (report.manualRequestId !== undefined && (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(report.manualRequestId) || rows.length!==1 || rows[0].source!=='notam'))
+    throw new Error('Invalid manual refresh identity');
   for (const row of rows) {
     const start = Date.parse(row.startedAt), end = Date.parse(row.finishedAt);
     const retry = row.status === 'failed' && row.attempt < MAX_DAILY_ATTEMPTS;
@@ -51,6 +53,14 @@ function validateDailyReport(report) {
 }
 
 function mergeDailyStatus(state, report, imported, at) {
+  if(report?.manualRequestId){
+    const records=state.manualResults||[],old=records.find(r=>r.requestId===report.manualRequestId),result=report.results[0];
+    if(!old||(old.result.status!=='success'&&result.attempt>=old.result.attempt)){
+      state.manualResults=[{requestId:report.manualRequestId,cycleId:report.cycleId,cycleStartedAt:report.cycleStartedAt,result},
+        ...records.filter(r=>r.requestId!==report.manualRequestId)].sort((a,b)=>b.cycleStartedAt.localeCompare(a.cycleStartedAt)).slice(0,30);
+    }
+    return;
+  }
   const cycleAt = report?.version === 2 ? report.cycleStartedAt : at;
   const cycleId = report?.version === 2 ? report.cycleId : `legacy-${at}`;
   if (Date.parse(cycleAt) < Date.parse(state.cycleStartedAt || state.lastRunAt || '1970-01-01')) return;
@@ -99,7 +109,7 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
     const newest = stored.reduce((time, item) => Math.max(time, Date.parse(item.savedAt) || 0), 0);
     operations.push({ from: join(staging, relative), to: join(directory, relative) });
     if (Date.parse(record.savedAt) > newest) operations.push({ from: join(staging, config.cache), to: join(directory, config.cache) });
-    index.sources[source] = [{ ...record, automatic: true, dailyAsset: assetName }, ...stored.filter(item => item.id !== record.id)].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+    index.sources[source] = [{ ...record, automatic: !incoming.dailyReport?.manualRequestId, dailyAsset: assetName }, ...stored.filter(item => item.id !== record.id)].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
     imported.push(source);
   }
   if (!imported.length && !results) throw new Error('Daily archive has no successful sources');
