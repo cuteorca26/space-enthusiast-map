@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 process.env.FAA_NOTAM_REQUEST_INTERVAL_MS = '0';
 process.env.FAA_NOTAM_REQUEST_RETRY_ATTEMPTS = '1';
+process.env.FAA_NOTAM_TRANSPORT = 'fetch';
 const { fetchFaaNotamFir, fetchSeaLagomNavareaRegion, fetchHydropacCurrentTextWarnings, probeFaaNotamGateway } = await import('../server.mjs');
-test('explicit FAA access denial stops the gateway without trying another transport',async t=>{
+test('explicit fetch mode stops on FAA denial without opening a browser',async t=>{
   const old=globalThis.fetch;t.after(()=>globalThis.fetch=old);let requests=0;
   globalThis.fetch=async()=>{requests++;return new Response('<h1>Access Denied</h1>',{status:403});};
-  await assert.rejects(probeFaaNotamGateway({code:'TEST'}),/403.*保留/);
+  await assert.rejects(probeFaaNotamGateway({code:'TEST'}),e=>e.code==='FAA_ACCESS_DENIED' && /保留/.test(e.message));
   assert.equal(requests,1);
 });
 
@@ -32,7 +33,7 @@ test('FAA changing totals and malformed success pages are rejected',async t=>{
   globalThis.fetch=async()=>new Response(JSON.stringify({totalNotamCount:page?61:60,notamList:Array.from({length:30},(_,i)=>({transactionID:(page*30+i+1)})),page:page++}));
   await assert.rejects(fetchFaaNotamFir({code:'TEST'},new Map()),/total changed/);
   globalThis.fetch=async()=>new Response(JSON.stringify({error:'upstream unavailable'}));
-  await assert.rejects(fetchFaaNotamFir({code:'TEST'},new Map()),/valid NOTAM list/);
+  await assert.rejects(fetchFaaNotamFir({code:'TEST'},new Map()),/官方通告总数/);
 });
 test('error pages and repeated HYDROPAC pages cannot replace the cache with an incomplete result',async()=>{
   const card=readFileSync(new URL('fixtures/hydropac-1.html',import.meta.url),'utf8');

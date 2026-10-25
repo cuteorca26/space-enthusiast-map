@@ -20,7 +20,7 @@ import { downloadCloudFile, publicFilePath, runtimeSettings, sameOriginWrite } f
 import { createAdminAccess, requiresAdministrator } from "./admin-access.mjs";
 import { createPublicDataPersistence } from "./public-data-persistence.mjs";
 import { createScheduledRefresh } from "./scheduled-refresh.mjs";
-import { isFaaAccessDenied, faaResponseError, faaFailureDetails } from './faa-access.mjs';
+import { faaFailureDetails } from './faa-access.mjs';
 import { Agent as HttpsAgent, get as httpsGet } from "node:https";
 import { execFile } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
@@ -42,6 +42,8 @@ import { SatelliteHistoryService } from "./satellite-history.mjs";
 import { readCloudDataset } from "./cloud-dataset.mjs";
 import { MemoryBudgetQueue, dataResourceGroup } from "./memory-budget.mjs";
 import { SavedRegionStore, handleSavedRegionsApi } from "./saved-regions.mjs";
+import { isFaaAccessDenied, isFaaRateLimited, faaHttpError, readFaaSearchResponse, validateFaaSearchPayload, selectFaaTransport, faaTransportFailure } from "./faa-notam-access.mjs";
+import { firstNotamText, canonicalNotamText, buildFaaExportUrl, collectFaaExportBatch } from "./faa-notam-export.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const { host, port, online: onlineDeployment, dataDirectory } = runtimeSettings(root);
@@ -133,26 +135,27 @@ const HYDROPAC_ARCHIVE_MAX_PAGES = clampIntegerEnv("HYDROPAC_ARCHIVE_MAX_PAGES",
 const HYDROPAC_ARCHIVE_FETCH_CONCURRENCY = clampIntegerEnv("HYDROPAC_ARCHIVE_FETCH_CONCURRENCY", 4, 1, 12);
 const FAA_NOTAM_PAGE_SIZE = 30;
 const FAA_NOTAM_MAX_PER_FIR = Number(process.env.FAA_NOTAM_MAX_PER_FIR || 0);
-const FAA_NOTAM_FIR_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_FIR_CONCURRENCY", 32, 1, 64);
+const FAA_NOTAM_FIR_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_FIR_CONCURRENCY", 3, 1, 8);
 const FAA_NOTAM_BATCH_SIZE = clampIntegerEnv("FAA_NOTAM_BATCH_SIZE", 12, 1, 32);
 const FAA_NOTAM_ADAPTIVE_BATCH_SIZE = clampIntegerEnv("FAA_NOTAM_ADAPTIVE_BATCH_SIZE", 3, 1, 8);
-const FAA_NOTAM_ADAPTIVE_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_ADAPTIVE_CONCURRENCY", 4, 1, 12);
-const FAA_NOTAM_DISCOVERY_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_DISCOVERY_CONCURRENCY", 4, 1, 8);
-const FAA_NOTAM_POWERSHELL_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_POWERSHELL_CONCURRENCY", 3, 1, 24);
-const FAA_NOTAM_RETRY_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_RETRY_CONCURRENCY", 4, 1, 12);
+const FAA_NOTAM_ADAPTIVE_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_ADAPTIVE_CONCURRENCY", 2, 1, 4);
+const FAA_NOTAM_DISCOVERY_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_DISCOVERY_CONCURRENCY", 2, 1, 4);
+const FAA_NOTAM_POWERSHELL_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_POWERSHELL_CONCURRENCY", 1, 1, 4);
+const FAA_NOTAM_RETRY_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_RETRY_CONCURRENCY", 2, 1, 4);
 const FAA_NOTAM_RETRY_DELAY_MS = clampIntegerEnv("FAA_NOTAM_RETRY_DELAY_MS", 8000, 0, 60000);
 const FAA_NOTAM_POWERSHELL_STAGGER_MS = clampIntegerEnv("FAA_NOTAM_POWERSHELL_STAGGER_MS", 250, 0, 5000);
-const FAA_NOTAM_REQUEST_INTERVAL_MS = clampIntegerEnv("FAA_NOTAM_REQUEST_INTERVAL_MS", 200, 0, 5000);
+const FAA_NOTAM_REQUEST_INTERVAL_MS = clampIntegerEnv("FAA_NOTAM_REQUEST_INTERVAL_MS", 750, 200, 10000);
 const FAA_NOTAM_REQUEST_RETRY_ATTEMPTS = clampIntegerEnv("FAA_NOTAM_REQUEST_RETRY_ATTEMPTS", 3, 1, 6);
 const FAA_NOTAM_REQUEST_RETRY_BASE_DELAY_MS = clampIntegerEnv("FAA_NOTAM_REQUEST_RETRY_BASE_DELAY_MS", 5000, 250, 60000);
 const FAA_NOTAM_MAX_FAILED_FIRS = clampIntegerEnv("FAA_NOTAM_MAX_FAILED_FIRS", 0, 0, 64);
 const FAA_NOTAM_PAGE_DELAY_MS = clampIntegerEnv("FAA_NOTAM_PAGE_DELAY_MS", 0, 0, 5000);
-const FAA_NOTAM_POWERSHELL_PAGE_DELAY_MS = clampIntegerEnv("FAA_NOTAM_POWERSHELL_PAGE_DELAY_MS", 200, 0, 5000);
+const FAA_NOTAM_POWERSHELL_PAGE_DELAY_MS = clampIntegerEnv("FAA_NOTAM_POWERSHELL_PAGE_DELAY_MS", 750, 200, 10000);
 const FAA_NOTAM_FETCH_TIMEOUT_MS = clampIntegerEnv("FAA_NOTAM_FETCH_TIMEOUT_MS", 30000, 5000, 60000);
 const FAA_NOTAM_POWERSHELL_TIMEOUT_MS = clampIntegerEnv("FAA_NOTAM_POWERSHELL_TIMEOUT_MS", 20 * 60 * 1000, 60 * 1000, 45 * 60 * 1000);
-const FAA_NOTAM_BROWSER_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_BROWSER_CONCURRENCY", 8, 1, 16);
+const FAA_NOTAM_BROWSER_CONCURRENCY = clampIntegerEnv("FAA_NOTAM_BROWSER_CONCURRENCY", 2, 1, 4);
 const FAA_NOTAM_BROWSER_TIMEOUT_MS = clampIntegerEnv("FAA_NOTAM_BROWSER_TIMEOUT_MS", 90 * 1000, 30 * 1000, 5 * 60 * 1000);
 const FAA_NOTAM_TRANSPORT = normalizeFaaNotamTransport(process.env.FAA_NOTAM_TRANSPORT || "auto");
+const FAA_NOTAM_EXPORT_ENABLED = process.env.FAA_NOTAM_EXPORT_ENABLED !== "0" && FAA_NOTAM_MAX_PER_FIR === 0;
 const FAA_NOTAM_DISCOVER_GLOBAL_FIRS = process.env.FAA_NOTAM_DISCOVER_GLOBAL_FIRS !== "0";
 const FAA_NOTAM_DISCOVERY_TERMS = (process.env.FAA_NOTAM_DISCOVERY_TERMS || "FIR,ARTCC,ACC,CENTRE,CENTER,OCEANIC,OCA,CERAP")
   .split(",")
@@ -403,7 +406,7 @@ const MSA_NAV_WARNING_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const NAVAREA_WARNING_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const LAUNCH_DISK_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const DETAIL_CACHE_TTL_MS = 30 * 60 * 1000;
-const FAA_NOTAM_PARSE_MIGRATION_VERSION = "parse-local-20261011-v38";
+const FAA_NOTAM_PARSE_MIGRATION_VERSION = "parse-cloud-20261025-v39";
 const AREA_PARSE_MIGRATION_VERSION = "area-local-20261011-v41";
 const MARINE_TEMPORAL_PARSE_VERSION = "marine-time-local-20261007-v10";
 const REFRESH_HISTORY_LIST_LIMIT = Infinity;
@@ -1537,6 +1540,7 @@ function getRestrictionsStatus({ includeDetails, includeGlobalNotams, includeTfr
     },
     refreshConfig: {
       transport: FAA_NOTAM_TRANSPORT,
+      officialExportEnabled: FAA_NOTAM_EXPORT_ENABLED,
       directConcurrency: FAA_NOTAM_FIR_CONCURRENCY,
       browserConcurrency: FAA_NOTAM_BROWSER_CONCURRENCY,
       batchSize: FAA_NOTAM_BATCH_SIZE,
@@ -2063,6 +2067,10 @@ function cachedFaaNotamPayload(cacheKey, error) {
       cacheSavedAt: savedAt,
       fetchedAt: savedAt,
       refreshFailure: {
+        code: error?.code || null,
+        httpStatus: error?.httpStatus || null,
+        retryAfterAt: error?.retryAfterAt || null,
+        transportAttempts: error?.transportAttempts || [],
         failedFirCount: Array.isArray(error?.faaFailureDetails) ? error.faaFailureDetails.length : null,
         failedFirs: Array.isArray(error?.faaFailureDetails) ? error.faaFailureDetails.slice(0, 25) : [],
       },
@@ -6432,11 +6440,15 @@ async function loadFaaTfrRestrictions(includeDetails) {
 
 async function fetchFaaNotamSearchPayload() {
   const startedAt = Date.now();
+  const previouslyKnownFirs = readFaaFirDesignatorCache();
+  const expectedFirCount = expectedFaaFirCountFromCaches();
   let gateway = null;
   try {
     gateway = await probeFaaNotamGateway({ code: FAA_NOTAM_GROUPS[0]?.codes?.[0] || "KZNY" });
     const firs = await expandFaaNotamFirs(gateway);
-    const expectedFirCount = expectedFaaFirCountFromCaches();
+    const discoveredCodes = new Set(firs.map(fir => fir.code));
+    const missingKnown = previouslyKnownFirs.filter(fir => !discoveredCodes.has(fir.code));
+    if (missingKnown.length) throw new Error(`FAA 未覆盖已知 FIR：${missingKnown.map(fir => fir.code).join(', ')}；已保留上次完整缓存。`);
     if (expectedFirCount && firs.length < expectedFirCount) {
       const error = new Error(
         `FAA FIR discovery returned only ${firs.length}/${expectedFirCount} known FIR/designators; refusing to publish partial global NOTAM data.`,
@@ -6452,8 +6464,10 @@ async function fetchFaaNotamSearchPayload() {
 
     for (const firResult of firResults) {
       for (const notam of firResult.notams) {
-        const text = notamText(notam);
-        const key = `${notam.notamNumber || ""}|${text}`.slice(0, 4000);
+        // Long multipart notices can share their first 4,000 characters while
+        // describing different areas later on. Never deduplicate by a prefix.
+        // Identical cross-FIR copies still represent one published notice.
+        const key = faaNotamDeduplicationKey(notam);
         if (!deduped.has(key)) {
           const sourceFir = resolveFaaNotamSourceFir(notam, firResult.memberFirs || [firResult.fir]);
           deduped.set(key, {
@@ -6538,6 +6552,7 @@ async function fetchFaaNotamSearchPayload() {
       elapsedMs,
       transport: transportUsed,
       transportDiagnostics,
+      gatewayAttempts: gateway.attempts || [],
       requestedTransport: FAA_NOTAM_TRANSPORT,
         concurrency: transportUsed.includes("browser") ? FAA_NOTAM_BROWSER_CONCURRENCY : FAA_NOTAM_FIR_CONCURRENCY,
         browserConcurrency: FAA_NOTAM_BROWSER_CONCURRENCY,
@@ -6582,6 +6597,8 @@ async function fetchFaaNotamSearchPayload() {
         loadedCount: Number(result.loadedCount || 0),
         totalAvailable: Number(result.totalAvailable || 0),
         pagesFetched: Number(result.pagesFetched || 0),
+        exportCount: Number(result.exportCount || 0),
+        verification: result.verification || "JSON-pagination",
         error: result.error || "",
       })),
       discovery: {
@@ -6615,167 +6632,153 @@ async function fetchFaaNotamSearchPayload() {
 
 async function probeFaaNotamGateway(fir) {
   if (!fir?.code) throw new Error("FAA NOTAM refresh has no FIR/designator available for its gateway check.");
-  const params = buildFaaNotamSearchParams(fir, 0);
-  const errors = [];
-  if (FAA_NOTAM_TRANSPORT === "auto" || FAA_NOTAM_TRANSPORT === "fetch") {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.min(FAA_NOTAM_FETCH_TIMEOUT_MS, 15000));
-    try {
+  return selectFaaTransport({
+    mode: FAA_NOTAM_TRANSPORT,
+    params: buildFaaNotamSearchParams(fir, 0),
+    direct: async (params) => {
       const response = await fetch(FAA_NOTAM_SEARCH_ENDPOINT, {
-        method: "POST",
-        signal: controller.signal,
+        method: "POST", signal: AbortSignal.timeout(Math.min(FAA_NOTAM_FETCH_TIMEOUT_MS, 15000)),
         headers: {
           "content-type": "application/x-www-form-urlencoded; charset=utf-8",
-          accept: "application/json, text/plain, */*",
-          cookie: "fnsDisclaimer=agreed",
-          origin: "https://notams.aim.faa.gov",
-          referer: "https://notams.aim.faa.gov/notamSearch/nsapp.html",
+          accept: "application/json, text/plain, */*", cookie: "fnsDisclaimer=agreed",
+          origin: "https://notams.aim.faa.gov", referer: "https://notams.aim.faa.gov/notamSearch/nsapp.html",
           "user-agent": "Mozilla/5.0 FAA-NOTAM-map/1.0",
         },
         body: new URLSearchParams(params),
       });
-      const body = await response.text();
-      const failure = faaResponseError(response, body);
-      if (failure) throw failure;
-      if (/^\s*</.test(body) || body.includes("redirectToDisclaimer")) throw new Error("FAA returned an HTML access gate.");
-      JSON.parse(body || "{}");
-      return { transport: "fetch", browserSession: null };
-    } catch (error) {
-      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
-      errors.push(`direct ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      clearTimeout(timeout);
-    }
+      return readFaaSearchResponse(response);
+    },
+    openBrowser: createFaaNotamBrowserSession,
+    windows: process.platform === "win32" ? (params) => fetchFaaNotamFormViaPowerShell(FAA_NOTAM_SEARCH_ENDPOINT, params) : null,
+  });
+}
+
+async function recoverFaaNotamFirsInBrowser(firs, gateway, primaryError, previousResults = []) {
+  if (FAA_NOTAM_TRANSPORT !== "auto" || gateway?.browserAttempted || isFaaRateLimited(primaryError)) throw primaryError;
+  gateway.browserAttempted = true;
+  const completed = previousResults.filter(result => !faaFirResultNeedsRecovery(result));
+  const completedCodes = new Set(completed.flatMap(result => result.memberFirs || [result.fir]).map(fir => fir.code));
+  const remaining = firs.filter(fir => !completedCodes.has(fir.code));
+  if (!remaining.length) return { results: completed, transport: "fetch", diagnostics: { recoveredFirs: 0 } };
+  try {
+    gateway.browserSession = await createFaaNotamBrowserSession();
+    validateFaaSearchPayload(await gateway.browserSession.fetchForm(buildFaaNotamSearchParams(remaining[0], 0)));
+    gateway.attempts ||= [];
+    gateway.attempts.push({ transport: "browser-recovery", status: "ok", reason: primaryError?.message || String(primaryError) });
+    const recovered = FAA_NOTAM_EXPORT_ENABLED
+      ? await fetchFaaNotamFirsViaExports(remaining, gateway.browserSession)
+      : await fetchFaaNotamFirsViaBrowser(remaining, gateway.browserSession);
+    return {
+      results: [...completed, ...recovered.results], transport: "fetch+official-browser-recovery",
+      diagnostics: { ...recovered.diagnostics, primary: "fetch", primaryError: primaryError?.message || String(primaryError),
+        primaryFailedFirs: remaining.length, preservedCompletedFirs: completedCodes.size,
+        recoveredFirs: remaining.length - countFaaResultFirs(recovered.results.filter(faaFirResultNeedsRecovery)) },
+    };
+  } catch (error) {
+    await gateway.browserSession?.close();
+    gateway.browserSession = null;
+    throw faaTransportFailure([
+      { transport: "fetch", status: "failed", message: primaryError?.message || String(primaryError) },
+      { transport: "browser-recovery", status: "failed", message: error.message || String(error) },
+    ], error);
   }
-  if (FAA_NOTAM_TRANSPORT === "auto" || FAA_NOTAM_TRANSPORT === "browser") {
-    let browserSession = null;
-    try {
-      browserSession = await createFaaNotamBrowserSession();
-      await browserSession.fetchForm(params);
-      return { transport: "browser", browserSession };
-    } catch (error) {
-      await browserSession?.close();
-      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
-      errors.push(`browser ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  if ((FAA_NOTAM_TRANSPORT === "auto" || FAA_NOTAM_TRANSPORT === "powershell") && process.platform === "win32") {
-    try {
-      await fetchFaaNotamFormViaPowerShell(FAA_NOTAM_SEARCH_ENDPOINT, params);
-      return { transport: "powershell", browserSession: null };
-    } catch (error) {
-      errors.push(`Windows ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  throw new Error(
-    `FAA NOTAM official gateway is currently refusing every configured transport; the full refresh was stopped before any partial data could be published. ${errors.join(" | ")}`,
-  );
 }
 
 async function fetchFaaNotamFirs(firs, gateway = null) {
-  const preferredTransport = gateway?.transport || FAA_NOTAM_TRANSPORT;
-  if (preferredTransport === "browser") {
-    return fetchFaaNotamFirsViaBrowser(firs, gateway.browserSession);
+  gateway ||= { transport: FAA_NOTAM_TRANSPORT, browserAttempted: false, attempts: [] };
+  if (gateway.transport === "browser") return FAA_NOTAM_EXPORT_ENABLED
+    ? fetchFaaNotamFirsViaExports(firs, gateway.browserSession)
+    : fetchFaaNotamFirsViaBrowser(firs, gateway.browserSession);
+  if (gateway.transport === "powershell") {
+    return { results: await fetchFaaNotamFirsViaPowerShell(firs), transport: "powershell",
+      diagnostics: { primary: "powershell" } };
   }
-  if (preferredTransport === "powershell") {
-    return {
-      results: await fetchFaaNotamFirsViaPowerShell(firs),
-      transport: "powershell",
-      diagnostics: { primary: "powershell", primaryFailedFirs: 0, recoveredFirs: 0, recoveryFailedFirs: 0 },
-    };
-  }
-
+  let results = [];
+  let primaryFailedFirs = 0;
   try {
-    let results = await fetchFaaNotamFirsViaFetch(firs);
-    const failedPrimary = results.filter(faaFirResultNeedsRecovery);
-    if (!failedPrimary.length || FAA_NOTAM_TRANSPORT === "fetch") {
-      const primaryFailedFirs = failedPrimary.reduce(
-        (sum, result) => sum + (result.memberFirs || result.fir?.memberFirs || [result.fir]).length,
-        0,
-      );
-      return {
-        results,
-        transport: "fetch",
-        diagnostics: {
-          primary: "fetch",
-          primaryFailedFirs,
-          recoveredFirs: 0,
-          recoveryFailedFirs: primaryFailedFirs,
-        },
-      };
-    }
-
-    const failedPrimaryFirs = uniqueFaaFirs(
-      failedPrimary.flatMap((result) => result.memberFirs || result.fir?.memberFirs || [result.fir]),
-    );
-    let adaptiveError = "";
-    try {
-      const adaptiveResults = await fetchFaaNotamFirsViaFetch(failedPrimaryFirs, {
-        batchSize: FAA_NOTAM_ADAPTIVE_BATCH_SIZE,
-        concurrency: FAA_NOTAM_ADAPTIVE_CONCURRENCY,
+    if (FAA_NOTAM_TRANSPORT === "auto" && FAA_NOTAM_EXPORT_ENABLED) return await fetchFaaNotamFirsViaExports(firs);
+    results = await fetchFaaNotamFirsViaFetch(firs);
+    const failed = uniqueFaaFirs(results.filter(faaFirResultNeedsRecovery).flatMap(result => result.memberFirs || [result.fir]));
+    primaryFailedFirs = failed.length;
+    if (failed.length && FAA_NOTAM_TRANSPORT === "auto") {
+      const adaptive = await fetchFaaNotamFirsViaFetch(failed, {
+        batchSize: FAA_NOTAM_ADAPTIVE_BATCH_SIZE, concurrency: FAA_NOTAM_ADAPTIVE_CONCURRENCY,
         retryConcurrency: Math.min(FAA_NOTAM_RETRY_CONCURRENCY, FAA_NOTAM_ADAPTIVE_CONCURRENCY),
       });
-      results = mergeFaaBatchRecoveryResults(results, adaptiveResults);
-    } catch (error) {
-      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
-      adaptiveError = error instanceof Error ? error.message : String(error);
+      results = mergeFaaBatchRecoveryResults(results, adaptive);
     }
-
-    const failedAfterAdaptiveFirs = uniqueFaaFirs(
-      results
-        .filter(faaFirResultNeedsRecovery)
-        .flatMap((result) => result.memberFirs || result.fir?.memberFirs || [result.fir]),
-    );
-    const adaptiveRecoveredFirs = Math.max(0, failedPrimaryFirs.length - failedAfterAdaptiveFirs.length);
-    if (!failedAfterAdaptiveFirs.length) {
-      return {
-        results,
-        transport: "fetch+adaptive-recovery",
-        diagnostics: {
-          primary: "fetch",
-          primaryFailedFirs: failedPrimaryFirs.length,
-          adaptiveRecoveredFirs,
-          powershellRequestedFirs: 0,
-          recoveredFirs: failedPrimaryFirs.length,
-          recoveryFailedFirs: 0,
-          adaptiveError,
-        },
-      };
+    const remaining = countFaaResultFirs(results.filter(faaFirResultNeedsRecovery));
+    if (remaining && FAA_NOTAM_TRANSPORT === "auto") {
+      const error = new Error('FAA direct pagination is incomplete after smaller-batch recovery.');
+      return recoverFaaNotamFirsInBrowser(firs, gateway, error, results);
     }
-
-    const recoveryResults = await recoverFaaNotamFirs(failedAfterAdaptiveFirs);
-    results = mergeFaaBatchRecoveryResults(results, recoveryResults);
-    const recoveryFailedFirs = countFaaResultFirs(results.filter(faaFirResultNeedsRecovery));
-    return {
-      results,
-      transport: process.platform === "win32" ? "fetch+adaptive+powerShell-recovery" : "fetch+adaptive+single-recovery",
-      diagnostics: {
-        primary: "fetch",
-        primaryFailedFirs: failedPrimaryFirs.length,
-        adaptiveRecoveredFirs,
-        powershellRequestedFirs: process.platform === "win32" ? failedAfterAdaptiveFirs.length : 0,
-        singleRequestedFirs: process.platform === "win32" ? 0 : failedAfterAdaptiveFirs.length,
-        recoveredFirs: Math.max(0, failedPrimaryFirs.length - recoveryFailedFirs),
-        recoveryFailedFirs,
-        adaptiveError,
-      },
-    };
+    return { results, transport: primaryFailedFirs ? "fetch+adaptive-recovery" : "fetch",
+      diagnostics: { primary: "fetch", primaryFailedFirs, adaptiveRecoveredFirs: primaryFailedFirs - remaining,
+        recoveredFirs: primaryFailedFirs - remaining, recoveryFailedFirs: remaining } };
   } catch (error) {
-    if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') throw error;
-    if (FAA_NOTAM_TRANSPORT !== "auto") throw error;
-    const results = await recoverFaaNotamFirs(firs);
-    return {
-      results,
-      transport: process.platform === "win32" ? "powershell-fallback" : "fetch-single-fallback",
-      diagnostics: {
-        primary: "fetch",
-        primaryFailedFirs: firs.length,
-        recoveredFirs: Math.max(0, firs.length - results.filter(faaFirResultNeedsRecovery).length),
-        recoveryFailedFirs: results.filter(faaFirResultNeedsRecovery).length,
-        primaryError: error instanceof Error ? error.message : String(error),
-      },
-    };
+    if (FAA_NOTAM_TRANSPORT !== "auto" || isFaaRateLimited(error)) throw error;
+    const completed = [...results.filter(result => !faaFirResultNeedsRecovery(result)), ...(error.faaResults || [])];
+    return recoverFaaNotamFirsInBrowser(firs, gateway, error, completed);
   }
+}
+
+async function fetchFaaNotamFirsViaExports(firs, browserSession = null) {
+  const queries = buildFaaNotamQueryBatches(firs, FAA_NOTAM_BATCH_SIZE);
+  const jar = new Map([["fnsDisclaimer", "agreed"]]);
+  let terminalError = null;
+  let results = await mapLimit(queries, browserSession ? 1 : 2, async query => {
+    try {
+      if (terminalError) throw terminalError;
+      return await collectFaaExportBatch({ query,
+        getMetadata: async fir => {
+          if (terminalError) throw terminalError;
+          const params = buildFaaNotamSearchParams(fir, 0);
+          if (browserSession) { await paceFaaNotamRequest(); return browserSession.fetchMetadata(params); }
+          return fetchFaaNotamForm(FAA_NOTAM_SEARCH_ENDPOINT, jar, params);
+        },
+        download: async fir => {
+          await paceFaaNotamRequest();
+          if (terminalError) throw terminalError;
+          const params = buildFaaNotamSearchParams(fir, 0);
+          if (browserSession) return browserSession.fetchExport(params);
+          const response = await fetch(buildFaaExportUrl(params), {
+            signal: AbortSignal.timeout(60000), headers: { accept:"application/vnd.ms-excel", cookie:cookieHeader(jar),
+              referer:FAA_NOTAM_SEARCH_URL + "nsapp.html", "user-agent":"Mozilla/5.0 FAA-NOTAM-map/1.0" },
+          });
+          if (!response.ok) throw faaHttpError(response.status, await response.text(), response.headers.get('retry-after'));
+          const chunks=[]; let size=0;
+          for await (const chunk of response.body) {
+            size += chunk.length;
+            if (size > 24 * 1024 * 1024) throw new Error('FAA export exceeds the permitted size.');
+            chunks.push(chunk);
+          }
+          return Buffer.concat(chunks);
+        },
+        retryDelay: () => sleep(FAA_NOTAM_REQUEST_RETRY_BASE_DELAY_MS),
+      });
+    } catch (error) {
+      if (isFaaAccessDenied(error) || isFaaRateLimited(error)) terminalError = error;
+      return { fir:query, memberFirs:query.memberFirs, notams:[], loadedCount:0, totalAvailable:0, error:error.message || String(error) };
+    }
+  });
+  if (terminalError) { terminalError.faaResults = results; throw terminalError; }
+  const remaining = uniqueFaaFirs(results.filter(faaFirResultNeedsRecovery).flatMap(result=>result.memberFirs));
+  const exportErrors = results.filter(faaFirResultNeedsRecovery).map(result=>({query:result.fir.code,error:result.error}));
+  if (remaining.length) {
+    try {
+      const recovery = browserSession
+        ? (await fetchFaaNotamFirsViaBrowser(remaining, browserSession)).results
+        : await fetchFaaNotamFirsViaFetch(remaining, {concurrency:FAA_NOTAM_ADAPTIVE_CONCURRENCY});
+      results = mergeFaaBatchRecoveryResults(results, recovery);
+    } catch (error) {
+      error.faaResults = [...results.filter(result=>!faaFirResultNeedsRecovery(result)), ...(error.faaResults || [])];
+      throw error;
+    }
+  }
+  return { results, transport: browserSession ? "official-browser-export" : "official-export",
+    diagnostics: { primary: "official Excel export with JSON cross-checks", exportBatches:queries.length,
+      exportErrors, primaryFailedFirs:remaining.length, recoveredFirs:remaining.length-countFaaResultFirs(results.filter(faaFirResultNeedsRecovery)),
+      recoveryFailedFirs:countFaaResultFirs(results.filter(faaFirResultNeedsRecovery)) } };
 }
 
 function faaFirResultNeedsRecovery(result) {
@@ -6801,7 +6804,7 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
       if (accessDeniedError) throw accessDeniedError;
       return await fetchFaaNotamFir(fir, jar);
     } catch (error) {
-      if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') accessDeniedError = error;
+      if (isFaaAccessDenied(error) || isFaaRateLimited(error)) accessDeniedError = error;
       return {
         fir,
         memberFirs: fir.memberFirs || [fir],
@@ -6812,7 +6815,10 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
       };
     }
   });
-  if (accessDeniedError) throw accessDeniedError;
+  if (accessDeniedError) {
+    accessDeniedError.faaResults = results;
+    throw accessDeniedError;
+  }
   const retryable = results.filter(isRetryableFaaFirFailure);
   if (retryable.length) {
     if (FAA_NOTAM_RETRY_DELAY_MS > 0) await sleep(FAA_NOTAM_RETRY_DELAY_MS);
@@ -6824,7 +6830,7 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
           if (accessDeniedError) throw accessDeniedError;
           return await fetchFaaNotamFir(fir, jar);
         } catch (error) {
-          if (isFaaAccessDenied(error) || error.code === 'FAA_RATE_LIMITED') accessDeniedError = error;
+          if (isFaaAccessDenied(error) || isFaaRateLimited(error)) accessDeniedError = error;
           return {
             fir,
             memberFirs: fir.memberFirs || [fir],
@@ -6837,6 +6843,10 @@ async function fetchFaaNotamFirsViaFetch(firs, options = {}) {
       },
     );
     results = mergeFaaFirRetryResults(results, retryResults);
+    if (accessDeniedError) {
+      accessDeniedError.faaResults = results;
+      throw accessDeniedError;
+    }
   }
   if (accessDeniedError) throw accessDeniedError;
   return results;
@@ -6901,8 +6911,8 @@ function resolveFaaNotamSourceFir(notam, memberFirs) {
 }
 
 function isRetryableFaaFirFailure(result) {
-  if (isFaaAccessDenied(result?.error)) return false;
-  return /\b(403|429|503)\b|Access Denied|Too Many Requests|fetch failed|aborted|timeout|pagination incomplete|repeated a page|worker returned no result/i.test(
+  if (isFaaAccessDenied(result?.error) || isFaaRateLimited(result?.error)) return false;
+  return /\b(500|502|503|504)\b|fetch failed|aborted|timeout|pagination incomplete|repeated a page|overlaps|total changed|worker returned no result/i.test(
     String(result?.error || ""),
   );
 }
@@ -6917,8 +6927,13 @@ function mergeFaaFirRetryResults(results, retryResults) {
 
 async function fetchFaaNotamFirsViaBrowser(firs, browserSession) {
   if (!browserSession) throw new Error("FAA browser transport was selected without an active browser session.");
+  const checkAccess = results => {
+    const failure = results.find(result => isFaaAccessDenied(result.error) || isFaaRateLimited(result.error));
+    if (failure) throw faaHttpError(isFaaRateLimited(failure.error) ? 429 : 403);
+  };
   const primaryQueries = buildFaaNotamQueryBatches(firs, FAA_NOTAM_BATCH_SIZE);
   let results = await browserSession.fetchQueries(primaryQueries, FAA_NOTAM_BROWSER_CONCURRENCY);
+  checkAccess(results);
   const failedPrimaryFirs = uniqueFaaFirs(
     results.filter(faaFirResultNeedsRecovery).flatMap((result) => result.memberFirs || [result.fir]),
   );
@@ -6931,6 +6946,7 @@ async function fetchFaaNotamFirsViaBrowser(firs, browserSession) {
       adaptiveQueries,
       Math.min(FAA_NOTAM_BROWSER_CONCURRENCY, FAA_NOTAM_ADAPTIVE_CONCURRENCY),
     );
+    checkAccess(adaptiveResults);
     results = mergeFaaBatchRecoveryResults(results, adaptiveResults);
     const failedAfterAdaptive = uniqueFaaFirs(
       results.filter(faaFirResultNeedsRecovery).flatMap((result) => result.memberFirs || [result.fir]),
@@ -6943,6 +6959,7 @@ async function fetchFaaNotamFirsViaBrowser(firs, browserSession) {
         buildFaaNotamQueryBatches(failedAfterAdaptive, 1),
         Math.min(FAA_NOTAM_BROWSER_CONCURRENCY, FAA_NOTAM_RETRY_CONCURRENCY),
       );
+      checkAccess(singleResults);
       results = mergeFaaBatchRecoveryResults(results, singleResults);
       const failedAfterSingle = countFaaResultFirs(results.filter(faaFirResultNeedsRecovery));
       singleRecoveredFirs = Math.max(0, failedAfterAdaptive.length - failedAfterSingle);
@@ -6978,7 +6995,6 @@ async function createFaaNotamBrowserSession() {
       ...(process.platform !== "win32" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []),
       "--window-position=-32000,-32000",
       "--window-size=1280,900",
-      "--disable-blink-features=AutomationControlled",
       "--disable-background-networking",
       "--disable-extensions",
       "--disable-sync",
@@ -6989,8 +7005,8 @@ async function createFaaNotamBrowserSession() {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1280, height: 900 } });
   let page = await context.newPage();
   async function acceptFaaDisclaimer(targetPage) {
-    if (!/\/notamSearch\/disclaimer\.html(?:[#?].*)?$/i.test(targetPage.url())) return;
     const acceptButton = targetPage.getByRole("button", { name: /read and understood/i });
+    if (!(await acceptButton.isVisible())) return;
     await Promise.all([
       targetPage.waitForURL(/\/notamSearch\/nsapp\.html(?:[#?].*)?$/i, { timeout: FAA_NOTAM_BROWSER_TIMEOUT_MS }),
       acceptButton.click({ timeout: FAA_NOTAM_BROWSER_TIMEOUT_MS }),
@@ -7022,7 +7038,7 @@ async function createFaaNotamBrowserSession() {
     if (/Access Denied/i.test(title)) throw new Error("FAA returned an Access Denied page to the browser transport.");
   }
   try {
-    const response = await page.goto(`${FAA_NOTAM_SEARCH_URL}disclaimer.html`, {
+    const response = await page.goto(FAA_NOTAM_SEARCH_URL, {
       waitUntil: "domcontentloaded",
       timeout: FAA_NOTAM_BROWSER_TIMEOUT_MS,
     });
@@ -7032,16 +7048,7 @@ async function createFaaNotamBrowserSession() {
     const title = await page.title();
     if (/Access Denied/i.test(title)) throw new Error("FAA returned an Access Denied page to the browser transport.");
     await acceptFaaDisclaimer(page);
-    await context.addCookies([
-      {
-        name: "fnsDisclaimer",
-        value: "agreed",
-        domain: "notams.aim.faa.gov",
-        path: "/",
-        secure: true,
-        sameSite: "Lax",
-      },
-    ]);
+    await page.locator('input[name="designatorsForLocation"]').waitFor({ state: "visible", timeout: FAA_NOTAM_BROWSER_TIMEOUT_MS });
   } catch (error) {
     await browser.close();
     throw error;
@@ -7077,32 +7084,43 @@ async function createFaaNotamBrowserSession() {
   }
   return {
     async fetchForm(params) {
-      return evaluateOnStableFaaPage(
-        async ({ endpoint, params, timeoutMs }) => {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), timeoutMs);
-          try {
-            const response = await fetch(endpoint, {
-              method: "POST",
-              signal: controller.signal,
-              headers: {
-                accept: "application/json, text/plain, */*",
-                "content-type": "application/x-www-form-urlencoded; charset=utf-8",
-              },
-              body: new URLSearchParams(params),
-            });
-            const text = await response.text();
-            if (!response.ok) throw new Error(`FAA NOTAM Search ${response.status}: ${text.slice(0, 180)}`);
-            if (/^\s*</.test(text) || text.includes("redirectToDisclaimer")) {
-              throw new Error("FAA NOTAM Search returned an HTML gate instead of NOTAM JSON.");
-            }
-            return text ? JSON.parse(text) : {};
-          } finally {
-            clearTimeout(timeout);
+      // Enter through the official form so its normal session initialization
+      // runs. No copied cookies, challenge solvers or hidden CAPTCHA tokens.
+      const input = page.locator('input[name="designatorsForLocation"]');
+      if (!(await input.isVisible())) await page.getByRole("button", { name: "Change Search", exact: true }).click();
+      await input.fill(params.designatorsForLocation);
+      const [response] = await Promise.all([
+        page.waitForResponse(response => response.url().split('?')[0] === FAA_NOTAM_SEARCH_ENDPOINT && response.request().method() === "POST", { timeout: FAA_NOTAM_BROWSER_TIMEOUT_MS }),
+        page.getByRole("button", { name: /^Search/ }).click({ timeout: FAA_NOTAM_BROWSER_TIMEOUT_MS }),
+      ]);
+      return readFaaSearchResponse({ ok: response.ok(), status: response.status(),
+        headers: { get: key => response.headers()[key] }, text: () => response.text() });
+    },
+    async fetchMetadata(params) {
+      const result = await evaluateOnStableFaaPage(async ({endpoint,params,timeoutMs}) => {
+        const response = await fetch(endpoint, { method:'POST', signal:AbortSignal.timeout(timeoutMs),
+          headers:{'content-type':'application/x-www-form-urlencoded; charset=utf-8',accept:'application/json'},
+          body:new URLSearchParams(params) });
+        return {ok:response.ok,status:response.status,retryAfter:response.headers.get('retry-after'),body:await response.text()};
+      }, {endpoint:FAA_NOTAM_SEARCH_ENDPOINT,params,timeoutMs:FAA_NOTAM_FETCH_TIMEOUT_MS});
+      return readFaaSearchResponse({...result,headers:{get:()=>result.retryAfter},text:async()=>result.body});
+    },
+    async fetchExport(params) {
+      const result = await evaluateOnStableFaaPage(async ({url}) => {
+        const response = await fetch(url, {signal:AbortSignal.timeout(60000)});
+        if (!response.ok) return {status:response.status,error:true,retryAfter:response.headers.get('retry-after')};
+        const chunks=[]; let size=0; const reader=response.body.getReader();
+        try {
+          while(true) {
+            const {done,value}=await reader.read(); if(done)break;
+            size+=value.length; if(size>24*1024*1024)throw new Error('FAA export exceeds the permitted size.');
+            for(let i=0;i<value.length;i+=32768)chunks.push(String.fromCharCode(...value.subarray(i,i+32768)));
           }
-        },
-        { endpoint: FAA_NOTAM_SEARCH_ENDPOINT, params, timeoutMs: FAA_NOTAM_FETCH_TIMEOUT_MS },
-      );
+        } finally { await reader.cancel().catch(()=>{}); }
+        return {data:btoa(chunks.join(''))};
+      }, {url:buildFaaExportUrl(params)});
+      if(result.error)throw faaHttpError(result.status,'',result.retryAfter);
+      return Buffer.from(result.data,'base64');
     },
     async fetchLocs(terms) {
       return evaluateOnStableFaaPage(
@@ -7149,14 +7167,17 @@ async function createFaaNotamBrowserSession() {
           const results = new Array(queries.length);
           let cursor = 0;
           let nextRequestAt = Date.now();
+          let terminalError = null;
 
           async function pacedPost(params) {
             let lastError = null;
             for (let attempt = 1; attempt <= config.attempts; attempt += 1) {
+              if (terminalError) throw terminalError;
               const now = Date.now();
               const scheduledAt = Math.max(now, nextRequestAt);
               nextRequestAt = scheduledAt + config.requestIntervalMs;
               if (scheduledAt > now) await delay(scheduledAt - now);
+              if (terminalError) throw terminalError;
               const controller = new AbortController();
               const timeout = setTimeout(() => controller.abort(), config.fetchTimeoutMs);
               try {
@@ -7170,14 +7191,20 @@ async function createFaaNotamBrowserSession() {
                   body: new URLSearchParams(params),
                 });
                 const text = await response.text();
-                if (!response.ok) throw new Error(`FAA NOTAM Search ${response.status}: ${text.slice(0, 180)}`);
+                if (!response.ok) {
+                  const error = new Error(`FAA NOTAM Search HTTP ${response.status}${response.status === 403 ? ' / Access Denied' : ''}`);
+                  if (response.status === 403 || response.status === 429) terminalError = error;
+                  throw error;
+                }
                 if (/^\s*</.test(text) || text.includes("redirectToDisclaimer")) {
                   throw new Error("FAA NOTAM Search returned an HTML gate instead of NOTAM JSON.");
                 }
-                return text ? JSON.parse(text) : {};
+                const payload = text ? JSON.parse(text) : {};
+                if (payload?.error && payload.error !== 'false') throw new Error('FAA returned a query error instead of complete data.');
+                return payload;
               } catch (error) {
                 lastError = error;
-                if (attempt >= config.attempts) break;
+                if (terminalError || attempt >= config.attempts) break;
                 await delay(config.retryBaseDelayMs * attempt);
               } finally {
                 clearTimeout(timeout);
@@ -7198,13 +7225,16 @@ async function createFaaNotamBrowserSession() {
                 ...config.baseParams,
                 designatorsForLocation: query.code,
                 offset: String(offset),
-                notamsOnly: offset > 0 ? "true" : "false",
+                // Request metadata on every page. The official "true" mode
+                // returns a bare array, so it cannot verify a changed total.
+                notamsOnly: "false",
               };
               const payload = await pacedPost(params);
               const page = Array.isArray(payload?.notamList) ? payload.notamList : Array.isArray(payload) ? payload : [];
               pagesFetched += 1;
               if (!Array.isArray(payload) && !Array.isArray(payload?.notamList) && !(payload?.totalNotamCount != null && Number(payload.totalNotamCount) === 0)) throw new Error("FAA response does not contain a valid NOTAM list.");
               const reportedTotal = payload?.totalNotamCount == null ? null : Number(payload.totalNotamCount);
+              if (reportedTotal == null) throw new Error("FAA response lacks an official total; completeness cannot be verified.");
               if (reportedTotal != null && (!Number.isInteger(reportedTotal) || reportedTotal < 0 || (pagesFetched > 1 && reportedTotal !== totalAvailable))) throw new Error("FAA total changed or is invalid while paging; retry required.");
               totalAvailable = reportedTotal ?? (totalAvailable || page.length);
               if (offset + page.length > totalAvailable) throw new Error("FAA page exceeds its advertised total; snapshot rejected.");
@@ -7426,7 +7456,7 @@ foreach ($fir in $firs) {
         archiveDate = ''
         archiveDesignator = ''
         offset = [string]$offset
-        notamsOnly = $(if ($offset -gt 0) { 'true' } else { 'false' })
+        notamsOnly = 'false'
         filters = ''
         minRunwayLength = ''
         minRunwayWidth = ''
@@ -7448,6 +7478,8 @@ foreach ($fir in $firs) {
       }
       $payload = $response.Content | ConvertFrom-Json
       $pagesFetched += 1
+      if (($payload -is [array]) -or ($null -eq $payload.totalNotamCount)) { throw 'FAA response lacks an official total; completeness cannot be verified.' }
+      if ($payload.error -and $payload.error -ne 'false') { throw 'FAA returned a query error instead of complete data.' }
       if ($payload -is [array]) {
         $page = @(Expand-JsonRows $payload)
       } else {
@@ -7455,10 +7487,12 @@ foreach ($fir in $firs) {
         $page = @(Expand-JsonRows $payload.notamList)
         if ($null -ne $payload.totalNotamCount) {
           $nextTotal = [int]$payload.totalNotamCount
+          if ($nextTotal -lt 0) { throw 'FAA returned an invalid total.' }
           if ($pagesFetched -gt 1 -and $nextTotal -ne $totalAvailable) { throw 'FAA total changed while paging; retry required.' }
           $totalAvailable = $nextTotal
         }
       }
+      if ($offset + $page.Count -gt $totalAvailable) { throw 'FAA page exceeds its advertised total; snapshot rejected.' }
       if ($page.Count -eq 0) { break }
       foreach ($item in $page) {
         $key = [string]$item.transactionID
@@ -7558,7 +7592,9 @@ async function expandFaaNotamFirs(gateway = null) {
       seen.set(fir.code, fir);
     }
   }
-  if (cachedFirs.length && seen.size < cachedFirs.length) {
+  // Union by identifier, not by count: discovering a new FIR must not remove an
+  // older one simply because the new list happens to be the same size.
+  if (cachedFirs.length) {
     for (const fir of cachedFirs) {
       if (!fir.code || seen.has(fir.code)) continue;
       seen.set(fir.code, {
@@ -7802,6 +7838,7 @@ async function fetchFaaNotamFir(fir, jar) {
     pagesFetched += 1;
     if (!Array.isArray(payload) && !Array.isArray(payload?.notamList) && !(payload?.totalNotamCount != null && Number(payload.totalNotamCount) === 0)) throw new Error("FAA response does not contain a valid NOTAM list.");
     const reportedTotal = payload?.totalNotamCount == null ? null : Number(payload.totalNotamCount);
+    if (reportedTotal == null) throw new Error("FAA response lacks an official total; completeness cannot be verified.");
     if (reportedTotal != null && (!Number.isInteger(reportedTotal) || reportedTotal < 0 || (pagesFetched > 1 && reportedTotal !== totalAvailable))) throw new Error("FAA total changed or is invalid while paging; retry required.");
     totalAvailable = reportedTotal ?? (totalAvailable || page.length);
     if (offset + page.length > totalAvailable) throw new Error("FAA page exceeds its advertised total; snapshot rejected.");
@@ -7872,7 +7909,9 @@ function buildFaaNotamSearchParams(fir, offset) {
     archiveDate: "",
     archiveDesignator: "",
     offset: String(offset),
-    notamsOnly: offset > 0 ? "true" : "false",
+    // FAA still honors offset when metadata is requested on subsequent pages.
+    // A total on every page lets us reject a collection that changed mid-query.
+    notamsOnly: "false",
     filters: "",
     minRunwayLength: "",
     minRunwayWidth: "",
@@ -7911,7 +7950,11 @@ function isAirspaceRestrictionRestriction(item) {
 }
 
 function notamText(notam) {
-  return notam?.icaoMessage || notam?.traditionalMessage || notam?.plainLanguageMessage || notam?.text || "";
+  return firstNotamText(notam);
+}
+
+function faaNotamDeduplicationKey(notam) {
+  return JSON.stringify([notam.notamNumber || "", canonicalNotamText(notamText(notam))]);
 }
 
 function qCodeFromText(text) {
@@ -7950,13 +7993,7 @@ async function fetchFaaNotamForm(url, jar, params) {
         body: new URLSearchParams(params),
       });
       mergeSetCookies(jar, response.headers);
-      const text = await response.text();
-      const failure = faaResponseError(response, text);
-      if (failure) throw failure;
-      if (/^\s*</.test(text) || text.includes("redirectToDisclaimer")) {
-        throw new Error("FAA NOTAM Search returned an HTML gate instead of NOTAM JSON.");
-      }
-      return text ? JSON.parse(text) : {};
+      return await readFaaSearchResponse(response);
     } catch (error) {
       lastError = error;
       // Long upstream cool-downs belong to the outer scheduled attempt, not a
@@ -7992,7 +8029,7 @@ function deferFaaNotamRequests(error, attempt) {
 }
 
 function isRetryableFaaRequestError(error) {
-  if (isFaaAccessDenied(error)) return false;
+  if (isFaaAccessDenied(error) || isFaaRateLimited(error)) return false;
   return /\b(403|429|500|502|503|504)\b|Access Denied|Too Many Requests|fetch failed|aborted|timeout|HTML gate/i.test(
     error instanceof Error ? error.message : String(error),
   );
@@ -8173,16 +8210,7 @@ function loadImportedNotams() {
 }
 
 function buildImportedNotamRestriction(item, index) {
-  const text =
-    typeof item === "string"
-      ? item
-      : item?.text ||
-        item?.rawText ||
-        item?.icaoMessage ||
-        item?.traditionalMessage ||
-        item?.plainLanguageMessage ||
-        item?.notamText ||
-        "";
+  const text = firstNotamText(item);
   if (!text.trim()) return null;
   const parsed = parseNotamText(text);
   const explicitGeometry = typeof item === "object" ? normalizeExplicitGeometry(item.geometry) : null;
@@ -8708,12 +8736,15 @@ function extractNotamGeometryText(text) {
   // FAA concatenates multipart messages with a repeated header, sometimes in
   // the middle of a coordinate. Only join parts belonging to the same NOTAM.
   const original = String(text || "");
+  // Domestic FAA messages have no ICAO letter fields. In particular, the B)
+  // in "(INCLUDING ... ADS-B)" must not consume the following coordinates.
+  if (/^\s*![A-Z0-9]{2,5}\s+\d+\/\d+\b/i.test(original)) return original;
   const messageId = original.match(/\b([A-Z]\d{1,4}\/\d{2,4})\s+NOTAM[NR]/i)?.[1];
   const source = original.replace(
     /\bEND\s+PART\s+\d+\s+OF\s+\d+\s+([A-Z]\d{1,4}\/\d{2,4})\s+NOTAM[NR][\s\S]*?\bE\)\s*/gi,
     (match, id) => id === messageId ? " " : match,
   ).replace(/\bEND\s+PART\s+\d+\s+OF\s+\d+\b/gi, " ");
-  const eMatch = /(?<!\()\bE\)\s*/i.exec(source);
+  const eMatch = /(?<![\w(/-])\bE\)\s*/i.exec(source);
   if (eMatch) {
     const tail = source.slice(eMatch.index + eMatch[0].length);
     const fieldMatches = [...tail.matchAll(/(?:^|[\r\n\s])([FG])\)\s*/gi)];
@@ -8727,7 +8758,7 @@ function extractNotamGeometryText(text) {
     );
     if (body.trim()) return body;
   }
-  return source.replace(/(?<!\()\b[QABCDFG]\)\s*[\s\S]*?(?=\s+\b[QABCDEFG]\)|$)/gi, " ");
+  return source.replace(/(?<![\w(/-])\b[QABCDFG]\)\s*[\s\S]*?(?=\s+\b[QABCDEFG]\)|$)/gi, " ");
 }
 
 function cleanNotamGeometryText(text) {
@@ -9952,10 +9983,11 @@ function buildSourceDescription() {
     faaNotamSearch: {
       status: "official_live",
       message:
-        `FAA NOTAM Search live JSON uses the official nsapp.html multi-designator query and paginates every returned record. Transport=${FAA_NOTAM_TRANSPORT}, discoveryConcurrency=${FAA_NOTAM_DISCOVERY_CONCURRENCY}, fetchConcurrency=${FAA_NOTAM_FIR_CONCURRENCY}, batchSize=${FAA_NOTAM_BATCH_SIZE}, adaptiveBatchSize=${FAA_NOTAM_ADAPTIVE_BATCH_SIZE}, adaptiveConcurrency=${FAA_NOTAM_ADAPTIVE_CONCURRENCY}, requestInterval=${FAA_NOTAM_REQUEST_INTERVAL_MS}ms, requestRetries=${FAA_NOTAM_REQUEST_RETRY_ATTEMPTS}, powershellRecoveryWorkers=${FAA_NOTAM_POWERSHELL_CONCURRENCY}, powershellPageDelay=${FAA_NOTAM_POWERSHELL_PAGE_DELAY_MS}ms, retryConcurrency=${FAA_NOTAM_RETRY_CONCURRENCY}, workerStagger=${FAA_NOTAM_POWERSHELL_STAGGER_MS}ms, maxFailedFirs=${FAA_NOTAM_MAX_FAILED_FIRS}, pageDelay=${FAA_NOTAM_PAGE_DELAY_MS}ms.`,
+        `FAA NOTAM Search 官方网页查询：优先使用完整 Excel 导出，并核对下载前后的官方总数和正文样本；核对不符的批次改用 JSON 全部分页。直连失败时可使用普通浏览器完成官方页面查询。Transport=${FAA_NOTAM_TRANSPORT}, officialExport=${FAA_NOTAM_EXPORT_ENABLED}, discoveryConcurrency=${FAA_NOTAM_DISCOVERY_CONCURRENCY}, fetchConcurrency=${FAA_NOTAM_FIR_CONCURRENCY}, batchSize=${FAA_NOTAM_BATCH_SIZE}, adaptiveBatchSize=${FAA_NOTAM_ADAPTIVE_BATCH_SIZE}, adaptiveConcurrency=${FAA_NOTAM_ADAPTIVE_CONCURRENCY}, requestInterval=${FAA_NOTAM_REQUEST_INTERVAL_MS}ms, requestRetries=${FAA_NOTAM_REQUEST_RETRY_ATTEMPTS}, powershellRecoveryWorkers=${FAA_NOTAM_POWERSHELL_CONCURRENCY}, powershellPageDelay=${FAA_NOTAM_POWERSHELL_PAGE_DELAY_MS}ms, retryConcurrency=${FAA_NOTAM_RETRY_CONCURRENCY}, workerStagger=${FAA_NOTAM_POWERSHELL_STAGGER_MS}ms, maxFailedFirs=${FAA_NOTAM_MAX_FAILED_FIRS}, pageDelay=${FAA_NOTAM_PAGE_DELAY_MS}ms.`,
       urls: {
         app: FAA_NOTAM_SEARCH_URL,
         searchEndpoint: FAA_NOTAM_SEARCH_ENDPOINT,
+        exportEndpoint: "https://notams.aim.faa.gov/notamSearch/excel",
         locationEndpoint: FAA_NOTAM_LOCS_ENDPOINT,
       },
     },
@@ -11553,6 +11585,7 @@ export {
   discoverMsaWarningColumns,
   buildMsaNavWarningRestriction,
   probeFaaNotamGateway,
+  fetchFaaNotamFirs,
   getRestrictions,
   getHydropacWarnings,
   getNavareaWarnings,

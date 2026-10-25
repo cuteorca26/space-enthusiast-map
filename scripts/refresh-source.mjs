@@ -19,7 +19,8 @@ try {
   const report = { source, status: 'success', fetchedAt: meta.fetchedAt || data.generatedAt,
     total: (data.restrictions?.length || 0) + (data.skipped?.length || 0),
     drawable: data.restrictions?.filter(item => item.hasGeometry && item.geometry).length || 0,
-    message: meta.message, coverage: source === 'msa' ? { bureaus: meta.bureauCount,
+    message: meta.message, coverage: source === 'notam' ? { ...meta.completeness,
+      transport: meta.transport, diagnostics: meta.transportDiagnostics } : source === 'msa' ? { bureaus: meta.bureauCount,
       scannedDetailPages: meta.scannedDetailPages, refreshMode: meta.refreshMode, lookbackDays: meta.lookbackDays } : undefined };
   writeFileSync(join(process.env.DATA_DIR, `${source}-report.json`), JSON.stringify(report));
   console.log(`${source}: ${report.total} records, ${report.drawable} drawable`);

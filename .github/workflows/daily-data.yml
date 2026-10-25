@@ -4,11 +4,17 @@ on:
     # UTC 07:37 = Beijing 15:37, every 24 hours.
     - cron: '37 7 * * *'
   workflow_dispatch:
+    inputs:
+      source:
+        description: 'Refresh all sources, or verify a single source through the same daily pipeline'
+        type: choice
+        options: [all, notam, navarea, hydropac, msa]
+        default: all
 permissions:
   contents: write
   actions: read
 concurrency:
-  group: daily-full-warning-refresh
+  group: daily-full-warning-refresh-${{ inputs.source || 'all' }}
   cancel-in-progress: false
 jobs:
   refresh:
@@ -19,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [notam, navarea, hydropac, msa]
+        source: ${{ fromJSON(inputs.source != '' && inputs.source != 'all' && format('["{0}"]', inputs.source) || '["notam","navarea","hydropac","msa"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -34,7 +40,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_URL: ${{ vars.APP_URL || 'https://space-enthusiast-map.onrender.com' }}
-          FAA_NOTAM_TRANSPORT: 'fetch'
+          FAA_NOTAM_TRANSPORT: 'auto'
           FAA_NOTAM_FIR_CONCURRENCY: '2'
           FAA_NOTAM_REQUEST_INTERVAL_MS: '1000'
           NAVAREA_FETCH_CONCURRENCY: '2'
