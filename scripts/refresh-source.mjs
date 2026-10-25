@@ -1,6 +1,7 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getRestrictions, getHydropacWarnings, getNavareaWarnings, getMsaNavWarnings, closePerformanceWorkers } from '../server.mjs';
+import { getRestrictions, getHydropacWarnings, getNavareaWarnings, getMsaNavWarnings, closePerformanceWorkers, readStreamedNotamResponse, restrictionsCacheKey } from '../server.mjs';
+import { prepareNotamPublication } from '../prepared-notam.mjs';
 import { assertCompleteScheduledSource } from '../daily-refresh-policy.mjs';
 import { faaFailureDetails } from '../faa-access.mjs';
 
@@ -16,6 +17,11 @@ try {
   sourceMeta = meta;
   // Do not turn a fallback or a partial global scan into a successful new day.
   assertCompleteScheduledSource(meta);
+  if(source==='notam'){
+    await prepareNotamPublication(process.env.DATA_DIR,readStreamedNotamResponse,
+      restrictionsCacheKey({includeDetails:false,includeGlobalNotams:true,includeTfr:false}));
+    console.log('Prepared current NOTAM display and history replay on the collector.');
+  }
   const report = { source, status: 'success', fetchedAt: meta.fetchedAt || data.generatedAt,
     total: (data.restrictions?.length || 0) + (data.skipped?.length || 0),
     drawable: data.restrictions?.filter(item => item.hasGeometry && item.geometry).length || 0,

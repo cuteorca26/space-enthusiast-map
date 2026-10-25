@@ -1,4 +1,17 @@
 import test from 'node:test';
+import {isFaaAccessDenied,isFaaRateLimited} from '../faa-notam-access.mjs';
+
+test('export record counts and NOTAM identifiers are never mistaken for HTTP access errors',()=>{
+ for(const message of ['FAA export incomplete or changed: 422/429.','FAA export incomplete or changed: 403/410.',
+  'FAA pagination incomplete: loaded 429/500.','FAA sample differs: A0429/26','FAA sample differs: 10/403']){
+  assert.equal(isFaaAccessDenied(new Error(message)),false,message);
+  assert.equal(isFaaRateLimited(new Error(message)),false,message);
+ }
+ assert.equal(isFaaRateLimited(new Error('FAA NOTAM Search HTTP 429')),true);
+ assert.equal(isFaaAccessDenied(new Error('Response status code: 403')),true);
+ assert.equal(isFaaAccessDenied({httpStatus:403,message:'upstream'}),true);
+ assert.equal(isFaaRateLimited({status:429,message:'upstream'}),true);
+});
 import assert from 'node:assert/strict';
 import { selectFaaTransport, readFaaSearchResponse, faaHttpError, validateFaaSearchPayload } from '../faa-notam-access.mjs';
 const valid={notamList:[{notamNumber:'A1/26'}],totalNotamCount:1};

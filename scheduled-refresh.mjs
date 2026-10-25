@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { unpackPublicData } from './public-data-persistence.mjs';
 import { DAILY_RETRY_DELAY_MS, MAX_DAILY_ATTEMPTS } from './daily-refresh-policy.mjs';
+import { preparedNotamFiles, copyPreparedNotam } from './prepared-notam.mjs';
 
 export const DAILY_SOURCES = {
   notam: { cache: 'faa_notam_cache.json', directory: 'faa_notam_snapshots' },
@@ -93,6 +94,8 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
   const index = readJson(join(directory, INDEX_FILE), { version: 3, sources: { notam: [], hydropac: [], navarea: [], msa: [], satellite: [] } });
   if (index.version !== 3 || !index.sources) throw new Error('Existing history index needs migration before daily import');
   const operations = [], imported = [];
+  let updatePreparedManifest=false;
+  const prepared=preparedNotamFiles(staging);
   for (const [source, config] of Object.entries(DAILY_SOURCES)) {
     const records = incoming.sources[source] ?? (source === 'msa' ? [] : undefined);
     if (!Array.isArray(records) || records.length > 1) throw new Error(`Invalid ${source} daily history`);
@@ -109,12 +112,15 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
     const newest = stored.reduce((time, item) => Math.max(time, Date.parse(item.savedAt) || 0), 0);
     operations.push({ from: join(staging, relative), to: join(directory, relative) });
     if (Date.parse(record.savedAt) > newest) operations.push({ from: join(staging, config.cache), to: join(directory, config.cache) });
+    if(source==='notam'&&Date.parse(record.savedAt)>newest)updatePreparedManifest=true;
     index.sources[source] = [{ ...record, automatic: !incoming.dailyReport?.manualRequestId, dailyAsset: assetName }, ...stored.filter(item => item.id !== record.id)].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
     imported.push(source);
   }
   if (!imported.length && !results) throw new Error('Daily archive has no successful sources');
   if (results && (results.some(row => (row.status === 'success') !== imported.includes(row.source)) ||
     imported.some(source => !results.some(row => row.source === source && row.status === 'success')))) throw new Error('Daily outcome does not match saved sources');
+  if(prepared.length&&!imported.includes('notam'))throw Error('Prepared responses without NOTAM snapshot');
+  if(prepared.length)copyPreparedNotam(staging,directory,{current:updatePreparedManifest});
   for (const item of operations) {
     mkdirSync(join(item.to, '..'), { recursive: true });
     renameSync(item.from, item.to);
@@ -235,6 +241,7 @@ export function createScheduledRefresh({ directory, repository, enabled = false,
         const downloaded = join(staging, DAILY_SOURCES[source].directory, id);
         if (!existsSync(downloaded)) throw new Error('Daily history body missing');
         mkdirSync(join(target, '..'), { recursive: true }); renameSync(downloaded, target);
+        if(source==='notam')copyPreparedNotam(staging,directory,{current:false});
         trimDailyBodies(directory, current, id);
       } finally { await rm(staging, { recursive: true, force: true }); }
     })().finally(() => downloads.delete(key));

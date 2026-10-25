@@ -52,6 +52,12 @@ test('changing totals fail after a bounded retry',async()=>{
 test('export HTTP 403 is not blindly retried',async()=>{
  let downloads=0;await assert.rejects(collectFaaExportBatch({query:{code:'PHZH'},getMetadata:async()=>metadata,download:async()=>{downloads++;throw faaHttpError(403);}}),e=>e.code==='FAA_ACCESS_DENIED');assert.equal(downloads,1);
 });
+test('an export total of 429 is retried as a completeness failure, not treated as an HTTP rate limit',async()=>{
+ let downloads=0;
+ await assert.rejects(collectFaaExportBatch({query:{code:'PHZH'},getMetadata:async()=>({...metadata,totalNotamCount:429}),
+  download:async()=>{downloads++;return bytes;}}),/13\/429/);
+ assert.equal(downloads,2);
+});
 test('genuinely empty FIR still needs two matching official metadata checks',async()=>{
  let checks=0;const r=await collectFaaExportBatch({query:{code:'EMPTY'},getMetadata:async()=>{checks++;return{notamList:[],totalNotamCount:0};},download:async()=>{throw Error('must not download');}});assert.equal(checks,2);assert.equal(r.loadedCount,0);
 });

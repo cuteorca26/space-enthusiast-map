@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { pipeline } from 'node:stream/promises';
@@ -9,6 +9,7 @@ import { replace } from 'stream-json/filters/replace.js';
 import { pick } from 'stream-json/filters/pick.js';
 import { streamValues } from 'stream-json/streamers/stream-values.js';
 import { fileRevision } from './history-derived-cache.mjs';
+import { preparedNotamFiles } from './prepared-notam.mjs';
 
 // Only our own saved snapshots enter this parser. Keep one notice in memory,
 // using exactly the same geometry and time rules as the ordinary history path.
@@ -140,13 +141,14 @@ export async function streamNotamResponse({ path, directory, version, id, curren
 }
 
 function trimStreamedCache(directory, keep) {
+  const published=new Set(preparedNotamFiles(dirname(directory)).map(name=>join(directory,name)));
   const files = readdirSync(directory).filter(name => /^[a-f0-9]{64}\.json$/.test(name)).map(name => {
     const path = join(directory, name), stat = statSync(path); return { path, size: stat.size, time: stat.mtimeMs };
   }).sort((a, b) => b.time - a.time);
   let size = 0;
   for (const file of files) {
     size += file.size;
-    if (size > 512 * 1024 * 1024 && file.path !== keep) {
+    if (size > 512 * 1024 * 1024 && file.path !== keep && !published.has(file.path)) {
       try { unlinkSync(file.path); unlinkSync(file.path.replace(/\.json$/, '.meta.json')); } catch {}
     }
   }

@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGzip, createGunzip } from 'node:zlib';
+import { preparedNotamFiles, PREPARED_NOTAM_DIRECTORY, PREPARED_NOTAM_MANIFEST } from './prepared-notam.mjs';
 
 const MAGIC = Buffer.from('SPACE-MAP-DATA-1\n');
 const MAX_ARCHIVE = 1900 * 1024 * 1024;
@@ -16,14 +17,14 @@ const CACHE_FILES = new Set(['faa_notam_cache.json', 'faa_fir_designators_cache.
 const SNAPSHOTS = /^(faa_notam_snapshots|hydropac_snapshots|msa_nav_warning_snapshots|navarea_warning_snapshots|satellite_catalog_snapshots)\/[\w.-]+\.json$/;
 export function isPublicDataPath(path) {
   return typeof path === 'string' && !path.includes('..') && !path.includes('\\') &&
-    (CACHE_FILES.has(path) || SNAPSHOTS.test(path) || /^cloud_cache\/gmgsi\/\d{10}\.nc$/.test(path));
+    (CACHE_FILES.has(path) || path===PREPARED_NOTAM_MANIFEST || /^derived_notam_stream_v1\/[a-f0-9]{64}(?:\.meta)?\.json$/.test(path) || SNAPSHOTS.test(path) || /^cloud_cache\/gmgsi\/\d{10}\.nc$/.test(path));
 }
 async function publicFiles(directory, prefix = '') {
   const result = [];
   for (const entry of await readdir(join(directory, prefix), { withFileTypes: true })) {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (entry.isFile() && isPublicDataPath(path)) result.push(path);
-    else if (entry.isDirectory() && /^(cloud_cache(?:\/gmgsi)?|faa_notam_snapshots|hydropac_snapshots|msa_nav_warning_snapshots|navarea_warning_snapshots|satellite_catalog_snapshots)$/.test(path))
+    else if (entry.isDirectory() && /^(derived_notam_stream_v1|cloud_cache(?:\/gmgsi)?|faa_notam_snapshots|hydropac_snapshots|msa_nav_warning_snapshots|navarea_warning_snapshots|satellite_catalog_snapshots)$/.test(path))
       result.push(...await publicFiles(directory, path));
   }
   return result.sort();
@@ -40,7 +41,8 @@ export async function packPublicData(directory, output) {
     for (const [source, records] of Object.entries(index.sources || {}))
       for (const record of records || []) if (dirs[source] && /^daily-\d{4}-\d{14}-\d+-\d+-[a-f0-9]{64}\.pack\.gz$/.test(record.dailyAsset || '')) external.add(`${dirs[source]}/${record.id}`);
   } catch { /* A missing index never excludes legacy history files. */ }
-  const paths = (await publicFiles(directory)).filter(path => !external.has(path));
+  const prepared=new Set(preparedNotamFiles(directory).map(name=>`${PREPARED_NOTAM_DIRECTORY}/${name}`));
+  const paths = (await publicFiles(directory)).filter(path => !external.has(path) && (!path.startsWith(PREPARED_NOTAM_DIRECTORY+'/') || prepared.has(path)));
   if (paths.length > 3000) throw new Error('Public snapshot file limit reached');
   let total = 0;
   async function* records() {
@@ -270,7 +272,10 @@ export function createPublicDataPersistence({ directory, enabled = false, reposi
   ready.then(() => {
     if (!writable || stopped) return;
     try {
-      watcher = watch(directory, { recursive: true }, (event, file) => { if (isPublicDataPath(String(file || '').replaceAll('\\', '/'))) schedule(); });
+      watcher = watch(directory, { recursive: true }, (event, file) => {
+        const path=String(file || '').replaceAll('\\', '/');
+        if(isPublicDataPath(path)&&!path.startsWith(PREPARED_NOTAM_DIRECTORY+'/'))schedule();
+      });
       watcher.on('error', () => { lastError = 'Public data watcher failed'; });
       schedule();
     } catch { lastError = 'Public data watcher failed'; }

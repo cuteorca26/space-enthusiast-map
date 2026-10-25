@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { packPublicData } from '../public-data-persistence.mjs';
 import { DAILY_SOURCES, dailyAssetName } from '../scheduled-refresh.mjs';
 import { runDailySource } from '../daily-refresh-policy.mjs';
+import { copyPreparedNotam } from '../prepared-notam.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const repository = process.env.GITHUB_REPOSITORY, token = process.env.GITHUB_TOKEN;
@@ -72,6 +73,7 @@ try {
         await copyFile(join(currentDirectory, config.cache), join(bundle, config.cache));
         await mkdir(join(bundle, config.directory));
         await copyFile(join(currentDirectory, config.directory, record.id), join(bundle, config.directory, record.id));
+        if(source==='notam')copyPreparedNotam(currentDirectory,bundle);
       }
       await writeFile(join(bundle, 'refresh_history_index.json'), JSON.stringify(combined));
       const archive = join(temporary, `daily-${outcome.attempt}.pack.gz`);

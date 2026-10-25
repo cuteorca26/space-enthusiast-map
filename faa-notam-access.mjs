@@ -1,11 +1,13 @@
 // Shared policy for the public FAA search transports. No credentials or response
 // HTML are retained in diagnostics; only status, transport and reference number.
 export function isFaaAccessDenied(error) {
-  return error?.code === 'FAA_ACCESS_DENIED' || /\b403\b|Access\s+Denied/i.test(error?.message || String(error || ''));
+  return error?.code === 'FAA_ACCESS_DENIED' || error?.httpStatus===403 || error?.status===403 ||
+    /\bAccess\s+Denied\b|\b(?:HTTP(?:\/[\d.]+)?|status(?:\s+code)?)\s*[:=]?\s*403\b|\(403\)\s*Forbidden|^\s*(?:Error:\s*)?403(?:\s|$)/i.test(error?.message || String(error || ''));
 }
 
 export function isFaaRateLimited(error) {
-  return error?.code === 'FAA_RATE_LIMITED' || /\b429\b|Too Many Requests/i.test(error?.message || String(error || ''));
+  return error?.code === 'FAA_RATE_LIMITED' || error?.httpStatus===429 || error?.status===429 ||
+    /\bToo Many Requests\b|\b(?:HTTP(?:\/[\d.]+)?|status(?:\s+code)?)\s*[:=]?\s*429\b|^\s*(?:Error:\s*)?429(?:\s|$)/i.test(error?.message || String(error || ''));
 }
 
 export function faaHttpError(status, text = '', retryAfter = '', now = Date.now()) {
