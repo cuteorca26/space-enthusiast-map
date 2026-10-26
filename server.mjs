@@ -617,6 +617,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "HEAD") res.end();
     else createReadStream(filePath).pipe(res);
   } catch (error) {
+    // A visitor may close a tab while a large streamed replay is computing.
+    // Never send a second set of headers or reject this async HTTP listener.
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) { res.destroy(); return; }
     console.error(`Request failed: ${req.method || "GET"} ${req.url || "/"}`, error instanceof Error ? error.stack || error.message : String(error));
     sendJson(res, Number(error?.status) || 500, {
       error: "server_error",

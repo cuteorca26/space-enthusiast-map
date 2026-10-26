@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +17,7 @@ test('cloud-mode server starts and serves the complete app and API without local
   const data = await mkdtemp(join(tmpdir(), 'space-map-server-'));
   const child = spawn(process.execPath, ['--expose-gc', '--max-old-space-size=256', 'server.mjs'], { cwd: root, windowsHide: true,
     env: { ...process.env, HOST: '0.0.0.0', PORT: String(port), DATA_DIR: data, BALLISTIC_WORKERS: '1',
-      ADMIN_SECRET_SHA256: '', PUBLIC_DATA_REPOSITORY: '', GITHUB_DATA_TOKEN: '' } });
+      ADMIN_SECRET_SHA256: '', PUBLIC_DATA_REPOSITORY: '', GITHUB_DATA_TOKEN: '', MEMORY_BUDGET_MODE: '1' } });
   let log = '';
   child.stdout.on('data', chunk => { log += chunk; });
   child.stderr.on('data', chunk => { log += chunk; });
@@ -70,4 +71,18 @@ test('cloud-mode server starts and serves the complete app and API without local
   assert.equal(blocked.status, 403);
   const oversized = await fetch(`${base}/api/notam/parse`, { method: 'POST', body: 'x'.repeat(1024 * 1024 + 1) });
   assert.equal(oversized.status, 413);
+  // A visitor closing a large replay must never terminate the shared server.
+  await mkdir(join(data, 'faa_notam_snapshots'), { recursive: true });
+  await writeFile(join(data, 'faa_notam_snapshots', 'abort.json'), JSON.stringify({ savedAt: new Date().toISOString(),
+    data: { restrictions: [{ id: 'transport-fixture', rawText: 'x'.repeat(8 * 1024 * 1024) }], skipped: [] } }));
+  await new Promise((resolve, reject) => {
+    const request = httpGet(base + '/api/refresh-history/item?source=notam&id=abort.json', response => {
+      response.once('data', () => { response.destroy(); request.destroy(); resolve(); });
+      response.once('error', () => {});
+    });
+    request.on('error', error => { if (error.code !== 'ECONNRESET') reject(error); });
+  });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(child.exitCode, null, log);
+  assert.equal((await fetch(base + '/api/health')).status, 200);
 });
