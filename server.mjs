@@ -453,7 +453,9 @@ const memoryBudget = new MemoryBudgetQueue({
   enabled: onlineDeployment && process.env.MEMORY_BUDGET_MODE !== "0",
   release: releaseWorkingCaches,
 });
-const cachedReadBudget = new MemoryBudgetQueue({ enabled: memoryBudget.enabled, release: releaseWorkingCaches });
+// External warning collectors do not occupy this queue. All local decoding,
+// including catalogue and historical reads, shares one memory budget.
+const cachedReadBudget = memoryBudget;
 
 async function releaseWorkingCaches() {
     for (const [key, cached] of aggregateCache) aggregateStatusMetadata.set(key, restrictionStatusMetadata(cached.data, key));
@@ -463,6 +465,7 @@ async function releaseWorkingCaches() {
     satelliteCatalogService.memory = null;
     if (!satelliteLaunchHistoryService.pending) satelliteLaunchHistoryService.memory = null;
     jsonResponseCache = new WeakMap();
+    if (memoryBudget.enabled && !historyCompute.current && !historyCompute.queue.length) await historyCompute.close();
     // Let the previous response and background result handlers finish first.
     await new Promise(resolve => setImmediate(resolve));
     globalThis.gc?.();
@@ -2457,7 +2460,17 @@ async function buildRefreshHistoryListAsync({ wait = true } = {}) {
           const records = [], candidates = existsSync(directory) ? readdirSync(directory).filter(name => name.endsWith(".json")).map(id => ({ source, path: join(directory, id), id, latest: false })) : [];
           if (latest && existsSync(latest)) candidates.push({ source, path: latest, id: "latest-cache.json", latest: true });
           for (const candidate of candidates) {
-            const record = await historyCompute.run("history-summary", candidate);
+            // Immutable snapshots already have capture-time summaries. A v3→v4
+            // inventory migration must discover missing files without decoding
+            // every existing catalogue/NOTAM again on the 512 MB public host.
+            const saved = before.get(candidate.id);
+            const reusable = onlineDeployment && !candidate.latest && saved?.source === source &&
+              Number.isFinite(Date.parse(saved.savedAt)) && Number.isFinite(saved.total) &&
+              Number.isFinite(saved.drawable) && saved.total >= saved.drawable && saved.drawable >= 0;
+            const record = reusable ? saved : await cachedReadBudget.run("history-summary", async () => {
+              try { return await historyCompute.run("history-summary", candidate); }
+              finally { if (memoryBudget.enabled) await releaseWorkingCaches(); }
+            }, { fresh: true });
             if (record && existsSync(candidate.path) && (!candidate.latest || !records.some(item => item.dataVersion === record.dataVersion || item.savedAt === record.savedAt))) records.push(record);
           }
           // A refresh or deletion may happen while the worker runs: preserve newer records.

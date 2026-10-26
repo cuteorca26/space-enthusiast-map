@@ -92,7 +92,9 @@ export function applyDailyArchive(directory, staging, assetName, now = new Date(
   const results = incoming.dailyReport?.results;
   validateDailyReport(incoming.dailyReport);
   const index = readJson(join(directory, INDEX_FILE), { version: 3, sources: { notam: [], hydropac: [], navarea: [], msa: [], satellite: [] } });
-  if (index.version !== 3 || !index.sources) throw new Error('Existing history index needs migration before daily import');
+  // The web app's v4 adds scan provenance; v3 collector archives remain valid.
+  // Preserve that provenance and every existing source when importing a batch.
+  if (![3, 4].includes(index.version) || !index.sources) throw new Error('Existing history index needs migration before daily import');
   const operations = [], imported = [];
   let updatePreparedManifest=false;
   const prepared=preparedNotamFiles(staging);

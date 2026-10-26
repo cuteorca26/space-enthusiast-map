@@ -56,6 +56,20 @@ test('daily import preserves exact source text, times and geometry; repeated che
   assert.equal(index.sources.navarea.length, 1); assert.equal(index.sources.navarea[0].automatic, true);
 });
 
+test('daily v3 archives import into v4 indexes without losing scan provenance or existing history', async t => {
+  const f = await fixture(t, { sources: ['hydropac'] });
+  const satellite = { id: 'satellite-existing.json', source: 'satellite', total: 33314, drawable: 33314 };
+  const previous = { id: 'old.json', source: 'hydropac', savedAt: '2026-10-01T00:00:00Z', total: 5, drawable: 2 };
+  await writeFile(join(f.target, 'refresh_history_index.json'), JSON.stringify({ version: 4, scanComplete: true,
+    sources: { notam: [], hydropac: [previous], navarea: [], msa: [], satellite: [satellite] } }));
+  const result = await f.client().check(); assert.equal(result.error, false);
+  const index = JSON.parse(await readFile(join(f.target, 'refresh_history_index.json')));
+  assert.equal(index.version, 4); assert.equal(index.scanComplete, true);
+  assert.deepEqual(index.sources.satellite, [satellite]);
+  assert.deepEqual(index.sources.hydropac[1], previous);
+  assert.equal(index.sources.hydropac[0].dailyAsset, f.name);
+});
+
 test('an entirely failed day publishes its outcome without replacing any saved data', async t => {
   const f = await fixture(t, { sources: [] });
   const old = Buffer.from('{"data":"previous complete cache"}');
