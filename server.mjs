@@ -3935,7 +3935,12 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
   const output = [];
   const coverage = [];
   await mapLimit(columns, 4, async (column) => {
+    const recoveredPaginationErrors = [];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+    const columnItems = [];
     const entry = {
+      paginationAttempts: attempt,
+      recoveredPaginationErrors: [...recoveredPaginationErrors],
       bureau: column.bureau,
       url: column.url,
       paged: Boolean(column.paged),
@@ -3949,7 +3954,6 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
       errors: [],
       cutoffTime: new Date(cutoffMs).toISOString(),
     };
-    coverage.push(entry);
     let page = 1;
     let pageCount = 1;
     const seenPages=new Set();
@@ -3963,7 +3967,6 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
       } catch (error) {
         const message = `${column.bureau || "MSA"} list page ${page}: ${error instanceof Error ? error.message : String(error)}`;
         entry.errors.push(message);
-        sourceErrors.push(message);
         entry.stopReason = "fetch-error";
         break;
       }
@@ -3976,15 +3979,15 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
       const overlap=items.some(i=>seenItems.has(canonicalMsaUrl(i.url)));
       if(overlap||(Number.isFinite(initialTotal)&&advertised!==initialTotal)){
         const message=`${column.bureau} list page ${page}: ${overlap?'overlapping page items':'pagination total changed during refresh'}`;
-        sourceErrors.push(message);entry.errors.push(message);entry.stopReason='invalid-pagination';break;
+        entry.errors.push(message);entry.stopReason='invalid-pagination';break;
       }
       if((!items.length&&advertised!==0)||(pageKey&&seenPages.has(pageKey))){
         const message=`${column.bureau} list page ${page}: ${!items.length?'unrecognized or unexpectedly empty list':'duplicate pagination response'}`;
-        sourceErrors.push(message);entry.errors.push(message);entry.stopReason='invalid-page';break;
+        entry.errors.push(message);entry.stopReason='invalid-page';break;
       }
       if(column.paged&&!/pageParam\.count\s*=\s*\d+/i.test(html)){
         const message=`${column.bureau} list page ${page}: pagination total missing`;
-        sourceErrors.push(message);entry.errors.push(message);entry.stopReason='invalid-pagination';break;
+        entry.errors.push(message);entry.stopReason='invalid-pagination';break;
       }
       seenPages.add(pageKey);
       for(const item of items)seenItems.add(canonicalMsaUrl(item.url));
@@ -3998,7 +4001,7 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
         latestPublishDate: pageDates.latest || "",
         oldestPublishDate: pageDates.oldest || "",
       });
-      output.push(...items);
+      columnItems.push(...items);
       if (!items.length) {
         entry.stopReason = "empty-page";
         break;
@@ -4019,12 +4022,23 @@ async function fetchMsaWarningListItems(columns, sourceErrors = [], options = {}
       if (page >= MSA_NAV_WARNING_MAX_PAGES_PER_BUREAU) {
         entry.stopReason = "max-pages";
         const message=`${column.bureau}: page limit reached before requested lookback was covered`;
-        sourceErrors.push(message);entry.errors.push(message);
+        entry.errors.push(message);
         break;
       }
       page += 1;
     }
     if (!entry.stopReason) entry.stopReason = page > pageCount ? "page-end" : "max-pages";
+    // Newly published notices can shift page boundaries between two requests.
+    // Restart this bureau from page one, discard the inconsistent pass, and
+    // retain strict overlap/total checks. Never merely deduplicate a broken scan.
+    if (["invalid-pagination", "invalid-page"].includes(entry.stopReason) && attempt < 3) {
+      recoveredPaginationErrors.push(...entry.errors);
+      continue;
+    }
+    sourceErrors.push(...entry.errors);
+    coverage.push(entry); output.push(...columnItems);
+    break;
+    }
   });
   coverage.sort((a, b) => String(a.bureau || "").localeCompare(String(b.bureau || ""), "zh-Hans-CN"));
   return { items: output, coverage };

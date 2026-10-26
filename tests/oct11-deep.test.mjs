@@ -57,3 +57,18 @@ test('MSA retains table coordinates outside p tags and excludes sharing footer',
  const d=parseMsaWarningDetail(html,{title:'航警1/26',url:'https://www.msa.gov.cn/test.html'});assert.ok(!d.rawText.includes('微信'));assert.equal(parts(parseMsaWarningGeometry(d.rawText)),1);
 });
 test('MSA successful HTTP error body is rejected as invalid detail',()=>assert.throws(()=>parseMsaWarningDetail('<p>Access denied</p>',{title:'航警',url:'https://www.msa.gov.cn/test.html'})));
+test('MSA restarts a shifted bureau and discards every row from its inconsistent pass',async()=>{
+ let pass=0;const errors=[];const d=await fetchMsaWarningListItems([column],errors,{cutoffMs:Date.parse('2026-01-01'),fetchPage:async url=>{
+  if(!url.includes('_2')){pass++;return listing(pass===1?[1,2]:[0,1]);}
+  return listing(pass===1?[2,3]:[2,3]);
+ }});
+ assert.equal(pass,2);assert.deepEqual(errors,[]);assert.equal(d.items.length,4);
+ assert.deepEqual(d.items.map(i=>i.title),['航警0','航警1','航警2','航警3']);
+ assert.equal(d.coverage[0].paginationAttempts,2);assert.equal(d.coverage[0].recoveredPaginationErrors.length,1);
+});
+test('MSA persistently shifted pagination is still incomplete after three bounded scans',async()=>{
+ let pass=0;const errors=[];const d=await fetchMsaWarningListItems([column],errors,{cutoffMs:Date.parse('2026-01-01'),fetchPage:async url=>{
+  if(!url.includes('_2'))pass++;return listing(url.includes('_2')?[2,3]:[1,2]);
+ }});
+ assert.equal(pass,3);assert.equal(errors.length,1);assert.equal(d.coverage[0].stopReason,'invalid-pagination');assert.equal(d.items.length,2);
+});
