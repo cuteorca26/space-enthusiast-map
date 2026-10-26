@@ -56,3 +56,14 @@ test('dispatch rejection and missing token fail safely without revealing upstrea
  assert(!JSON.stringify(f.client.status()).includes('secret details'));
  const noToken=await fixture(t,{token:''});await assert.rejects(noToken.client.start(),/凭据/);assert.equal(noToken.requests.length,0);
 });
+
+for(const source of ['hydropac','navarea','msa'])test(`${source} manual collection has its own durable request and completion identity`,async t=>{
+ const f=await fixture(t,{source});const start=await f.client.start();
+ const body=JSON.parse(f.requests[0].init.body);assert.equal(body.event_type,'manual-warning-refresh');assert.equal(body.client_payload.source,source);
+ const archive=join(f.directory,'backup.gz'),packed=await packPublicData(f.directory,archive);
+ const restored=join(f.directory,'restored');await mkdir(restored);await unpackPublicData(createReadStream(archive),restored,packed.sha256);
+ const restarted=createCloudNotamRefresh({...f.options,directory:restored});assert.equal(restarted.status().requestId,start.requestId);
+ await f.report(start.requestId,{source,status:'success',total:99,finishedAt:'2026-10-25T09:05:00Z'});
+ assert.equal(f.client.status().active,false);assert.equal(f.client.status().lastRefresh.status,'success');
+ assert.match(f.client.status().message,/全量刷新完成/);
+});

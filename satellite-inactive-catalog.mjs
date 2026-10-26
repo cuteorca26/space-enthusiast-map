@@ -1,6 +1,8 @@
 import JSZip from "jszip";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import catalogIds from "./frontend/satellite-catalog-id.js";
+export const normalizeCatalogId = catalogIds.normalizeCatalogId;
 
 const execFileAsync = promisify(execFile);
 
@@ -324,11 +326,6 @@ function parseTleExponent(value) {
 function finiteNumber(value) {
   const number = Number(String(value ?? "").trim());
   return Number.isFinite(number) ? number : NaN;
-}
-
-function normalizeCatalogId(value) {
-  const text = String(value ?? "").trim();
-  return /^\d+$/.test(text) ? (text.replace(/^0+(?=\d)/, "") || "0") : text;
 }
 
 function delay(milliseconds) {

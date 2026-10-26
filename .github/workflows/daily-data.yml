@@ -1,8 +1,8 @@
 name: Daily full warning refresh
-run-name: ${{ github.event_name == 'repository_dispatch' && format('Manual NOTAM {0}', github.event.client_payload.requestId) || 'Daily full warning refresh' }}
+run-name: ${{ github.event_name == 'repository_dispatch' && format('Manual {0} {1}', github.event.client_payload.source || 'notam', github.event.client_payload.requestId) || 'Daily full warning refresh' }}
 on:
   repository_dispatch:
-    types: [manual-notam-refresh]
+    types: [manual-notam-refresh, manual-warning-refresh]
   schedule:
     # UTC 07:37 = Beijing 15:37, every 24 hours.
     - cron: '37 7 * * *'
@@ -16,19 +16,19 @@ on:
 permissions:
   contents: write
   actions: read
-concurrency:
-  group: daily-full-warning-refresh-${{ github.event_name == 'repository_dispatch' && 'notam' || inputs.source || 'all' }}
-  cancel-in-progress: false
 jobs:
   refresh:
-    if: github.repository == 'cuteorca26/space-enthusiast-map'
+    if: github.repository == 'cuteorca26/space-enthusiast-map' && (github.event_name != 'repository_dispatch' || contains(fromJSON('["notam","navarea","hydropac","msa"]'), github.event.client_payload.source || 'notam'))
     runs-on: ubuntu-latest
     # 3 x 45 min collection + 2 x 60 min waiting, with room for publishing.
     timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
-        source: ${{ fromJSON(github.event_name == 'repository_dispatch' && '["notam"]' || inputs.source != '' && inputs.source != 'all' && format('["{0}"]', inputs.source) || '["notam","navarea","hydropac","msa"]') }}
+        source: ${{ fromJSON(github.event_name == 'repository_dispatch' && format('["{0}"]', github.event.client_payload.source || 'notam') || inputs.source != '' && inputs.source != 'all' && format('["{0}"]', inputs.source) || '["notam","navarea","hydropac","msa"]') }}
+    concurrency:
+      group: warning-source-${{ matrix.source }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v6
         with:

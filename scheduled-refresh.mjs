@@ -41,7 +41,7 @@ function validateDailyReport(report) {
   if (report.version === 1 && [3, 4].includes(rows.length)) return;
   if (report.version !== 2 || !/^\d+-\d+$/.test(report.cycleId) || !Number.isFinite(Date.parse(report.cycleStartedAt)))
     throw new Error('Invalid daily cycle');
-  if (report.manualRequestId !== undefined && (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(report.manualRequestId) || rows.length!==1 || rows[0].source!=='notam'))
+  if (report.manualRequestId !== undefined && (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(report.manualRequestId) || rows.length!==1))
     throw new Error('Invalid manual refresh identity');
   for (const row of rows) {
     const start = Date.parse(row.startedAt), end = Date.parse(row.finishedAt);

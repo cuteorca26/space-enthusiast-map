@@ -52,7 +52,7 @@ test('collection exceptions participate in hourly retries; a new daily cycle res
 });
 test('all sources require complete coverage; MSA truncation/detail errors cannot be published as success', () => {
   assert.doesNotThrow(() => assertCompleteScheduledSource({ status: 'ok', coverageWarnings: [], sourceErrors: [] }));
-  for (const field of [{ cacheFallback: true }, { partialRefresh: true }, { failedFirs: ['KZNY'] }, { capped: true },
+  for (const field of [{ cacheFallback: true }, { partialRefresh: true }, { refreshIncomplete: true }, { failedFirs: ['KZNY'] }, { capped: true },
     { coverageWarnings: [{ bureau: '天津', truncatedWithinLookback: true }] }, { sourceErrors: ['missing detail page'] }, { status: 'warn' }])
     assert.throws(() => assertCompleteScheduledSource({ status: 'ok', ...field }));
 });

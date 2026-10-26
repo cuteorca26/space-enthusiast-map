@@ -3,6 +3,8 @@
 
   // Human-reviewed terminology takes precedence over the legacy generated catalog.
   root.NOTAM_EN_REVIEWED_TRANSLATIONS = Object.freeze({
+    "海阳东方航天港": "Haiyang Oriental Spaceport",
+    "海阳东方航天港（日照海上发射点）": "Haiyang Oriental Spaceport (Rizhao offshore launch site)",
     "正在计算完整弹道，请稍候。": "Calculating the complete trajectory. Please wait.",
     "已保存区域": "Saved areas",
     "原始 NOTAM": "Original NOTAM",

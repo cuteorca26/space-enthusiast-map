@@ -1,0 +1,46 @@
+[
+  {
+    "source": "notam",
+    "id": "10/291",
+    "rawText": "!CARF 10/291 ZWY AIRSPACE STNR ALT RESERVATION SCORE (OAK ALPHA) WI THE NEW YORK OCEANIC CTA/FIR ZNY WILL NOT ACCEPT IFR FLIGHTS WI AN AREA DEFINED AS 384600N0723000W TO 390700N0715300W TO 384100N0715500W TO 382000N0695700W TO 383000N0690000W TO 370000N0690000W TO 370000N0724000W TO 371500N0724000W TO 375700N0730000W TO 382000N0724800W TO POINT OF ORIGIN. SFC-FL210 AND WI AN AREA DEFINED AS (HAWKEYE 3) 380000N0721000W TO 380000N0714000W TO 370000N0713000W TO 370000N0724000W TO POINT OF ORIGIN. SFC-240 2610271400-2610271900",
+    "url": "https://notams.aim.faa.gov/notamSearch/",
+    "parts": 0,
+    "reason": "坐标顺序形成自交多边形，未绘制",
+    "complete": false,
+    "oldDrawable": false,
+    "coordinateCount": 14
+  },
+  {
+    "source": "notam",
+    "id": "L5003/26",
+    "rawText": "L5003/26 NOTAMN\r\nQ) CZVR/QRTCA/IV/BO/W/000/010/5401N12841W003\r\nA) CZVR B) 2610221832 C) 2701201700EST\r\nE) DESIGNATED AIRSPACE HANDBOOK (DAH) IS AMENDED AS FLW:\r\nCYR167 KITIMAT, BC. CLASS F RESTRICTED AISRAPCE IS ESTABLISHED\r\nWITHIN\r\nN540152 W1284141\r\nN540152 W1284108\r\nN540115 W1284009\r\nN535932 W1284028\r\nN535929 W1284117 TO POINT OF ORIGIN.\r\n(CENTRE APRX 10NM S KITIMAT AD (CBW2)).\r\nNO PERSON SHALL OPR AN ACFT,\r\nWITHIN THE AREA DESCRIBED UNLESS AUTH BY \r\nUSER/CONTROLLING AGENCY,\r\nLNG CANADA LOGISTICS SECTION CHIEF (DUTY) (778) 876-7013\r\nF) SFC G) 1000FT AMSL",
+    "url": "https://notams.aim.faa.gov/notamSearch/",
+    "parts": 0,
+    "reason": "Invalid coordinate field in boundary; vertices were not skipped or guessed.",
+    "complete": false,
+    "oldDrawable": false,
+    "coordinateCount": 5
+  },
+  {
+    "source": "notam",
+    "id": "A4338/26",
+    "rawText": "A4338/26 NOTAMN\r\nQ) SACF/QWPLW/IV/M/W/000/120/3123S06419W002\r\nA) SACF\r\nB) 2610260900 C) 2610310259\r\nD) DLY 0900-0259\r\nE) PJE WILL TAKE PLACE IN LA MEZQUITA -CORDOBA- COORD GEO 312209S/0641533W 312632S/0641706W 312530S/0642251W 312055S/0642107W312209S/0641533W AFFECTS ESCUELA AVIACION ATZ, CORDOBA CTR ,CORDOBA TMA ACT SUBJ TO TFC IN DEVELOPMENT\r\nF) GND G) FL120",
+    "url": "https://notams.aim.faa.gov/notamSearch/",
+    "parts": 0,
+    "reason": "Invalid coordinate field in boundary; vertices were not skipped or guessed.",
+    "complete": false,
+    "oldDrawable": false,
+    "coordinateCount": 4
+  },
+  {
+    "source": "notam",
+    "id": "F3362/26",
+    "rawText": "F3362/26 NOTAMN\r\nQ) EBBU/QRACA/IV/NBO/W /010/020/5112N00212E009\r\nA) EBBU B) 2610280830 C) 2610281330\r\nE) TEMPO SEGREGATED AREA (TSA) OVER NORTH SEA '(TRANSIT) CORRIDOR A' \r\nESTABLISHED 511043N 0020000E - 511717N 0022101E - 511532N 0022311E - \r\n510816N 0020000E - 511043N 0020000E FOR UAS BEYOND VISUAL LINE OF \r\nSIGHT. NON-PARTICIPATING UAS FLT PROHIBITED. REF AIP SUP 032/2026 OR \r\n033/2026\r\nF) 1000FT AMSL G) 2000FT AMSL",
+    "url": "https://notams.aim.faa.gov/notamSearch/",
+    "parts": 0,
+    "reason": "正文是多点线状走廊，需要缓冲线计算，不作普通多边形绘制",
+    "complete": false,
+    "oldDrawable": false,
+    "coordinateCount": 5
+  }
+]

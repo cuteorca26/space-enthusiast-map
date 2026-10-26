@@ -9,9 +9,12 @@ import {
   fetchClassifiedSatelliteTles,
   parseSatcatCsv,
   tleRecordToOmm,
+  normalizeCatalogId,
 } from "./satellite-inactive-catalog.mjs";
 import { normalizeGpEpochUtc, parseGpEpochUtc } from "./orbital-time.mjs";
 import satelliteIdentities from "./frontend/satellite-identities.js";
+import { fetchSatelliteGroups } from "./satellite-groups.mjs";
+import catalogIds from "./frontend/satellite-catalog-id.js";
 
 const CELESTRAK_ACTIVE_OMM_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=ACTIVE&FORMAT=JSON";
 const CELESTRAK_RECENT_OMM_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=LAST-30-DAYS&FORMAT=JSON";
@@ -20,7 +23,7 @@ const EARTH_MU_KM3_S2 = 398600.4418;
 const EARTH_EQUATORIAL_RADIUS_KM = 6378.137;
 const MIN_ACCEPTED_RECORDS = 1000;
 const MIN_BULK_ACCEPTED_RECORDS = 20000;
-const CACHE_SCHEMA_VERSION = 7;
+const CACHE_SCHEMA_VERSION = 9;
 const CLASSIFIED_ACTIVE_MAX_AGE_MS = 120 * 86400000;
 const PUBLIC_CLASSIFIED_NAME_ALIASES = new Map([
   ["39232", "USA 245 · CRYSTAL/KH-11（公开归属）"],
@@ -47,8 +50,12 @@ function isPublicNroAttribution(id, name) {
 }
 
 export class SatelliteCatalogService {
-  constructor(root, dataDirectory = join(root, "data")) {
+  constructor(root, dataDirectory = join(root, "data"), adapters = {}) {
+    this.fetchSource = adapters.fetchSource || fetchSource;
+    this.fetchBulk = adapters.fetchBulk || fetchAllSatelliteTles;
+    this.fetchClassified = adapters.fetchClassified || fetchClassifiedSatelliteTles;
     this.cacheFile = join(dataDirectory, "satellite_catalog_cache.json");
+    this.groupsCacheFile = join(dataDirectory, "satellite_group_membership_cache.json");
     this.inFlight = null;
     this.memory = null;
   }
@@ -72,6 +79,10 @@ export class SatelliteCatalogService {
     }
 
     if (this.inFlight) return this.inFlight;
+    const cacheAge = Date.now() - Date.parse(cached?.cacheSavedAt || cached?.source?.fetchedAt);
+    if (cacheAge >= 0 && cacheAge < 2 * 3600000 && cached?.source?.refreshCompleted && !cached?.source?.optionalErrors?.length) {
+      return { ...cached, source: { ...cached.source, refreshSkipped: true, message: `轨道已于 ${cached.cacheSavedAt} 完整刷新；CelesTrak 每两小时更新一次，本次复用当前更新周期的数据。` } };
+    }
     this.inFlight = this.fetchAndPersist(cached).finally(() => {
       this.inFlight = null;
     });
@@ -93,12 +104,13 @@ export class SatelliteCatalogService {
 
   async fetchAndPersist(stale) {
     try {
-      const [activeResult, recentResult, satcatResult, bulkResult, classifiedResult] = await Promise.allSettled([
-        fetchSource(CELESTRAK_ACTIVE_OMM_URL, { accept: "application/json", responseType: "json", timeoutMs: 600000 }),
-        fetchSource(CELESTRAK_RECENT_OMM_URL, { accept: "application/json", responseType: "json", timeoutMs: 90000 }),
-        fetchSource(CELESTRAK_SATCAT_CSV_URL, { accept: "text/plain, */*", responseType: "text", timeoutMs: 600000 }),
-        fetchAllSatelliteTles(),
-        fetchClassifiedSatelliteTles(),
+      const [activeResult, recentResult, satcatResult, bulkResult, classifiedResult, groupsResult] = await Promise.allSettled([
+        this.fetchSource(CELESTRAK_ACTIVE_OMM_URL, { accept: "application/json", responseType: "json", timeoutMs: 600000 }),
+        this.fetchSource(CELESTRAK_RECENT_OMM_URL, { accept: "application/json", responseType: "json", timeoutMs: 90000 }),
+        this.fetchSource(CELESTRAK_SATCAT_CSV_URL, { accept: "text/plain, */*", responseType: "text", timeoutMs: 600000 }),
+        this.fetchBulk(),
+        this.fetchClassified(),
+        fetchSatelliteGroups(this.groupsCacheFile, this.fetchSource),
       ]);
 
       const satcatRecords = satcatResult.status === "fulfilled" ? parseSatcatCsv(satcatResult.value) : [];
@@ -122,13 +134,13 @@ export class SatelliteCatalogService {
       const activeIds = new Set();
       const analystNamesById = new Map();
       const addElement = (omm, elementSource, sourcePriority = 0) => {
-        const id = String(omm?.NORAD_CAT_ID ?? "").trim();
+        const id = normalizeCatalogId(omm?.NORAD_CAT_ID);
         const epochMs = parseGpEpochUtc(omm?.EPOCH);
         if (!id || !Number.isFinite(epochMs)) return;
         const existing = elementById.get(id);
         const existingEpochMs = parseGpEpochUtc(existing?.omm?.EPOCH);
         if (!existing || epochMs > existingEpochMs || (epochMs === existingEpochMs && sourcePriority > existing.sourcePriority)) {
-          elementById.set(id, { omm, elementSource, sourcePriority });
+          elementById.set(id, { omm: { ...omm, NORAD_CAT_ID: id }, elementSource, sourcePriority });
         }
       };
 
@@ -167,19 +179,22 @@ export class SatelliteCatalogService {
         addElement(omm, "CelesTrak GP / ACTIVE OMM", 3);
       }
 
+      const grouped = groupsResult.status === "fulfilled" ? groupsResult.value : null;
+      for (const omm of grouped?.elements || []) addElement(omm, "CelesTrak GP / 公开系列分组 OMM", 2);
       const satellites = [];
       for (const [id, element] of elementById.entries()) {
         const satcat = satcatById.get(id);
-        if (!isCurrentEarthOrbit(satcat)) continue;
+        if (!isCurrentEarthOrbit(satcat, grouped?.byId.get(id)?.includes("stations"))) continue;
         const preferredName = analystNamesById.get(id);
         const publicAttribution = isPublicNroAttribution(id, preferredName);
-      const normalized = normalizeSatellite(element.omm, {
+        const normalized = normalizeSatellite(element.omm, {
           satcat,
           forceActive: activeIds.has(id),
           elementSource: element.elementSource,
           preferredName,
           owner: publicAttribution ? "US" : "",
           publicAttribution,
+          classificationGroups: grouped?.byId.get(id) || [],
         });
         if (normalized) satellites.push(normalized);
       }
@@ -206,6 +221,8 @@ export class SatelliteCatalogService {
         sourceError("SATCAT", satcatResult),
         sourceError("ALL_TLE", bulkResult),
         sourceError("CLASSFD", classifiedResult),
+        sourceError("SERIES GROUPS", groupsResult),
+        ...(grouped?.errors || []).map(message => `卫星分组未更新：${message}`),
       ].filter(Boolean);
       const payload = {
         schemaVersion: CACHE_SCHEMA_VERSION,
@@ -229,7 +246,8 @@ export class SatelliteCatalogService {
           refreshCompleted: true,
           refreshSkipped: false,
           cacheFallback: !hasCompleteBulk,
-          fetchConcurrency: 5,
+          fetchConcurrency: 7,
+          classificationGroups: grouped?.statuses || [],
           optionalErrors,
           catalogScope: "公开可获得当前 GP/OMM/TLE 的地球在轨对象；保密目标采用公开天文观测轨道并与官方目录分层标注",
           message: `已保存全在轨目录 ${counts.included.toLocaleString("zh-CN")} 个对象：在役载荷 ${counts.ACTIVE_PAYLOAD.toLocaleString("zh-CN")}、退役载荷 ${counts.RETIRED_PAYLOAD.toLocaleString("zh-CN")}、火箭体 ${counts.ROCKET_BODY.toLocaleString("zh-CN")}、残骸 ${counts.DEBRIS.toLocaleString("zh-CN")}。全量 SATCAT ${counts.satcatSourceTotal.toLocaleString("zh-CN")} 条。${optionalErrors.length ? ` ${optionalErrors.join("；")}，其余并行数据源与完整缓存已完成补齐。` : ""}`,
@@ -255,7 +273,7 @@ export class SatelliteCatalogService {
 }
 
 export function normalizeSatellite(omm, metadata = {}) {
-  const noradId = String(omm?.NORAD_CAT_ID ?? "").trim();
+  const noradId = normalizeCatalogId(omm?.NORAD_CAT_ID);
   const satcat = metadata.satcat || {};
   const name = String(metadata.preferredName || satcat.OBJECT_NAME || omm?.OBJECT_NAME || `NORAD ${noradId}`).trim();
   const epoch = normalizeIsoTime(omm?.EPOCH);
@@ -297,8 +315,10 @@ export function normalizeSatellite(omm, metadata = {}) {
     operationalStatusLabel: operationalStatusLabel(operationalStatusCode),
     owner: String(satcat.OWNER || metadata.owner || "").trim(),
     launchDate: String(satcat.LAUNCH_DATE || "").trim(),
+    dockedTo: String(satcat.ORBIT_TYPE || "").toUpperCase() === "DOC" ? String(satcat.ORBIT_CENTER || "") : "",
     elementSource: String(metadata.elementSource || "CelesTrak GP / ACTIVE OMM"),
     publicAttribution: Boolean(metadata.publicAttribution),
+    classificationGroups: metadata.classificationGroups || [],
     periodMinutes: round(periodMinutes, 4),
     semiMajorKm: round(semiMajorKm, 3),
     perigeeKm: round(perigeeKm, 3),
@@ -341,7 +361,7 @@ function compactOmm(omm, fallback) {
   };
 }
 
-function countOrbitClasses(satellites, sourceStats = {}) {
+export function countOrbitClasses(satellites, sourceStats = {}) {
   const counts = {
     sourceTotal: Math.max(Number(sourceStats.bulkSourceTotal || 0), satellites.length),
     bulkSourceTotal: Number(sourceStats.bulkSourceTotal || 0),
@@ -459,9 +479,10 @@ function objectTypeLabel(type) {
   return ({ PAYLOAD: "卫星载荷", ROCKET_BODY: "火箭体", DEBRIS: "空间残骸", UNKNOWN: "未知对象" })[type] || "未知对象";
 }
 
-function isCurrentEarthOrbit(satcat) {
+export function isCurrentEarthOrbit(satcat, includeDocked = false) {
   if (!satcat || !Object.keys(satcat).length) return true;
   if (String(satcat.DECAY_DATE || "").trim()) return false;
+  if (includeDocked && String(satcat.ORBIT_TYPE).toUpperCase() === "DOC" && /^\d+$/.test(String(satcat.ORBIT_CENTER))) return true;
   if (String(satcat.ORBIT_CENTER || "EA").trim().toUpperCase() !== "EA") return false;
   return String(satcat.ORBIT_TYPE || "ORB").trim().toUpperCase() === "ORB";
 }
@@ -516,7 +537,7 @@ async function fetchSource(url, options = {}) {
         "--silent",
         "--show-error",
         "--compressed",
-        "--retry", "3",
+        "--retry", String(options.retries ?? 0),
         "--retry-delay", "2",
         "--retry-all-errors",
         "--connect-timeout", "15",
@@ -578,7 +599,9 @@ function normalizeIsoTime(value) {
 function normalizeCachedCatalogEpochs(payload) {
   if (!Array.isArray(payload?.satellites)) return payload;
   let changed = Number(payload.schemaVersion) < CACHE_SCHEMA_VERSION;
-  const satellites = payload.satellites.map((item) => {
+  const canonical = catalogIds.canonicalizeCatalog(payload.satellites);
+  if (canonical.length !== payload.satellites.length || canonical.some((item,index)=>item!==payload.satellites[index])) changed = true;
+  const satellites = canonical.map((item) => {
     const epoch = normalizeGpEpochUtc(item?.omm?.EPOCH || item?.epoch);
     const normalized = !epoch || (item.epoch === epoch && item?.omm?.EPOCH === epoch) ? item : {
       ...item,

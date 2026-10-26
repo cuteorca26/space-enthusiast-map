@@ -14,7 +14,7 @@ test('cloud-mode server starts and serves the complete app and API without local
   const port = portFinder.address().port;
   await new Promise(resolve => portFinder.close(resolve));
   const data = await mkdtemp(join(tmpdir(), 'space-map-server-'));
-  const child = spawn(process.execPath, ['server.mjs'], { cwd: root, windowsHide: true,
+  const child = spawn(process.execPath, ['--expose-gc', '--max-old-space-size=256', 'server.mjs'], { cwd: root, windowsHide: true,
     env: { ...process.env, HOST: '0.0.0.0', PORT: String(port), DATA_DIR: data, BALLISTIC_WORKERS: '1',
       ADMIN_SECRET_SHA256: '', PUBLIC_DATA_REPOSITORY: '', GITHUB_DATA_TOKEN: '' } });
   let log = '';
@@ -43,6 +43,12 @@ test('cloud-mode server starts and serves the complete app and API without local
   const page = await (await fetch(`${base}/`)).text();
   assert.ok(page.includes('航天爱好者地图'));
   assert.ok(page.includes('/deployment-config.js'));
+  assert.ok(page.includes('satellite-workspace.js'));
+  for (const match of page.matchAll(/(?:src|href)="(\/frontend\/[^"?#]+)(?:[^"\s]*)"/g)) {
+    assert.equal((await fetch(base + match[1])).status, 200, match[1]);
+  }
+  const archive = await (await fetch(base + '/api/satellites/launch-history')).json();
+  assert.ok(archive.objects.length > 10000); assert.ok(archive.coverage.launches > 5000);
   assert.ok((await (await fetch(`${base}/deployment-config.js`)).text()).includes('"online":true'));
   for (const path of ['/frontend/app.js', '/frontend/satellite-orbit-worker.js', '/node_modules/three/build/three.module.js',
     '/node_modules/three/build/three.core.js', '/node_modules/satellite.js/dist/index.js', '/node_modules/jszip/dist/jszip.min.js']) {

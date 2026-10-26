@@ -142,6 +142,20 @@ function retryReport(source, { attempt = 1, status = 'failed', cycleId = '12345-
     retryExhausted: status === 'failed' && !retry }] };
 }
 
+for(const source of ['hydropac','navarea','msa'])test(`${source} manual full snapshot imports exact data and is never mislabeled as automatic`,async t=>{
+ const f=await fixture(t,{sources:[source]});
+ const requestId='12345678-1234-4567-8901-123456789abc';
+ f.index.dailyReport={...retryReport(source,{status:'success'}),manualRequestId:requestId};
+ await writeFile(join(f.original,'refresh_history_index.json'),JSON.stringify(f.index));
+ const expectedCache=await readFile(join(f.original,DAILY_SOURCES[source].cache));
+ assert.deepEqual(applyDailyArchive(f.target,f.original,f.name).sources,[source]);
+ const index=JSON.parse(await readFile(join(f.target,'refresh_history_index.json')));
+ assert.equal(index.sources[source][0].automatic,false);
+ const state=JSON.parse(await readFile(join(f.target,'scheduled_refresh_state.json')));
+ assert.equal(state.manualResults[0].requestId,requestId);assert.equal(state.manualResults[0].result.source,source);
+ assert.deepEqual(await readFile(join(f.target,DAILY_SOURCES[source].cache)),expectedCache);
+});
+
 test('manual result imports preserve daily outcomes and history identity through success, late retry, and backup',async t=>{
  const first=await fixture(t,{sources:['msa']});
  first.index.dailyReport=retryReport('msa',{status:'success'});

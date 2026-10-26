@@ -27,7 +27,7 @@ export async function runDailySource({ source, collect, publish, now = Date.now,
 }
 
 export function assertCompleteScheduledSource(meta) {
-  if (!meta || meta.status !== 'ok' || meta.cacheFallback || meta.partialRefresh ||
+  if (!meta || meta.status !== 'ok' || meta.cacheFallback || meta.partialRefresh || meta.refreshIncomplete ||
     meta.failedFirs?.length || meta.capped || meta.coverageWarnings?.length || meta.sourceErrors?.length)
     throw new Error(meta?.message || 'The full source refresh did not succeed');
 }

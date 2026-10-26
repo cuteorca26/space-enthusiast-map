@@ -8,6 +8,19 @@ export function normalizeBoundaryLanguage(text) {
   return String(text).replace(/\b(ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|TWENTY|HALF)(?=\s+(?:NAUTICAL\s+)?(?:MILES?|NM|KM|METERS?|METRES?)\b)/gi, m=>String(words[m.toUpperCase()]))
     .replace(/\bSEA\s+MILES?\b/gi,'NM')
     .replace(/\bC\s+OORD\b/gi,'COORD')
+    .replace(/\bEXC\s+ON\s+(?=20\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2}\b)/gi,'ACTIVITY DATE EXCEPTION ')
+    .replace(/\b(AREA\b[^.\r\n]{0,80}?)\s+NOT\s+INCLUDED\b/gi,'EXCLUDING $1')
+    // These clauses describe who may enter, not holes in the boundary. Keep
+    // their contents so any later geometric exclusion still gets checked.
+    .replace(/\b(?:EXC|EXCEPT|EXCLUDING)\s+(?:FOR\s*)?[:\-]?\s*(?:-\s*)?(?=(?:(?:IFR|FRENCH|STATE|UNMANN?ED|COMMERCIAL)\s+)*(?:ACFT|AIRCRAFT|FLIGHTS?|UA|UAS|MEDEVAC)\b|DEFENCE\s+AND\s+STATE\s+HEL\b|POLICE\s+AND\s+BOS\s+UAS\b)/gi,'OPERATIONAL EXEMPTION ')
+    .replace(/\bEXC\s+(?=AS\s+SPECIFIED\s+BLW\b|THE\s+FLT\s+OPS\s+LISTED\s+BLW\b)/gi,'OPERATIONAL EXEMPTION ')
+    .replace(/\bEXC\s*:\s*(?=1\)\s*FLIGHTS?\s+CONDUCTED\b)/gi,'OPERATIONAL EXEMPTION ')
+    .replace(/\b(?:EXC|EXCEPT)\s+(?:FOR\s+)?(?=WHERE\s+OPR\s+UNDER\s+CAR\s+601\.17\b|PARTICIPANTS\s+SHALL\s+OPR\b|ONLY\s+FLT\s+OPR\s+AUTH\b|MEDICAL,\s+POLICE\s+AND\s+MILITARY\s+AGENCIES\b|SPECIAL\s+FIGHTS,\s+HUMANITARIAN,\s+SAR\b|STATE,\s+SPECIAL,\s+HUM,\s+SAR\b)/gi,'OPERATIONAL EXEMPTION ')
+    .replace(/\b(?:EXC|EXCEPT)\s*(?:FOR\s*)?[:\-]?\s*(?:[.\-]\s*|1[.)]\s*)?(?=WITH\s+PPR\s+REQUEST\b|UNMANNED\s+ACFT\s+INVOLVED\b|ACFT\s+BELONGING\b|STATE\s+AVIATION\b|IFR,\s+SAR,\s+MEDEVAC\b|POLICE\s+OPS\b|ALL\s+TRAFFIC\s+TO\/FROM\b)/gi,'OPERATIONAL EXEMPTION ')
+    .replace(/\bEXC\s+(?:OVERLAPPED|OVELAPPED)\s+AREA\s+WITH\s+(?=\d{6}[NS]\s+\d{7}[EW])/gi,'EXCLUDING AREA ')
+    .replace(/\bAP\s+AIRSPACE\s+AFFECTED\s+MAY\s+INCLUDE\s+[A-Z0-9,\s]+\./gi,' ')
+    .replace(/\bDIAMETER\s+OF\s+(?:THE\s+)?BALLOON\s*:\s*\d+(?:\.\d+)?\s*(?:CM|M|FT|IN)\b/gi,' ')
+    .replace(/(\bBALLOON\s+CHARACTERISTICS?\s*:\s*CATEGORY\s+(?:LIGHT|MEDIUM|HEAVY)\s+\d+(?:\.\d+)?\s*(?:M|FT|FEET|CM)\s+)DIAMETER\b/gi,'$1BALLOON SIZE')
     .replace(/\b(\d+),(\d+)\s*(NM|KM|M)\b/gi,'$1.$2$3');
 }
 function meters(value, unit) {
@@ -94,6 +107,12 @@ export function explicitArcBoundary(text, tokens) {
     if(circle&&!circle.boundaryError)return success(circle,'圆弧围成的封闭区域，按明确圆心与半径绘制完整圆');
   }
   if (/\b(?:EXC|EXCEPT|EXCLUDING|COASTLINE|SHORELINE|(?:FIR|STATE|NATIONAL)\s+(?:BOUNDARY|BORDER))\b/i.test(text)) return fail('圆弧包含尚未确定的边界或排除区域，未绘制。');
+  if (tokens.length === 1 && /\bSECTOR\s+CENT(?:RED|ERED)\s+ON\b/i.test(text)
+    && /\b(?:BTN|BETWEEN)\s+BRG\s+\d+(?:\.\d+)?\s+AND\s+\d+(?:\.\d+)?\s*DEG\b/i.test(text)
+    && /\bCLOCKWISE\b/i.test(text) && !/\b(?:COUNTER|ANTI)[ -]?CLOCKWISE\b/i.test(text)) {
+    const sector=explicitRadialBoundary(text.replace(/\bARC\b/gi,'').replace(/\bBRG\b/gi,'BEARINGS'),tokens);
+    if (sector && !sector.boundaryError) return success(sector,'明确圆心、半径与顺时针方位角的扇形');
+  }
   // Some Japanese NOTAMs list the vertices first, then redefine one edge as
   // the minor arc. The repeated reference endpoints are not extra vertices.
   const post = /\bTHE\s+LINE\s+CONNECTING\b/i.exec(text);
@@ -236,6 +255,11 @@ export function explicitCorridorBoundary(text, tokens) {
 // Maritime unqualified miles are nautical miles. Never use Q-line radii here:
 // this function receives only a coordinate-bearing body section.
 export function explicitRadialBoundary(text, tokens) {
+  // A repeated correction confirming the identical centre adds no new boundary.
+  // A different corrected position remains ambiguous and is never substituted.
+  if (tokens.length === 2 && tokens[0].lat === tokens[1].lat && tokens[0].lon === tokens[1].lon
+    && /\bLOCATION\s+CORRECTED\s+TO\s*$/i.test(String(text).slice(tokens[0].sourceEnd,tokens[1].sourceIndex))
+    && (String(text).match(/\b(?:RADIUS|RDO)\b/gi)||[]).length === 1) tokens = [tokens[0]];
   const source = String(text).replace(/\b(?:EXC|EXCEPT|EXCLUDING)\s+(?:(?:ACFT|AIRCRAFT|SKED|CIV|MIL|MILITARY|SAR|HOSP|STATE|HEL|EMERG)\b)[^.\n]*/gi,' ')
     .replace(/\bEXCEPT\s+(?:PARTICIPATING\s+ACFT|WHEN\s+(?:AUTHORISED|AUTHORIZED|AUTORISED)\s+BY\s+ATC)[^.\n]*/gi,' ')
     .replace(/\bEXCEPT\s+(?:REAL\s+)?AIR\s+POLICING\b(?:[\s,]+(?:HUMANITARIAN|SAR|AND|EMERG|FLTS?|FLIGHTS?)\b)*/gi,' ')
@@ -288,12 +312,28 @@ export function explicitRadialBoundary(text, tokens) {
 // only list punctuation/labels; a route or a polygon must never become circles.
 export function explicitCircleList(text, tokens) {
   if (tokens.length < 2 || /\b(?:ARC|SECTOR|EXC|EXCEPT|EXCLUDING|EITHER|TRACK|LINE|BOUNDED|LIMITED|DIAMETER)\b/i.test(text)) return null;
+  // Chilean notices enumerate named sites, each with its own radius and centre.
+  // Require an exact one-to-one relationship; unrelated coordinates are not circles.
+  const sites=[...text.matchAll(new RegExp("(?:^|[\\r\\n])\\s*SECT[ \\t]+[A-Z][A-Z0-9 '/\\-]{0,65}[ \\t]+RDO[ \\t]+"+distancePattern+'[ \\t]+CENT(?:RED|ERED)[ \\t]+ON[ \\t]*','gi'))];
+  if (sites.length === tokens.length && sites.every((m,i)=>m.index+m[0].length<=tokens[i].sourceIndex
+      && !text.slice(m.index+m[0].length,tokens[i].sourceIndex).trim()
+      && (!sites[i+1]||tokens[i].sourceEnd<=sites[i+1].index))) {
+    const circles=tokens.map((p,i)=>explicitRadialBoundary(`RADIUS ${sites[i][1]} ${sites[i][2]}`,[p]));
+    if(circles.every(p=>p&&!p.boundaryError))return success({type:'MultiPolygon',coordinates:circles.map(p=>p.coordinates)},'具名地点逐项提供半径和圆心，按 WGS84 分别绘制');
+  }
   const prefix=text.slice(0,tokens[0].sourceIndex);
+  const safety=prefix.match(new RegExp('\\bSAFETY\\s+ZONES\\s+OF\\s+'+distancePattern+'\\s+ESTABLISHED\\s+AROUND\\s+SPMS\\s+IN\\s+FOLLOWING\\s+POSITIONS\\s*:\\s*SPM\\d+\\s*$','i'));
+  if(safety && tokens.every((p,i)=>!i || /^\s*SPM\d+\s*$/i.test(text.slice(tokens[i-1].sourceEnd,p.sourceIndex)))) {
+    const circles=tokens.map(p=>explicitRadialBoundary(`RADIUS ${safety[1]} ${safety[2]}`,[p]));
+    if(circles.every(p=>p&&!p.boundaryError))return success({type:'MultiPolygon',coordinates:circles.map(p=>p.coordinates)},'以通告明确的 SPM 位置和安全距离分别绘制安全区');
+  }
   const shared=prefix.match(new RegExp('\\b(?:WI(?:THIN)?\\s+(?:AN?\\s+)?(?:AREAS?\\s+)?)'+distancePattern+'\\s+(?:RADIUS\\s+)?OF\\s*:?\\s*(?:[A-Z][.)]\\s*)?$', 'i'))
-    || prefix.match(new RegExp('\\b'+distancePattern+'\\s+RADIUS\\s+CENT(?:RED|ERED)\\s+ON\\s+COORD(?:S|INATES)?\\s+AS\\s+FLW\\s*:\\s*(?:1[.)]\\s*)?$', 'i'))
+    || prefix.match(new RegExp('\\bRADIUS\\s+(?:OF\\s+)?'+distancePattern+'\\s+(?:FM|FROM)\\s+(?:FLW|FOLLOWING)\\s+COORD(?:S|INATES)?\\s*:\\s*(?:1[.)]\\s*)?$','i'))
+    || prefix.match(new RegExp('\\b'+distancePattern+'\\s+RADIUS\\s+CENT(?:RED|ERED)\\s+ON\\s+(?:COORD(?:S|INATES)?\\s+)?AS\\s+FLW\\s*:\\s*(?:1[.)]\\s*|-\\s*)?$', 'i'))
+    || prefix.match(new RegExp('\\b'+distancePattern+'\\s+RADIUS\\s+WI\\s+COORD(?:S|INATES)?\\s+AS\\s+FLW\\s*:\\s*-\\s*$', 'i'))
     || text.slice(tokens.at(-1).sourceEnd).match(new RegExp('^\\s*\\)?\\s*WI(?:THIN)?\\s+'+distancePattern+'\\s+RADIUS\\b','i'));
   if(!shared) return null;
-  for(let i=1;i<tokens.length;i++)if(!/^[\s,，、;；.()\/-]*(?:(?:AND|[A-Z][.)]|\d+[.)])\s*)?$/i.test(text.slice(tokens[i-1].sourceEnd,tokens[i].sourceIndex)))return null;
+  for(let i=1;i<tokens.length;i++)if(!/^[\s,，、;；.()\/-]*(?:(?:AND|[A-Z][.)]|\d+[.)])\s*)?$/i.test(text.slice(tokens[i-1].sourceEnd,tokens[i].sourceIndex).replace(/\([A-Z][A-Z0-9 '\/-]{0,80}\)/gi,'')))return null;
   const polygons=tokens.map(p=>explicitRadialBoundary(`RADIUS ${shared[1]} ${shared[2]}`,[p]));
   const bad=polygons.find(p=>!p||p.boundaryError);
   return bad ? fail(bad?.boundaryError||'圆心或半径不完整') : success({type:'MultiPolygon',coordinates:polygons.map(p=>p.coordinates)},'正文多个圆心共用明确半径，逐一按 WGS84 绘制');
@@ -315,6 +355,16 @@ export function explicitLabeledCircles(text,tokens){
 }
 
 export function explicitSharedSectors(text,tokens){
+  // One centre with separate, explicitly altitude-labelled radii. Preserve
+  // each boundary; choosing only the first would hide the lower-altitude rings.
+  if(tokens.length===1 && /\bCENT(?:RED|ERED)\s+ON\s+PSN\s*:/i.test(text)
+    && !/\b(?:ARC|EXC|EXCEPT|EXCLUDING|LIMITED|DIAMETER)\b/i.test(text)) {
+    const radii=[...text.matchAll(new RegExp('(?:^|[\\r\\n])\\s*-\\s*'+distancePattern+'\\s+RADIUS\\s+AT\\s+(?:FL\\s*\\d+|\\d+\\s*FT)\\b','gi'))];
+    if(radii.length>1 && (text.match(/\bRADIUS\b/gi)||[]).length===radii.length) {
+      const circles=radii.map(m=>explicitRadialBoundary(`RADIUS ${m[1]} ${m[2]}`,tokens));
+      if(circles.every(p=>p&&!p.boundaryError))return success({type:'MultiPolygon',coordinates:circles.map(p=>p.coordinates)},'同一圆心按原文各高度对应的半径分别绘制；高度对应关系见原文');
+    }
+  }
   if(tokens.length===1&&/\bAREA\s+CENTERED\s+(?:OF|ON)\b/i.test(text)){
     const m=text.match(new RegExp('RADIUS\\s*'+distancePattern+'\\s+AND\\s+COVERING\\s+BEARINGS\\s+FROM\\s*(\\d+(?:\\.\\d+)?)\\s*DEG(?:REE)?S?\\s+TO\\s*(\\d+(?:\\.\\d+)?)\\s*DEG(?:REE)?S?\\s+RADIUS\\s*'+distancePattern,'i'));
     if(m){

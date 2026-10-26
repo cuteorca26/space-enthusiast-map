@@ -311,12 +311,13 @@ function propagateSelection(message) {
 }
 
 function orbitPathAtDisplayTime(id, satrecSeries, item, timeMs, currentGmst, requestedSampleCounts, exactPosition = null) {
-  const periodMinutes = Math.max(20, Number(item.periodMinutes) || 90);
-  const bucketMs = item.orbitClass === "LEO" ? 10 * 60 * 1000 : item.orbitClass === "MEO" ? 30 * 60 * 1000 : 60 * 60 * 1000;
-  const centerMs = Math.round(timeMs / bucketMs) * bucketMs;
-  const fallback = item.orbitClass === "LEO" ? 256 : item.orbitClass === "MEO" ? 384 : item.orbitClass === "GEO" ? 448 : 1024;
-  const sampleCount = Math.max(32, Math.min(1200, Math.round(Number(requestedSampleCounts?.[item.orbitClass]) || fallback)));
   const activeElement = selectSatrec(satrecSeries, timeMs);
+  const periodMinutes = Math.max(20, Number(activeElement?.periodMinutes) || Number(item.periodMinutes) || 90);
+  const orbitClass = activeElement?.orbitClass || item.orbitClass;
+  const bucketMs = orbitClass === "LEO" ? 10 * 60 * 1000 : orbitClass === "MEO" ? 30 * 60 * 1000 : 60 * 60 * 1000;
+  const centerMs = Math.round(timeMs / bucketMs) * bucketMs;
+  const fallback = orbitClass === "LEO" ? 256 : orbitClass === "MEO" ? 384 : orbitClass === "GEO" ? 448 : 1024;
+  const sampleCount = Math.max(32, Math.min(1200, Math.round(Number(requestedSampleCounts?.[orbitClass]) || fallback)));
   const cacheKey = `${id}:${activeElement?.epochMs || 0}:${centerMs}:${sampleCount}`;
   let cachedPath = inertialPathCache.get(cacheKey);
   const periodMs = periodMinutes * 60 * 1000;
@@ -335,7 +336,7 @@ function orbitPathAtDisplayTime(id, satrecSeries, item, timeMs, currentGmst, req
       periodMs,
       maxSegments: sampleCount,
       sampleAtTime,
-      adaptive: item.orbitClass === "HEO",
+      adaptive: orbitClass === "HEO",
       toleranceKm: heoPathToleranceKm(sampleCount),
     });
     if (cachedPath.points.some((point) => !finitePathPoint(point))) throw new Error("orbit_envelope_diverged");
@@ -369,7 +370,7 @@ function orbitPathAtDisplayTime(id, satrecSeries, item, timeMs, currentGmst, req
 function createSatrecSeries(item) {
   const sourceSets = Array.isArray(item?.elementSets) && item.elementSets.length
     ? item.elementSets
-    : [{ epoch: item?.epoch || item?.omm?.EPOCH, omm: item?.omm }];
+    : [{ epoch: item?.epoch || item?.omm?.EPOCH, omm: item?.omm, periodMinutes: item?.periodMinutes, orbitClass: item?.orbitClass }];
   const series = [];
   for (const element of sourceSets) {
     if (!element?.omm) continue;
@@ -378,7 +379,10 @@ function createSatrecSeries(item) {
       if (!satrec || satrec.error) continue;
       const epochMs = Date.parse(element.epoch || element.omm.EPOCH || "");
       if (!Number.isFinite(epochMs)) continue;
-      series.push({ epochMs, satrec });
+      // Keep the summary beside its own roots: custom multi-epoch imports can
+      // cross orbit regimes, and the catalog summary describes only the latest.
+      const periodMinutes = Number(element.periodMinutes) || 1440 / Number(element.omm.MEAN_MOTION);
+      series.push({ epochMs, satrec, periodMinutes, orbitClass: element.orbitClass || item.orbitClass });
     } catch {
       // Reject only the invalid epoch; later valid sets remain usable.
     }

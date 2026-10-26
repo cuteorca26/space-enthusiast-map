@@ -221,6 +221,10 @@ ${placemarks}
   }
 
   function geometryToKml(geometry) {
+    if (geometry?.type === "MultiPolygon") {
+      const polygons = (geometry.coordinates || []).map((coordinates) => geometryToKml({ type: "Polygon", coordinates })).filter(Boolean);
+      return polygons.length ? `<MultiGeometry>${polygons.join("")}</MultiGeometry>` : "";
+    }
     if (geometry?.type === "Point") return `<Point><coordinates>${coordinateToKml(geometry.coordinates)}</coordinates></Point>`;
     if (geometry?.type === "LineString") {
       const coords = (geometry.coordinates || []).map(coordinateToKml).filter(Boolean);

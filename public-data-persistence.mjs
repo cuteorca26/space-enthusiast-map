@@ -13,7 +13,10 @@ const MAX_TOTAL = 8 * 1024 * 1024 * 1024;
 const TAG = 'public-map-data';
 const CACHE_FILES = new Set(['faa_notam_cache.json', 'faa_fir_designators_cache.json', 'nga_hydropac_cache.json',
   'nga_hydropac_all_cache.json', 'msa_nav_warning_cache.json', 'navarea_warning_cache.json',
-  'satellite_catalog_cache.json', 'launch_forecast_cache.json', 'refresh_history_index.json', 'scheduled_refresh_state.json', 'manual_notam_refresh.json', 'cloud_cache/gmgsi_timeline_cache.json']);
+  'satellite_catalog_cache.json', 'satellite_group_membership_cache.json', 'satellite_launch_history.json',
+  'launch_forecast_cache.json', 'refresh_history_index.json', 'scheduled_refresh_state.json',
+  'manual_notam_refresh.json', 'manual_hydropac_refresh.json', 'manual_navarea_refresh.json', 'manual_msa_refresh.json',
+  'cloud_cache/gmgsi_timeline_cache.json']);
 const SNAPSHOTS = /^(faa_notam_snapshots|hydropac_snapshots|msa_nav_warning_snapshots|navarea_warning_snapshots|satellite_catalog_snapshots)\/[\w.-]+\.json$/;
 export function isPublicDataPath(path) {
   return typeof path === 'string' && !path.includes('..') && !path.includes('\\') &&

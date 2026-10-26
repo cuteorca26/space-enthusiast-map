@@ -1,3 +1,230 @@
+const marineCloudJobs = new Map();
+let satelliteWorkspace = null;
+let satelliteWorkspacePrevious = null;
+let satelliteWorkspaceListScope = null;
+let satelliteLaunchData = null;
+let satelliteLaunchRequest = null;
+let satelliteNetwork = null;
+const satelliteExpandedCards = new Set();
+const satelliteWorkspaceEmptyItems = [];
+async function loadSatelliteLaunchData(refresh = false) {
+  if (!refresh && satelliteLaunchData) return satelliteLaunchData;
+  if (satelliteLaunchRequest) return satelliteLaunchRequest;
+  satelliteLaunchRequest = (async () => {
+    let response = await fetch('/api/satellites/launch-history' + (refresh ? '?refresh=1' : ''), { cache: 'no-store' });
+    if (response.status === 404 && !refresh) response = await fetch('/frontend/data/satellite-launch-history.json', { cache: 'no-cache' });
+    if (!response.ok) throw new Error('读取发射档案失败（HTTP ' + response.status + '）');
+    const data = await response.json();
+    if (data.version !== 1 || !Array.isArray(data.objects) || !data.launches) throw new Error('发射档案格式无效');
+    satelliteLaunchData = data;
+    if (isSatelliteMode()) renderSatelliteList();
+    return data;
+  })().finally(() => { satelliteLaunchRequest = null; });
+  return satelliteLaunchRequest;
+}
+function openSatelliteNetwork(config = {}) {
+  satelliteNetwork ||= window.NotamSatelliteNetwork.mount({ data: loadSatelliteLaunchData, snapshot: () => ({items:state.satellites,classifications:state.satelliteSeriesById}) });
+  satelliteNetwork.open(config);
+}
+function initializeSatelliteWorkspace() {
+  satelliteWorkspace = window.NotamSatelliteWorkspace.mount({
+    analyze: openSatelliteAnalysis, network: openSatelliteNetwork, fit: fitSelectedSatelliteOrbits,
+    launchData: loadSatelliteLaunchData, members: showSatelliteWorkspaceMembers,
+  });
+  document.querySelector('[data-workspace="satellite"]').addEventListener('click', enterSatelliteWorkspace);
+}
+function enterSatelliteWorkspace() {
+  if (!satelliteWorkspace || satelliteWorkspace.active) return;
+  const flags = ['notamEnabled','hydropacEnabled','msaEnabled','navareaEnabled','customCoordinatesEnabled','launchRingsEnabled','trajectoryEnabled','customMapAddMode','ballisticPickStageId','ballisticTargetPickStageId','ballisticPoweredStartPickTrackId'];
+  satelliteWorkspacePrevious = { baseLayer:state.baseLayer, view:{...state.view}, detailMode:isSatelliteMode()?'notam':state.detailMode,
+    search:state.notamIdSearch, layer:state.satelliteLayerEnabled, ballisticPlaying:Boolean(state.ballisticAnimation?.playing), flags:Object.fromEntries(flags.map(k=>[k,state[k]])) };
+  for (const flag of flags) state[flag] = typeof state[flag] === 'string' ? '' : false;
+  if(satelliteWorkspacePrevious.ballisticPlaying) pauseBallisticAnimation();
+  hideTooltip({force:true});
+  satelliteWorkspace.enter();
+  state.detailMode = 'satellite'; state.notamIdSearch = ''; els.notamIdSearchInput.value = '';
+  state.satelliteLayerEnabled = true;
+  activateSatelliteGlobeMode(); syncLayerButtons(); renderDetailModeUi(); applyFilters();
+  if (!state.satellitePayload && !state.satelliteLoading) loadSatellites(false);
+  requestAnimationFrame(() => { if (!satelliteWorkspace.active) return; window.dispatchEvent(new Event('resize')); fitSelectedSatelliteOrbits(); });
+}
+function leaveSatelliteWorkspace() {
+  if (!satelliteWorkspace?.active) return;
+  satelliteWorkspace.leave();
+  const previous = satelliteWorkspacePrevious;
+  if (previous) {
+    Object.assign(state, previous.flags); state.baseLayer = previous.baseLayer; Object.assign(state.view, previous.view);
+    state.detailMode = previous.detailMode; state.notamIdSearch = previous.search; els.notamIdSearchInput.value = previous.search;
+    state.satelliteLayerEnabled = previous.layer;
+    if(previous.ballisticPlaying){state.ballisticAnimation.playing=true;state.ballisticAnimation.playbackStartedAt=0;startBallisticAnimationLoop();}
+  }
+  state.satellitePlaybackRate = 0;
+  state.satellitePendingFitId = '';
+  satelliteWorkspacePrevious = null; renderDetailModeUi(); applyFilters(); syncLayerButtons(); drawSatelliteOverlay();
+  requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+}
+function showSatelliteWorkspaceMembers(ids = null, label = '') {
+  if (!satelliteWorkspace?.active) enterSatelliteWorkspace();
+  satelliteWorkspaceListScope = ids === 'all' ? 'all' : Array.isArray(ids) ? new Set(ids.map(String)) : null;
+  state.notamIdSearch = ''; els.notamIdSearchInput.value = '';
+  satelliteWorkspace.members(label || (ids === 'all' ? '全部卫星目录' : '已选卫星'));
+  renderSatelliteList();
+}
+function satelliteLaunchFieldsHtml(item, profile = null) {
+  const f = window.NotamSatelliteLaunchModel.fields({...item,launchDate:item.launchDate||profile?.launchDate||''}, satelliteLaunchData);
+  return [['发射时间',f.time],['发射场 / 工位',f.site],['运载火箭',f.vehicle],['上面级',f.upperStage],['档案来源',f.source + (f.batch?' · '+f.batch:'')],['构型依据',f.evidence],['档案获取',f.fetchedAt?new Date(f.fetchedAt).toLocaleString('zh-CN'):'' ]].filter(([,v])=>v).map(([k,v])=>`<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('');
+}
+function revealSatelliteWorkspaceMember(id) {
+  if (!satelliteWorkspace?.active) return;
+  satelliteExpandedCards.add(String(id));
+  showSatelliteWorkspaceMembers([String(id)], '已定位卫星 · NORAD ' + id);
+  document.getElementById('swPanel-members').scrollTop = 0;
+}
+
+let satelliteAnalysis = null;
+let satelliteAnalysisIndex = null;
+async function openSatelliteAnalysis(config = {}) {
+  try { await loadSatelliteLaunchData(); } catch {}
+  if (!satelliteAnalysisIndex || !window.NotamSatelliteAnalysis) return;
+  satelliteAnalysis ||= window.NotamSatelliteAnalysis.mount({
+    snapshot: satelliteAnalysisSnapshot, mapState: satelliteAnalysisMapState,
+    apply: applySatelliteAnalysisSelection, focus: focusSatelliteAnalysis,
+    network: openSatelliteNetwork, launchInfo: item => window.NotamSatelliteLaunchModel.fields(item, satelliteLaunchData),
+  });
+  satelliteAnalysis.open(config);
+}
+function satelliteAnalysisSnapshot(at) {
+  const timeMs = Number.isFinite(at) ? at : state.satelliteTimeMs;
+  const historical = state.satelliteElementMode === 'historical';
+  return {
+    timeMs, index: satelliteAnalysisIndex, classifications: state.satelliteSeriesById,
+    evidence: window.NotamSatelliteMembership?.records || {},
+    source: historical ? { ...state.satelliteHistorySource, fetchedAt: state.satelliteHistorySource?.fetchedAt || '' } : state.satellitePayload?.source || {},
+    modeLabel: historical ? 'Space-Track 历史根数' : '当前目录 / 用户根数',
+    catalogRef: state.satelliteById, historyRef: state.satelliteHistoricalElementsById, mode: state.satelliteElementMode,
+    items: state.satellites.map(item => {
+      const element = item.customOrbit && item.elementSets?.length
+        ? SATELLITE_ELEMENT_INPUT.selectElementSet(item, timeMs)
+        : historical ? state.satelliteHistoricalElementsById.get(String(item.id)) : item;
+      return { ...item, omm: element?.omm || null, epoch: element?.epoch || '',
+        ...(historical && !item.customOrbit ? { elementSource: 'Space-Track GP_HISTORY', fetchedAt: element?.fetchedAt || '' } : {}),
+      };
+    }),
+  };
+}
+function satelliteAnalysisMapState() {
+  const timePending = !state.satellitePlaybackRate && (!Number.isFinite(satelliteLastPropagatedTimeMs) || Math.abs(satelliteLastPropagatedTimeMs - state.satelliteTimeMs) >= 0.5);
+  const drawable = !timePending && state.satelliteLayerEnabled && isGlobeLayer()
+    ? new Set(state.satelliteVisibleIds.filter(id => state.selectedSatelliteIds.has(id) && state.satellitePositions.has(id) && !state.satellitePropagationErrorIds.has(id))) : new Set();
+  return { selected: state.selectedSatelliteIds, drawn: drawable, timeMs: state.satelliteTimeMs,
+    selectionRevision: satelliteSelectionRevision,
+    drawRevision: `${satelliteGpuPositionRevision}:${satelliteLastPropagatedTimeMs}:${timePending}:${drawable.size}:${state.satellitePropagationErrorIds.size}:${state.satelliteElementMode}`,
+  };
+}
+function satelliteAnalysisSnapshotMatches(snapshot) {
+  return snapshot.catalogRef === state.satelliteById && snapshot.historyRef === state.satelliteHistoricalElementsById && snapshot.mode === state.satelliteElementMode;
+}
+function applySatelliteAnalysisSelection(ids, mode, timeMs, snapshot) {
+  if (!satelliteAnalysisSnapshotMatches(snapshot)) return { message: '目录或历史根数已改变，请重新打开分析后操作。' };
+  if (mode !== 'remove' && !Number.isFinite(timeMs)) return { message: '分析时刻无效，请重新计算后操作。' };
+  const previous = state.selectedSatelliteIds;
+  const operation = window.NotamSatelliteExplorer.selectionOperation(state.selectedSatelliteIds, ids, mode, state.satelliteById, SATELLITE_MAX_SELECTED);
+  const requested = [...new Set(ids.map(String))].filter(id => state.satelliteById.has(id));
+  if (!requested.length) return { message: '没有可处理的目录对象，地图保持当前状态。' };
+  const changed = [...operation.ids].some(id => !previous.has(id)) || [...previous].some(id => !operation.ids.has(id));
+  const count = mode === 'remove' ? [...previous].filter(id => !operation.ids.has(id)).length : [...operation.ids].filter(id => !previous.has(id)).length;
+  const timeChanged = mode !== 'remove' && state.satelliteTimeMs !== timeMs;
+  const layerChanged = mode !== 'remove' && !state.satelliteLayerEnabled;
+  let filtersChanged = false;
+  if (changed) state.selectedSatelliteIds = operation.ids;
+  if (mode !== 'remove') {
+    for (const id of requested) {
+      const item = state.satelliteById.get(id);
+      if (!item || !operation.ids.has(id)) continue;
+      filtersChanged ||= !state.satelliteObjectClasses.has(satelliteObjectClass(item)) || !state.satelliteOrbitClasses.has(item.orbitClass);
+      state.satelliteObjectClasses.add(satelliteObjectClass(item)); state.satelliteOrbitClasses.add(item.orbitClass);
+    }
+    state.satelliteLayerEnabled = true;
+    state.satellitePlaybackRate = 0;
+    state.satelliteTimeMs = timeMs;
+    state.satelliteTimeExplicit = true;
+    state.satellitePlaybackAnchorSimMs = timeMs;
+    state.satellitePlaybackAnchorRealMs = performance.now();
+    if (timeChanged) {
+      state.satelliteOrbitPaths.clear();
+      satelliteOrbitMissingIds = new Set();
+      satelliteOrbitPathRetryCount = 0;
+    }
+    activateSatelliteGlobeMode();
+  }
+  if (mode === 'remove' && !operation.ids.has(state.satellitePendingFitId)) state.satellitePendingFitId = '';
+  if (mode === 'remove' && !operation.ids.has(state.satelliteFocusedId)) state.satelliteFocusedId = '';
+  if (changed || filtersChanged || layerChanged) satelliteSelectionChanged();
+  if (mode !== 'remove') {
+    syncSatelliteTimeUi();
+    const currentFrame = Number.isFinite(satelliteLastPropagatedTimeMs) && Math.abs(satelliteLastPropagatedTimeMs - timeMs) < 0.5;
+    if (changed || filtersChanged || layerChanged || timeChanged || !currentFrame) requestSatellitePropagation(timeChanged ? true : 'missing');
+  }
+  return { message: `${mode === 'remove' ? '本次移除' : '本次新增'} ${count.toLocaleString('zh-CN')} 个对象；地图共选中 ${operation.ids.size.toLocaleString('zh-CN')} 个。${operation.limited ? '部分对象超出选择上限。' : ''}${mode !== 'remove' ? '地图已暂停在分析时刻；重复对象不会再次加入，无法传播的对象保留状态说明。' : ''}` };
+}
+function focusSatelliteAnalysis(id, timeMs, snapshot) {
+  if (!satelliteAnalysisSnapshotMatches(snapshot)) return { message: '目录或历史根数已改变，请重新打开分析后定位。' };
+  const result = applySatelliteAnalysisSelection([id], 'add', timeMs, snapshot);
+  if (!state.selectedSatelliteIds.has(id)) return result;
+  state.satelliteFocusedId = id;
+  const point = state.satellitePositions.get(id);
+  const currentFrame = Number.isFinite(satelliteLastPropagatedTimeMs) && Math.abs(satelliteLastPropagatedTimeMs - timeMs) < 0.5;
+  const ready = currentFrame && point && !state.satellitePropagationErrorIds.has(id);
+  state.satellitePendingFitId = ready ? '' : id;
+  state.detailMode = 'satellite'; state.rightPanelCollapsed = false;
+  syncPanelCollapse(); renderDetailModeUi(); renderList(); drawSatelliteOverlay();
+  revealSatelliteWorkspaceMember(id);
+  if (ready) fitSatellitePosition(point);
+  else requestSatellitePropagation('missing');
+  return { message: `已选中 NORAD ${id} 的参数，${ready ? '已定位地图' : '等待该时刻的地图位置'}。点击右上“返回地图”查看；若传播失败则无法定位。` };
+}
+
+
+let satelliteExplorer = null;
+function rebuildSatelliteExplorer() {
+  const api = window.NotamSatelliteExplorer;
+  const host = document.getElementById('satelliteExplorer');
+  if (!api || !host || !SATELLITE_SERIES) return;
+  satelliteExplorer ||= api.mount(host, { apply: applySatelliteExplorerSelection, analyze: openSatelliteAnalysis, members: showSatelliteWorkspaceMembers, network: openSatelliteNetwork });
+  const index = api.buildIndex(state.satellites, state.satelliteSeriesById, SATELLITE_SERIES,
+    window.NotamSatelliteMembership?.records || {}, satelliteObjectClass);
+  satelliteAnalysisIndex = index;
+  satelliteExplorer.setIndex(index);
+  satelliteExplorer.syncSelection(state.selectedSatelliteIds, satelliteSelectionRevision);
+}
+
+function applySatelliteExplorerSelection(ids, mode) {
+  const operation = window.NotamSatelliteExplorer.selectionOperation(
+    state.selectedSatelliteIds, ids, mode, state.satelliteById, SATELLITE_MAX_SELECTED);
+  if (state.satelliteElementMode === 'historical') {
+    state.satelliteElementMode = 'current';
+    state.satelliteHistoricalElementsById = new Map();
+    state.satelliteHistorySource = null;
+    updateSatelliteHistoryStatus('warn', '卫星选择已改变，已恢复当前根数；历史回放请重新加载该日轨道。');
+  }
+  if (mode !== 'remove') {
+    for (const rawId of ids) {
+      const id = String(rawId);
+      if (!operation.ids.has(id)) continue;
+      const item = state.satelliteById.get(id);
+      if (item) { state.satelliteObjectClasses.add(satelliteObjectClass(item)); state.satelliteOrbitClasses.add(item.orbitClass); }
+    }
+    state.satelliteLayerEnabled = true;
+  }
+  state.selectedSatelliteIds = operation.ids;
+  state.satelliteFocusedId = '';
+  state.notamIdSearch = '';
+  if (els.notamIdSearchInput) els.notamIdSearchInput.value = '';
+  satelliteSelectionChanged();
+  if (mode !== 'remove' && operation.ids.size) requestAnimationFrame(() => fitSelectedSatelliteOrbits());
+  return { matched: operation.matched, total: operation.ids.size, limited: operation.limited };
+}
+
 const TILE_SIZE = 256;
 const MIN_ZOOM = 2;
 const MAX_ZOOM = 15;
@@ -59,10 +286,11 @@ const SATELLITE_GPU_BULK_THRESHOLD = 360;
 let SATELLITE_GPU_HIT_LIMIT = activePerformanceProfile.budgets.satelliteHitLimit;
 const SATELLITE_PATH_POINT_STRIDE = SATELLITE_ORBIT_POLICY?.PATH_POINT_STRIDE || 6;
 const SATELLITE_DENSE_ORBIT_LINE_THRESHOLD = 240;
-const SATELLITE_POINT_SIZE_MIN = 3;
-const SATELLITE_POINT_SIZE_MAX = 28;
-const SATELLITE_LABEL_SIZE_MIN = 9;
-const SATELLITE_LABEL_SIZE_MAX = 32;
+const SATELLITE_DISPLAY = window.NotamSatelliteDisplay;
+const SATELLITE_POINT_SIZE_MIN = 0.5;
+const SATELLITE_POINT_SIZE_MAX = 64;
+const SATELLITE_LABEL_SIZE_MIN = 4;
+const SATELLITE_LABEL_SIZE_MAX = 72;
 let SATELLITE_COVERAGE_SEGMENTS = activePerformanceProfile.budgets.coverageSegments;
 const SATELLITE_POSITION_STRIDE = 17;
 const SATELLITE_SELECTION_STORAGE_KEY = "notam-map-satellite-selection-v1";
@@ -270,6 +498,10 @@ let flatBallisticGpuRenderer = null;
 let restrictionHitSpatialIndex = null;
 let globeDrawableItemsCache = null;
 const flatRingSourceCache = new WeakMap();
+const flatPolygonPathCache = new WeakMap();
+let restrictionSurfaceSpareCanvas = null;
+let wheelInteractionUntil = 0;
+let wheelSettleTimer = null;
 const dateTimeFormatterCache = new Map();
 let satelliteSearchIndex = null;
 let satelliteSearchResultCache = null;
@@ -340,6 +572,9 @@ let satelliteOrbitPathRetrySelectionRevision = -1;
 let satelliteOrbitMissingIds = new Set();
 let satelliteLastOrbitFit = null;
 let satelliteCanvasCandidateCache = { key: "", ids: [] };
+const satelliteLabelLayout = window.NotamSatelliteLabelLayout.create();
+const satelliteLabelMetrics = new Map();
+let satelliteLabelFadeFrame = null;
 let satelliteThreeFramePending = false;
 let globeSurfaceFramePending = false;
 let globeSurfaceLastDrawAt = 0;
@@ -470,9 +705,18 @@ const LANDMARKS = [
   },
   {
     id: "oriental-spaceport",
-    label: "东方航天港",
+    label: "海阳东方航天港",
     lon: 121 + 14 / 60 + 24.22 / 3600,
     lat: 36 + 40 / 60 + 7.72 / 3600,
+    color: LANDMARK_RED,
+  },
+  {
+    id: "haiyang-rizhao-offshore-launch-site",
+    label: "海阳东方航天港（日照海上发射点）",
+    // Launch forecast location 185 / Rizhao offshore launch location.
+    // This launch position is distinct from the Haiyang shore base above.
+    lon: 119.598667,
+    lat: 35.391667,
     color: LANDMARK_RED,
   },
   {
@@ -736,6 +980,7 @@ const LANDMARK_LAUNCH_ALIASES = {
   "taiyuan-space-launch-center": ["taiyuan"],
   "xichang-space-launch-center": ["xichang"],
   "oriental-spaceport": ["haiyang", "oriental spaceport"],
+  "haiyang-rizhao-offshore-launch-site": ["rizhao offshore"],
   "wenchang-space-launch-site": ["wenchang"],
   "vostochny-space-launch-site": ["vostochny"],
   "baikonur-cosmodrome": ["baikonur"],
@@ -851,6 +1096,11 @@ const state = {
   satelliteRefreshBaselineIds: null,
   satelliteRefreshClassificationSummary: "",
   selectedSatelliteIds: new Set(),
+  satellitePickedIds: new Set(),
+  satelliteDisplayIdsCache: new Map(),
+  satelliteOnlyPicked: { orbits: false, labels: false, points: false, communications: false, imaging: false },
+  satelliteCommunicationAngleMode: "profile",
+  satelliteCommunicationAngle: 25,
   satelliteOrbitClasses: new Set(["LEO", "MEO", "GEO", "HEO"]),
   satelliteObjectClasses: new Set(["ACTIVE_PAYLOAD"]),
   satelliteVisibleIds: [],
@@ -1431,6 +1681,7 @@ async function init() {
   loadLandmarkVisibilityFromStorage();
   loadCustomCoordinatesFromStorage();
   initializeCloudControls();
+  initializeSatelliteWorkspace();
   initializeSatelliteControls();
   initializePanelNavigation();
   bindEvents();
@@ -1445,7 +1696,8 @@ async function init() {
   draw();
   loadRefreshHistory();
   initializeSavedRegions();
-  await loadRestrictions(false);
+  // Each source can display its cache while NOTAM/history preparation is pending.
+  loadRestrictions(false);
   loadHydropac(false);
   loadMsaWarnings(false);
   loadNavareaWarnings(false);
@@ -1801,6 +2053,7 @@ function bindEvents() {
   document.querySelectorAll("[data-layer]").forEach((button) => {
     button.addEventListener("click", () => {
       const nextLayer = button.dataset.layer;
+      leaveSatelliteWorkspace();
       if (!TILE_SOURCES[nextLayer] || state.baseLayer === nextLayer) return;
       state.baseLayer = nextLayer;
       if (nextLayer !== GLOBE_LAYER && state.view.zoom < MIN_ZOOM) state.view.zoom = MIN_ZOOM;
@@ -1873,7 +2126,10 @@ function bindEvents() {
   });
   els.satelliteLabelsToggle?.addEventListener("click", () => {
     state.satelliteLabelsEnabled = !state.satelliteLabelsEnabled;
-    if (!state.satelliteLabelsEnabled) state.satelliteAllLabelsEnabled = false;
+    if (!state.satelliteLabelsEnabled) {
+      state.satelliteAllLabelsEnabled = false;
+      satelliteLabelLayout.reset();
+    }
     saveSatelliteStyleSettings();
     syncSatelliteControls();
     drawSatelliteOverlay();
@@ -1945,19 +2201,19 @@ function bindEvents() {
     drawSatelliteOverlay();
   });
   els.satelliteImagingOpacityInput?.addEventListener("input", () => {
-    state.satelliteImagingOpacity = clamp((Number(els.satelliteImagingOpacityInput.value) || 45) / 100, 0.05, 1);
+    state.satelliteImagingOpacity = SATELLITE_DISPLAY.normalize("imagingOpacity", Number(els.satelliteImagingOpacityInput.value) / 100);
     saveSatelliteStyleSettings();
     syncSatelliteControls();
     drawSatelliteOverlay();
   });
   els.satelliteCommunicationOpacityInput?.addEventListener("input", () => {
-    state.satelliteCommunicationOpacity = clamp((Number(els.satelliteCommunicationOpacityInput.value) || 45) / 100, 0.05, 1);
+    state.satelliteCommunicationOpacity = SATELLITE_DISPLAY.normalize("communicationOpacity", Number(els.satelliteCommunicationOpacityInput.value) / 100);
     saveSatelliteStyleSettings();
     syncSatelliteControls();
     drawSatelliteOverlay();
   });
   els.satelliteOrbitWidthInput?.addEventListener("input", () => {
-    state.satelliteOrbitLineWidth = clamp(Number(els.satelliteOrbitWidthInput.value) || 1.5, 0.5, 5);
+    state.satelliteOrbitLineWidth = SATELLITE_DISPLAY.normalize("orbitLineWidth", els.satelliteOrbitWidthInput.value);
     saveSatelliteStyleSettings();
     invalidateSatelliteStaticLayers({ orbit: true });
     syncSatelliteControls();
@@ -1983,14 +2239,15 @@ function bindEvents() {
     syncSatelliteControls();
     drawSatelliteOverlay();
   });
-  document.querySelectorAll("[data-satellite-constellation]").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      toggleSatelliteConstellation(button.dataset.satelliteConstellation, {
-        append: Boolean(event.ctrlKey || event.shiftKey || event.metaKey),
-        label: button.querySelector("strong")?.textContent || button.dataset.satelliteConstellation,
-      });
+  document.getElementById("satelliteCountrySeriesGrid")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-satellite-constellation]");
+    if (!button) return;
+    toggleSatelliteConstellation(button.dataset.satelliteConstellation, {
+      append: Boolean(event.ctrlKey || event.shiftKey || event.metaKey),
+      label: button.dataset.seriesLabel || button.querySelector("strong")?.textContent,
     });
   });
+  document.getElementById("satelliteSeriesFilter")?.addEventListener("input", filterSatelliteSeriesTree);
   document.querySelectorAll("[data-satellite-reference]").forEach((button) => {
     button.addEventListener("click", () => setSatelliteReferenceFrame(button.dataset.satelliteReference));
   });
@@ -2424,7 +2681,7 @@ async function loadRestrictions(refresh, options = {}) {
       const message = silent ? "FAA NOTAM 后台刷新完成，已载入最新数据" : refresh ? "FAA NOTAM 刷新完成" : "FAA NOTAM 数据已载入";
       setLoading(false, message, "success");
     }
-    await loadRefreshHistory({ source: "notam" });
+    void loadRefreshHistory({ source: "notam" });
   } catch (error) {
     if (silent) {
       updateRefreshProgress("error", `后台刷新状态检查失败：${error.message}`);
@@ -2504,6 +2761,7 @@ async function pollFaaRefreshStatus() {
 }
 
 async function loadHydropac(refresh) {
+  if (refresh && window.APP_DEPLOYMENT?.online) return startMarineCloudRefresh('hydropac');
   if (state.hydropacLoading) {
     updateHydropacProgress("busy", "HYDROPAC 正在获取", "请等待当前 NGA MSI 请求完成");
     return;
@@ -2519,6 +2777,7 @@ async function loadHydropac(refresh) {
     const response = await fetch(`/api/hydropac${refresh ? "?refresh=1" : ""}`, { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.hydropacPayload = await response.json();
+    if (window.APP_DEPLOYMENT?.online && state.hydropacPayload.source?.backgroundRefresh?.active) monitorMarineCloudRefresh('hydropac');
     state.hydropacWarnings = marineDisplayRecords(state.hydropacPayload, "hydropac").map(enrichRestriction);
     syncCombinedRestrictions();
     renderSourceStatus();
@@ -2536,7 +2795,7 @@ async function loadHydropac(refresh) {
         : `HYDROPAC 已载入：${source.drawableWarnings ?? state.hydropacWarnings.length} 条可绘制`,
       source.status === "warn" ? source.message : `版本：${state.hydropacPayload.dataVersion || "--"}`,
     );
-    await loadRefreshHistory({ source: "hydropac" });
+    void loadRefreshHistory({ source: "hydropac" });
   } catch (error) {
     state.hydropacPayload = {
       source: {
@@ -2553,6 +2812,7 @@ async function loadHydropac(refresh) {
 }
 
 async function loadMsaWarnings(refresh) {
+  if (refresh && window.APP_DEPLOYMENT?.online) return startMarineCloudRefresh('msa');
   if (state.msaLoading) {
     updateMsaProgress("busy", "中国航警正在获取", "请等待当前中国海事局请求完成");
     return;
@@ -2568,6 +2828,7 @@ async function loadMsaWarnings(refresh) {
     const response = await fetch(`/api/msa-warnings${refresh ? "?refresh=1" : ""}`, { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.msaPayload = await response.json();
+    if (window.APP_DEPLOYMENT?.online && state.msaPayload.source?.backgroundRefresh?.active) monitorMarineCloudRefresh('msa');
     state.msaWarnings = marineDisplayRecords(state.msaPayload, "msa").map(enrichRestriction);
     syncCombinedRestrictions();
     renderSourceStatus();
@@ -2577,7 +2838,7 @@ async function loadMsaWarnings(refresh) {
     renderNotamIdSearchResults();
     applyFilters();
     const source = state.msaPayload.source || {};
-    if (source.backgroundRefresh?.active) {
+    if (source.backgroundRefresh?.active && !window.APP_DEPLOYMENT?.online) {
       updateMsaProgress("busy", "中国航警后台全量扫描中", "首次扫描可能需要较长时间，完成后自动载入结果。");
       scheduleMsaRefreshPoll();
       return;
@@ -2641,6 +2902,7 @@ async function pollMsaRefreshStatus() {
 }
 
 async function loadNavareaWarnings(refresh) {
+  if (refresh && window.APP_DEPLOYMENT?.online) return startMarineCloudRefresh('navarea');
   if (state.navareaLoading) {
     updateNavareaProgress("busy", "NAVAREA 正在获取", "请等待当前 NAVAREA 请求完成");
     return;
@@ -2656,6 +2918,7 @@ async function loadNavareaWarnings(refresh) {
     const response = await fetch(`/api/navarea-warnings${refresh ? "?refresh=1" : ""}`, { cache: "no-cache" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     state.navareaPayload = await response.json();
+    if (window.APP_DEPLOYMENT?.online && state.navareaPayload.source?.backgroundRefresh?.active) monitorMarineCloudRefresh('navarea');
     state.navareaWarnings = marineDisplayRecords(state.navareaPayload, "navarea").map(enrichRestriction);
     syncCombinedRestrictions();
     renderSourceStatus();
@@ -3029,6 +3292,7 @@ function isSatelliteMode() {
 }
 
 function isSourceDrawEnabled(item) {
+  if (satelliteWorkspace?.active) return false;
   if (item?.savedRegion) return true;
   if (isHydropacItem(item)) return state.hydropacEnabled;
   if (isMsaWarningItem(item)) return state.msaEnabled;
@@ -3037,6 +3301,7 @@ function isSourceDrawEnabled(item) {
 }
 
 function drawnFilteredItems() {
+  if (satelliteWorkspace?.active) return satelliteWorkspaceEmptyItems;
   const cached = drawnItemsCache;
   const highlightedSize = state.highlightedRestrictionIds.size;
   const highlightedKey = state.highlightOnly ? [...state.highlightedRestrictionIds].sort().join("|") : "";
@@ -3131,6 +3396,7 @@ function renderDetailModeUiLegacy() {
 }
 
 function renderDetailModeUi() {
+  if (isSatelliteMode() && satelliteWorkspace && !satelliteWorkspace.active) { enterSatelliteWorkspace(); return; }
   document.querySelectorAll("[data-detail-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.detailMode === state.detailMode);
   });
@@ -3393,6 +3659,13 @@ function loadLandmarkVisibilityFromStorage() {
       localStorage.setItem(LANDMARK_VISIBILITY_STORAGE_KEY, JSON.stringify([...hiddenIds]));
       localStorage.setItem(LANDMARK_ETLAQ_MIGRATION_KEY, "1");
     }
+    // Make the requested Haiyang marker visible once for existing installations;
+    // preserve every other choice and allow hiding it again afterwards.
+    if (!localStorage.getItem("notam-map-haiyang-visible-v1")) {
+      hiddenIds.delete("oriental-spaceport");
+      localStorage.setItem(LANDMARK_VISIBILITY_STORAGE_KEY, JSON.stringify([...hiddenIds]));
+      localStorage.setItem("notam-map-haiyang-visible-v1", "1");
+    }
     state.hiddenLandmarkIds = hiddenIds;
   } catch {
     state.hiddenLandmarkIds = new Set();
@@ -3439,7 +3712,7 @@ function renderLandmarkCount() {
 }
 
 function isLandmarkVisible(id) {
-  return !state.hiddenLandmarkIds.has(id);
+  return !satelliteWorkspace?.active && !state.hiddenLandmarkIds.has(id);
 }
 
 function allLandmarksHidden() {
@@ -5705,15 +5978,154 @@ function initializeSatelliteControls() {
   restoreCustomSatelliteElements();
   rebuildSatelliteCatalogWithCustomElements();
   restoreSatelliteStyleSettings();
+  initializeSatelliteDisplayControls();
   if (els.satelliteSpeedSelect) els.satelliteSpeedSelect.value = String(state.satellitePlaybackMagnitude);
   syncSatelliteControls();
   renderCustomSatelliteElements();
 }
 
+function satelliteDisplayIds(component, ids = state.satelliteVisibleIds) {
+  if (component === "communications" && ((state.satelliteCommunicationAngleMode === "elevation" && state.satelliteCommunicationAngle === 90)
+    || (state.satelliteCommunicationAngleMode === "offNadir" && state.satelliteCommunicationAngle === 0))) return [];
+  if (!state.satelliteOnlyPicked[component]) return ids;
+  const cached = state.satelliteDisplayIdsCache.get(component);
+  if (cached?.source === ids) return cached.ids;
+  const filtered = SATELLITE_DISPLAY.filter(ids, component, state.satellitePickedIds, state.satelliteOnlyPicked);
+  state.satelliteDisplayIdsCache.set(component, { source: ids, ids: filtered });
+  return filtered;
+}
+
+function satelliteComponentVisible(id, component) {
+  return SATELLITE_DISPLAY.allowed(id, component, state.satellitePickedIds, state.satelliteOnlyPicked);
+}
+
+function satelliteCommunicationEnvelope(profile, altitudeKm) {
+  return SATELLITE_DISPLAY.envelope(SATELLITE_PAYLOADS, profile, altitudeKm,
+    state.satelliteCommunicationAngleMode, state.satelliteCommunicationAngle);
+}
+
+function satelliteExtendedAlpha(strength, legacy, ceiling = 0.98) {
+  const amount = SATELLITE_DISPLAY.normalize("imagingOpacity", strength);
+  return SATELLITE_DISPLAY.extendAlpha(amount, legacy(clamp(amount, 0.05, 1)), ceiling);
+}
+
+function satelliteDenseLineThreshold() {
+  // Native WebGL lines ignore width. Preserve the fast dense default, but honor
+  // an explicitly changed width with the existing instanced ribbon renderer.
+  return state.satelliteOrbitLineWidth === 1.5 ? SATELLITE_DENSE_ORBIT_LINE_THRESHOLD : Infinity;
+}
+
+function refreshSatelliteDisplaySelection() {
+  state.satelliteDisplayIdsCache.clear();
+  satelliteCanvasCandidateCache = { key: "", ids: [] };
+  satelliteGpuPositionRevision += 1;
+  satelliteGpuCoverageRevision += 1;
+  invalidateSatelliteStaticLayers({ orbit: true, coverage: true });
+  syncSatelliteDisplayControls();
+  drawSatelliteOverlay();
+  requestSatelliteThreeDraw();
+}
+
+function toggleSatellitePicked(id) {
+  const key = String(id);
+  if (!state.selectedSatelliteIds.has(key)) return;
+  if (state.satellitePickedIds.has(key)) state.satellitePickedIds.delete(key);
+  else state.satellitePickedIds.add(key);
+  hideTooltip({ force: true });
+  refreshSatelliteDisplaySelection();
+}
+
+function initializeSatelliteDisplayControls() {
+  const panel = document.getElementById("satellitePickedControls");
+  panel?.addEventListener("change", event => {
+    const component = event.target.dataset.satelliteOnlyPicked;
+    if (!SATELLITE_DISPLAY.components.includes(component)) return;
+    state.satelliteOnlyPicked[component] = event.target.checked;
+    refreshSatelliteDisplaySelection();
+  });
+  panel?.addEventListener("click", event => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    if (button.dataset.satelliteUnpick) { toggleSatellitePicked(button.dataset.satelliteUnpick); return; }
+    const action = button.dataset.satellitePickAction;
+    if (!action) return;
+    if (action === "clear") state.satellitePickedIds.clear();
+    for (const key of SATELLITE_DISPLAY.components) state.satelliteOnlyPicked[key] = action === "isolate";
+    refreshSatelliteDisplaySelection();
+  });
+  document.getElementById("satelliteCommunicationAngleMode")?.addEventListener("change", event => {
+    state.satelliteCommunicationAngleMode = SATELLITE_DISPLAY.angleMode(event.target.value);
+    updateSatelliteCommunicationAngle();
+    if (isSatelliteMode()) renderList();
+  });
+  for (const id of ["satelliteCommunicationAngleInput", "satelliteCommunicationAngleNumber"]) {
+    const input = document.getElementById(id);
+    input?.addEventListener("input", () => {
+      if (input.value === "" || !Number.isFinite(Number(input.value))) return;
+      state.satelliteCommunicationAngle = SATELLITE_DISPLAY.normalize("communicationAngle", input.value);
+      updateSatelliteCommunicationAngle();
+    });
+    input?.addEventListener("change", () => {
+      input.value = String(state.satelliteCommunicationAngle);
+      if (isSatelliteMode()) renderList();
+    });
+  }
+}
+
+function updateSatelliteCommunicationAngle() {
+  state.satelliteCoverageGeometryById.clear();
+  satelliteGpuCoverageRevision += 1;
+  invalidateSatelliteStaticLayers({ coverage: true });
+  saveSatelliteStyleSettings();
+  syncSatelliteDisplayControls();
+  hideTooltip({ force: true });
+  drawSatelliteOverlay();
+  requestSatelliteThreeDraw();
+}
+
+function syncSatelliteDisplayControls() {
+  const el = id => document.getElementById(id);
+  const panel = el("satellitePickedControls");
+  if (!panel) return;
+  const count = state.satellitePickedIds.size;
+  const visibleCount = state.satelliteVisibleIds.reduce((n, id) => n + Number(state.satellitePickedIds.has(id)), 0);
+  const filtered = SATELLITE_DISPLAY.components.some(key => state.satelliteOnlyPicked[key]);
+  el("satellitePickedStatus").textContent = `点选 ${count} 颗 · 当前分类中 ${visibleCount} 颗`;
+  const summary = el("satellitePickedSummary");
+  if (summary) summary.textContent = `Shift 点选 ${count} 颗${filtered ? " · 已限制部分图层" : ""}`;
+  el("satellitePickedNote").textContent = filtered && visibleCount === 0
+    ? "当前没有可显示的点选卫星；受限图层为空。点击「恢复全部」可恢复画面。"
+    : "按住 Shift 点击星点，多次点击可多选；再次点击可取消。下方勾选的图层只显示点选卫星，未勾选的仍显示全部。";
+  panel.querySelectorAll("[data-satellite-only-picked]").forEach(input => { input.checked = state.satelliteOnlyPicked[input.dataset.satelliteOnlyPicked]; });
+  const isolate = panel.querySelector('[data-satellite-pick-action="isolate"]');
+  isolate.disabled = count === 0;
+  const list = el("satellitePickedList");
+  const signature = [...state.satellitePickedIds].map(id => `${id}:${state.satelliteById.get(id)?.name || ""}`).join("|");
+  if (list.dataset.signature !== signature) {
+    list.dataset.signature = signature;
+    list.innerHTML = [...state.satellitePickedIds].slice(0, 100).map(id => {
+      const name = state.satelliteById.get(id)?.name || id;
+      return `<button type="button" data-satellite-unpick="${escapeHtml(id)}" title="取消点选 ${escapeHtml(name)}">${escapeHtml(name)} <small>${escapeHtml(id)}</small> ×</button>`;
+    }).join("") + (count > 100 ? `<span>另有 ${count - 100} 颗点选卫星；所有点选均参与显示。</span>` : "");
+  }
+  const mode = state.satelliteCommunicationAngleMode;
+  el("satelliteCommunicationAngleMode").value = mode;
+  for (const id of ["satelliteCommunicationAngleInput", "satelliteCommunicationAngleNumber"]) {
+    const input = el(id);
+    input.disabled = mode === "profile";
+    if (document.activeElement !== input) input.value = String(state.satelliteCommunicationAngle);
+  }
+  el("satelliteCommunicationAngleHelp").textContent = mode === "profile"
+    ? "使用各星座原有公开参数或估算模型，保留当前覆盖范围。"
+    : mode === "elevation"
+      ? "地面最低仰角：0° 为地平线，角度越大，覆盖越小；90° 收缩为星下点。适用于已识别的通信卫星。"
+      : "卫星离轴半角：从星下方向向外量，角度越大，覆盖越大；超过地球边缘自动截到地平线。0° 不绘制圆面。";
+}
+
 function restoreSatelliteStyleSettings() {
   try {
     const stored = JSON.parse(localStorage.getItem(SATELLITE_STYLE_STORAGE_KEY) || "{}");
-    state.satelliteOrbitLineWidth = clamp(Number(stored.orbitLineWidth) || state.satelliteOrbitLineWidth, 0.5, 5);
+    state.satelliteOrbitLineWidth = SATELLITE_DISPLAY.normalize("orbitLineWidth", stored.orbitLineWidth);
     state.satellitePointSize = clamp(
       Number(stored.pointSize) || state.satellitePointSize,
       SATELLITE_POINT_SIZE_MIN,
@@ -5724,8 +6136,10 @@ function restoreSatelliteStyleSettings() {
       SATELLITE_LABEL_SIZE_MIN,
       SATELLITE_LABEL_SIZE_MAX,
     );
-    state.satelliteImagingOpacity = clamp(Number(stored.imagingOpacity) || state.satelliteImagingOpacity, 0.05, 1);
-    state.satelliteCommunicationOpacity = clamp(Number(stored.communicationOpacity) || state.satelliteCommunicationOpacity, 0.05, 1);
+    state.satelliteImagingOpacity = SATELLITE_DISPLAY.normalize("imagingOpacity", stored.imagingOpacity);
+    state.satelliteCommunicationOpacity = SATELLITE_DISPLAY.normalize("communicationOpacity", stored.communicationOpacity);
+    state.satelliteCommunicationAngleMode = SATELLITE_DISPLAY.angleMode(stored.communicationAngleMode);
+    state.satelliteCommunicationAngle = SATELLITE_DISPLAY.normalize("communicationAngle", stored.communicationAngle);
     state.satelliteAllLabelsEnabled = stored.allLabels === true;
   } catch {
     // Keep the documented defaults when local settings are unavailable.
@@ -5741,6 +6155,8 @@ function saveSatelliteStyleSettings() {
       imagingOpacity: state.satelliteImagingOpacity,
       communicationOpacity: state.satelliteCommunicationOpacity,
       allLabels: state.satelliteAllLabelsEnabled,
+      communicationAngleMode: state.satelliteCommunicationAngleMode,
+      communicationAngle: state.satelliteCommunicationAngle,
     }));
   } catch {
     // The current-session settings still remain active.
@@ -6176,11 +6592,12 @@ async function pollSatelliteRefreshStatus() {
 }
 
 function rebuildSatelliteCatalogWithCustomElements() {
-  const merged = new Map((state.satelliteCatalogItems || []).map((item) => {
+  const merged = new Map(window.NotamSatelliteCatalogId.canonicalizeCatalog(state.satelliteCatalogItems || []).map((item) => {
     const enriched = SATELLITE_IDENTITIES?.enrich?.(item) || item;
     return [String(enriched.id), enriched];
   }));
-  for (const [id, custom] of state.satelliteCustomElementsById.entries()) {
+  for (const [rawId, custom] of state.satelliteCustomElementsById.entries()) {
+    const id = window.NotamSatelliteCatalogId.normalizeCatalogId(rawId) || rawId;
     const catalogItem = merged.get(String(id)) || null;
     const customName = String(custom?.name || "").trim();
     const fallbackName = `NORAD ${id}`;
@@ -6205,7 +6622,7 @@ function rebuildSatelliteCatalogWithCustomElements() {
       elementSets: Array.isArray(custom.elementSets) ? custom.elementSets : [],
     });
   }
-  state.satellites = [...merged.values()];
+  state.satellites = window.NotamSatelliteCatalogId.canonicalizeCatalog([...merged.values()]);
   state.satelliteById = new Map(state.satellites.map((item) => [String(item.id), item]));
   state.satellitePayloadById = new Map();
   state.satellitePayloadSearchById = new Map();
@@ -6215,16 +6632,18 @@ function rebuildSatelliteCatalogWithCustomElements() {
     if (profile) state.satellitePayloadById.set(String(item.id), profile);
   }
   state.satelliteSeriesById = SATELLITE_SERIES?.classifyCatalog?.(
-    state.satellites.filter(isActiveSatellitePayloadItem),
+    state.satellites,
     (item) => state.satellitePayloadById.get(String(item?.id || item?.noradId || "")) || null,
   ) || new Map();
   for (const item of state.satellites) {
-    if (!isActiveSatellitePayloadItem(item)) continue;
     const profile = state.satellitePayloadById.get(String(item.id)) || null;
     const classification = state.satelliteSeriesById.get(String(item.id)) || null;
     const seriesKey = classification?.key || SATELLITE_SERIES?.classify(item, profile) || "UNCLASSIFIED";
     const seriesInfo = SATELLITE_SERIES?.describe?.(seriesKey) || null;
     const searchText = [
+      SATELLITE_SERIES?.searchText?.(item, classification),
+      item.catalogName,
+      ...(item.identityAliases || []),
       profile?.constellation,
       profile?.sensor,
       profile?.service,
@@ -6657,6 +7076,8 @@ function handleSatelliteWorkerMessage(event, workerIndex) {
     if (point) {
       fitSatellitePosition(point);
       state.satellitePendingFitId = "";
+    } else if (state.satellitePropagationErrorIds.has(state.satellitePendingFitId)) {
+      state.satellitePendingFitId = "";
     }
   }
   if (isInteractiveRender()) scheduleDraw();
@@ -7056,6 +7477,7 @@ function formatFixedZoneClock(timeMs, offsetHours) {
 }
 
 function syncSatelliteControls() {
+  syncSatelliteDisplayControls();
   syncSourceToggleButton(els.satelliteLayerToggle, state.satelliteLayerEnabled);
   syncSourceToggleButton(els.satelliteOrbitLinesToggle, state.satelliteOrbitLinesEnabled);
   syncSourceToggleButton(els.satelliteLabelsToggle, state.satelliteLabelsEnabled);
@@ -7379,6 +7801,8 @@ function syncSatelliteObjectSelectionButton(button, objectClass) {
 }
 
 function updateSatelliteSelectionStatus() {
+  satelliteWorkspace?.sync(`已选 ${state.selectedSatelliteIds.size.toLocaleString("zh-CN")} 颗 · 已计算 ${state.satelliteVisibleIds.length.toLocaleString("zh-CN")} 颗`);
+  satelliteAnalysis?.sync();
   if (!els.satelliteSelectionStatus) return;
   const requested = visibleSelectedSatelliteIds().length;
   const drawable = state.satellitePositions.size;
@@ -7387,13 +7811,14 @@ function updateSatelliteSelectionStatus() {
     requested - drawable,
   );
   const bulk = requested >= SATELLITE_GPU_BULK_THRESHOLD ? " · GPU 批量模式" : "";
-  const orbitText = state.satelliteOrbitLinesEnabled && requested
-    ? ` · 轨道 ${satelliteDrawableOrbitCount.toLocaleString("zh-CN")}/${requested.toLocaleString("zh-CN")}`
+  const orbitRequested = satelliteDisplayIds("orbits").length;
+  const orbitText = state.satelliteOrbitLinesEnabled && orbitRequested
+    ? ` · 轨道 ${satelliteDrawableOrbitCount.toLocaleString("zh-CN")}/${orbitRequested.toLocaleString("zh-CN")}`
     : "";
   const unavailableText = satelliteWorkerReady && unavailable
     ? ` · 当前历元不可传播 ${unavailable.toLocaleString("zh-CN")} 颗`
     : "";
-  const text = `已选 ${state.selectedSatelliteIds.size.toLocaleString("zh-CN")} 颗 · 当前绘制 ${drawable.toLocaleString("zh-CN")} 颗${orbitText}${unavailableText}${bulk}`;
+  const text = `已选 ${state.selectedSatelliteIds.size.toLocaleString("zh-CN")} 颗 · 已计算 ${drawable.toLocaleString("zh-CN")} 颗${orbitText}${unavailableText}${bulk}`;
   if (els.satelliteSelectionStatus.textContent !== text) els.satelliteSelectionStatus.textContent = text;
 }
 
@@ -7402,6 +7827,9 @@ function isInactiveSatelliteItem(item) {
 }
 
 function satelliteObjectClass(item) {
+  const physical = state.satelliteSeriesById.get(String(item?.id || ""))?.physicalType;
+  if (physical === "ROCKET_BODY") return "ROCKET_BODY";
+  if (physical === "DEBRIS" || physical === "COMPONENT") return "DEBRIS";
   if (item?.objectClass) return String(item.objectClass);
   if (item?.catalogClass === "INACTIVE" || item?.operationalState === "inactive" || item?.operationalStatusCode === "-") return "RETIRED_PAYLOAD";
   return "ACTIVE_PAYLOAD";
@@ -7429,76 +7857,89 @@ function satelliteObjectIds(objectClass) {
 }
 
 function satelliteConstellationKey(item) {
-  if (!isActiveSatellitePayloadItem(item)) return "";
-  const catalogClassification = state.satelliteSeriesById.get(String(item?.id || item?.noradId || ""));
-  if (catalogClassification?.key) return catalogClassification.key;
-  const name = String(item?.name || "").toUpperCase();
-  const profile = state.satellitePayloadById.get(String(item?.id));
-  const constellation = String(profile?.constellation || "").toUpperCase();
-  const resolvedSeries = SATELLITE_SERIES?.classify(item, profile) || "";
-  if (resolvedSeries) return resolvedSeries;
-  if (name.includes("STARLINK") || constellation === "STARLINK") return "STARLINK";
-  if (name.includes("ONEWEB") || constellation.includes("ONEWEB")) return "ONEWEB";
-  if (/(?:KUIPER|AMAZON LEO)/.test(name) || constellation.includes("AMAZON LEO")) return "AMAZON_LEO";
-  if (/(?:GUOWANG|HULIANWANG|HULIANWAN|GAOGUI|DIGUI)/.test(name) || constellation.includes("GUOWANG") || constellation.includes("星网")) return "GUOWANG";
-  if (name.includes("QIANFAN") || constellation.includes("QIANFAN")) return "QIANFAN";
-  if (/^NAVSTAR /.test(name) || /^GPS (?:BIIR|BIIF|III)/.test(name)) return "GPS";
-  if (/\[GLONASS-(?:M|K|K1|K2)\]/.test(name) || /^GLONASS/.test(name)) return "GLONASS";
-  if (/^BEIDOU-/.test(name)) return "BEIDOU";
-  if (/GALILEO/.test(name) || /^GSAT\d+/.test(name)) return "GALILEO";
-  if (/\b(?:TJS|TONGXIN JISHU SHIYAN)(?:-|\s|$)/.test(name)) return "TJS";
-  if (/\b(?:CHINASAT|ZHONGXING)(?:-|\s)/.test(name)) return "CHINASAT";
-  if (/\bYAOGAN(?:-|\s)/.test(name)) return "YAOGAN";
-  if (/\bGAOFEN(?:-|\s)/.test(name)) return "GAOFEN";
-  if (/\b(?:ZIYUAN|CBERS)(?:-|\s)/.test(name)) return "ZIYUAN";
-  if (/\bFENGYUN(?:-|\s)/.test(name)) return "FENGYUN";
-  if (/\bRESURS(?:-|\s)/.test(name)) return "RESURS";
-  if (/\bKANOPUS(?:-|\s)/.test(name)) return "KANOPUS";
-  if (/\bKONDOR(?:-|\s)/.test(name)) return "KONDOR";
-  if (/\bMETEOR(?:-|\s)/.test(name)) return "METEOR";
-  if (/\bGONETS(?:-|\s)/.test(name)) return "GONETS";
-  if (/\bLUCH(?:-|\s)/.test(name)) return "LUCH";
-  if (/\bEXPRESS(?:-|\s)/.test(name)) return "EXPRESS";
-  if (/\bYAMAL(?:-|\s)/.test(name)) return "YAMAL";
-  if (/\bLANDSAT(?:-|\s)/.test(name)) return "LANDSAT";
-  if (/\b(?:COSMO-SKYMED|CSG-)/.test(name)) return "COSMO_SKYMED";
-  if (/\b(?:RADARSAT|RCM-)/.test(name)) return "RADARSAT";
-  if (/\bPLEIADES(?:-|\s)/.test(name)) return "PLEIADES";
-  if (/\bKOMPSAT(?:-|\s)/.test(name)) return "KOMPSAT";
-  if (/^(?:FLOCK |SKYSAT-|PELICAN-|TANAGER-|DOVE[- ]3$)/.test(name)) return "PLANET";
-  if (/^(?:WORLDVIEW-|GEOEYE |LEGION )/.test(name)) return "VANTOR";
-  if (/^GLOBAL-/.test(name)) return "BLACKSKY";
-  if (/^ICEYE-X/.test(name)) return "ICEYE";
-  if (/^CAPELLA-/.test(name)) return "CAPELLA";
-  if (/^UMBRA-/.test(name)) return "UMBRA";
-  if (/^NUSAT-/.test(name)) return "SATELLOGIC";
-  if (/^STRIX-/.test(name)) return "SYNSPECTIVE";
-  if (/^QPS-SAR-/.test(name)) return "IQPS";
-  if (/^FIREFLY-/.test(name)) return "PIXXEL";
-  if (/^GRUS-/.test(name)) return "AXELSPACE";
-  if (name.includes("JILIN") || constellation.includes("吉林一号")) return "JILIN";
-  if (name.includes("SENTINEL") || constellation.startsWith("SENTINEL")) return "SENTINEL";
-  return "";
+  return state.satelliteSeriesById.get(String(item?.id || item?.noradId || ""))?.groupKey || "";
+}
+
+function satelliteMemberships(item) {
+  const c = state.satelliteSeriesById.get(String(item?.id || item?.noradId || ""));
+  return c ? [c, ...(c.relatedGroups || [])] : [];
 }
 
 function satelliteRetiredConstellationKey(item) {
-  if (isActiveSatellitePayloadItem(item)) return "";
-  const resolvedSeries = SATELLITE_SERIES?.classify(item, null) || "";
-  return SATELLITE_RETIRED_SERIES_KEYS.has(resolvedSeries) ? resolvedSeries : "";
+  return "";
+}
+
+// Rebuild only when the catalog changes; animation and selections only update counts.
+function renderSatelliteSeriesTree() {
+  rebuildSatelliteExplorer();
+  const grid = document.getElementById("satelliteCountrySeriesGrid");
+  if (!grid) return;
+  const expanded = new Set([...grid.querySelectorAll("details[open]")].map((node) => node.dataset.country));
+  const countries = new Map();
+  for (const [key, ids] of state.satelliteConstellationIdsByKey) {
+    const classification = satelliteMemberships(state.satelliteById.get(ids[0])).find(c => c.groupKey === key);
+    if (!classification) continue;
+    const code = classification.countryCode;
+    if (!countries.has(code)) countries.set(code, { code, label: classification.country, total: 0, ids: new Set(), groups: [] });
+    const country = countries.get(code), statuses = { active: 0, retired: 0, unknown: 0 };
+    for (const id of ids) {
+      const item = state.satelliteById.get(id);
+      if (satelliteObjectClass(item) === "ACTIVE_PAYLOAD") statuses.active++;
+      else if (satelliteObjectClass(item) === "RETIRED_PAYLOAD") statuses.retired++;
+      else statuses.unknown++;
+    }
+    for (const id of ids) country.ids.add(id);
+    country.total = country.ids.size;
+    country.groups.push({ key, label: classification.label, seriesKey: classification.key, total: ids.length, statuses });
+  }
+  const order = { US: 0, PRC: 1, CIS: 2 };
+  const sorted = [...countries.values()].sort((a,b) => (order[a.code] ?? 10) - (order[b.code] ?? 10) || a.label.localeCompare(b.label, "zh-CN"));
+  grid.innerHTML = sorted.map((country) => {
+    const groups = country.groups.sort((a,b) => {
+      const generic = (key) => ["OTHER_PAYLOAD", "UNCLASSIFIED", "ROCKET_BODY", "COMPONENT", "DEBRIS"].includes(key) ? 1 : 0;
+      return generic(a.seriesKey) - generic(b.seriesKey) || b.total - a.total || a.label.localeCompare(b.label,"zh-CN");
+    });
+    const buttons = groups.map((group) => {
+      const info = SATELLITE_SERIES?.describe?.(group.seriesKey);
+      const search = [country.label, country.code, group.label, group.seriesKey, ...(info?.aliases || [])].join(" ").toUpperCase();
+      const status = ["ROCKET_BODY", "COMPONENT", "DEBRIS"].includes(group.seriesKey) ? "公开轨道对象" : `在役 ${group.statuses.active} · 退役 ${group.statuses.retired} · 状态未知 ${group.statuses.unknown}`;
+      return `<button type="button" data-satellite-constellation="${escapeHtml(group.key)}" data-series-label="${escapeHtml(country.label + ' — ' + group.label)}" data-series-search="${escapeHtml(search)}" data-series-status="${escapeHtml(status)}"><strong>${escapeHtml(group.label)}</strong><span data-satellite-constellation-count="${escapeHtml(group.key)}">${group.total}</span><small>${status}</small></button>`;
+    }).join("");
+    return `<details class="satellite-series-country" data-country="${escapeHtml(country.code)}" ${expanded.has(country.code) || (!expanded.size && ["US", "PRC"].includes(country.code)) ? "open" : ""}><summary><strong>${escapeHtml(country.label)}</strong><span>${country.total.toLocaleString("zh-CN")} 个 · ${groups.length} 类</span></summary><div class="satellite-series-country-body">${buttons}</div></details>`;
+  }).join("");
+  const summary = document.getElementById("satelliteSeriesCoverage");
+  if (summary) summary.textContent = `${state.satellites.length.toLocaleString("zh-CN")} 个对象均有分类入口 · ${countries.size} 个国家 / 机构 · ${state.satelliteConstellationIdsByKey.size} 个分组。按目录所属国家 / 机构分类；托管任务另提供任务国家入口。分组可重叠，同一对象仅绘制一次。候选身份不计入已确认系列。`;
+  filterSatelliteSeriesTree();
+}
+
+function filterSatelliteSeriesTree() {
+  const query = String(document.getElementById("satelliteSeriesFilter")?.value || "").trim().toUpperCase();
+  const terms = query.split(/\s+/).filter(Boolean);
+  document.querySelectorAll("#satelliteCountrySeriesGrid details").forEach((country) => {
+    let visible = 0;
+    country.querySelectorAll("[data-series-search]").forEach((button) => {
+      const matches = terms.every((term) => button.dataset.seriesSearch.includes(term));
+      button.hidden = !matches;
+      if (matches) visible++;
+    });
+    country.hidden = !visible;
+    if (query && visible) country.open = true;
+  });
 }
 
 function rebuildSatelliteConstellationCounts() {
   const counts = new Map();
   const idsByKey = new Map();
   for (const item of state.satellites) {
-    const key = satelliteConstellationKey(item) || satelliteRetiredConstellationKey(item);
-    if (!key) continue;
-    counts.set(key, (counts.get(key) || 0) + 1);
-    if (!idsByKey.has(key)) idsByKey.set(key, []);
-    idsByKey.get(key).push(String(item.id));
+    for (const key of new Set(satelliteMemberships(item).map(c => c.groupKey))) {
+      counts.set(key, (counts.get(key) || 0) + 1);
+      if (!idsByKey.has(key)) idsByKey.set(key, []);
+      idsByKey.get(key).push(String(item.id));
+    }
   }
   state.satelliteConstellationCounts = counts;
   state.satelliteConstellationIdsByKey = idsByKey;
+  renderSatelliteSeriesTree();
 }
 
 function satelliteConstellationIds(key) {
@@ -7506,6 +7947,8 @@ function satelliteConstellationIds(key) {
 }
 
 function syncSatelliteConstellationControls() {
+  satelliteAnalysis?.sync();
+  satelliteExplorer?.syncSelection(state.selectedSatelliteIds, satelliteSelectionRevision);
   document.querySelectorAll("[data-satellite-constellation]").forEach((button) => {
     const key = String(button.dataset.satelliteConstellation || "");
     const total = state.satelliteConstellationCounts.get(key) || 0;
@@ -7520,14 +7963,11 @@ function syncSatelliteConstellationControls() {
     const selectionHint = partial
       ? `已选择 ${selected.toLocaleString("zh-CN")}/${total.toLocaleString("zh-CN")}；按住 Shift 点击补全，再次 Shift 点击取消`
       : "按住 Shift 点击可与其他星座多选；再次 Shift 点击可取消";
-    button.title = info ? `${info.country} · ${info.purpose}\n${selectionHint}` : selectionHint;
+    button.title = `${button.dataset.seriesLabel || info?.label || key}\n${button.dataset.seriesStatus || ""}\n${info?.purpose || ""}\n${selectionHint}`;
     button.disabled = !total;
     const count = button.querySelector("[data-satellite-constellation-count]");
     if (count) {
-      const identitySummary = SATELLITE_IDENTITIES?.summary?.(key) || null;
-      count.textContent = identitySummary?.physicalInOrbit > total
-        ? `${total.toLocaleString("zh-CN")}/${identitySummary.physicalInOrbit.toLocaleString("zh-CN")}`
-        : total.toLocaleString("zh-CN");
+      count.textContent = total.toLocaleString("zh-CN");
     }
   });
 }
@@ -7555,7 +7995,10 @@ function toggleSatelliteConstellation(key, options = {}) {
   } else {
     for (const id of ids) {
       const item = state.satelliteById.get(String(id));
-      if (item) state.satelliteObjectClasses.add(satelliteObjectClass(item));
+      if (item) {
+        state.satelliteObjectClasses.add(satelliteObjectClass(item));
+        state.satelliteOrbitClasses.add(item.orbitClass);
+      }
     }
   }
   state.selectedSatelliteIds = next;
@@ -7697,14 +8140,14 @@ function formatSatelliteOffset(days) {
 }
 
 function pruneSatelliteSelection() {
-  state.selectedSatelliteIds = new Set([...state.selectedSatelliteIds].filter((id) => state.satelliteById.has(String(id))).slice(0, SATELLITE_MAX_SELECTED));
+  state.selectedSatelliteIds = new Set([...state.selectedSatelliteIds].map((id) => window.NotamSatelliteCatalogId.normalizeCatalogId(id) || String(id)).filter((id) => state.satelliteById.has(String(id))).slice(0, SATELLITE_MAX_SELECTED));
 }
 
 function restoreSatelliteSelection() {
   if (state.selectedSatelliteIds.size) return;
   try {
     const stored = JSON.parse(localStorage.getItem(SATELLITE_SELECTION_STORAGE_KEY) || "[]");
-    state.selectedSatelliteIds = new Set((Array.isArray(stored) ? stored : []).map(String).filter((id) => state.satelliteById.has(id)).slice(0, SATELLITE_MAX_SELECTED));
+    state.selectedSatelliteIds = new Set((Array.isArray(stored) ? stored : []).map((id) => window.NotamSatelliteCatalogId.normalizeCatalogId(id) || String(id)).filter((id) => state.satelliteById.has(id)).slice(0, SATELLITE_MAX_SELECTED));
   } catch {
     state.selectedSatelliteIds.clear();
   }
@@ -7804,6 +8247,8 @@ function visibleSelectedSatelliteIds() {
 }
 
 function rebuildSatelliteSelectionCaches() {
+  state.satelliteDisplayIdsCache.clear();
+  for (const id of state.satellitePickedIds) if (!state.selectedSatelliteIds.has(id)) state.satellitePickedIds.delete(id);
   const visible = [];
   const imaging = [];
   const communication = [];
@@ -7811,8 +8256,9 @@ function rebuildSatelliteSelectionCaches() {
   for (const id of state.selectedSatelliteIds) {
     const key = String(id);
     const item = state.satelliteById.get(key);
-    const constellationKey = satelliteConstellationKey(item) || satelliteRetiredConstellationKey(item);
-    if (constellationKey) selectedConstellationCounts.set(constellationKey, (selectedConstellationCounts.get(constellationKey) || 0) + 1);
+    for (const constellationKey of new Set(satelliteMemberships(item).map(c => c.groupKey))) {
+      selectedConstellationCounts.set(constellationKey, (selectedConstellationCounts.get(constellationKey) || 0) + 1);
+    }
     if (!satelliteCategoryEnabled(item)) continue;
     visible.push(key);
     const profile = state.satellitePayloadById.get(key);
@@ -7844,7 +8290,8 @@ function rebuildSatelliteSelectionCaches() {
 }
 
 function satelliteSearchMatches(query = state.notamIdSearch.trim().toUpperCase()) {
-  const normalized = String(query || "").trim().toUpperCase();
+  const rawQuery = String(query || "").trim().toUpperCase();
+  const normalized = /^[A-HJ-NP-Z]\d{4}$/.test(rawQuery) ? window.NotamSatelliteCatalogId.normalizeCatalogId(rawQuery) : rawQuery;
   if (!normalized) return state.satellites.filter((item) => satelliteCategoryEnabled(item) && state.selectedSatelliteIds.has(item.id));
   const index = getSatelliteSearchIndex();
   if (satelliteSearchResultCache?.index === index && satelliteSearchResultCache.query === normalized) return satelliteSearchResultCache.items;
@@ -7877,9 +8324,16 @@ function scheduleSatelliteSearchRender() {
 }
 
 function satelliteListItems() {
+  if (satelliteWorkspace?.active && satelliteWorkspaceListScope) {
+    const items = state.notamIdSearch.trim() ? satelliteSearchMatches() : getSatelliteSearchIndex().sorted;
+    return satelliteWorkspaceListScope === "all" ? items : items.filter(item => satelliteWorkspaceListScope.has(String(item.id)));
+  }
   if (state.notamIdSearch.trim()) return satelliteSearchMatches();
   return getSatelliteSearchIndex().sorted.filter((item) => satelliteCategoryEnabled(item) && state.selectedSatelliteIds.has(item.id));
 }
+
+let satelliteListPage = 0;
+let satelliteListSignature = "";
 
 function renderSatelliteList() {
   const items = satelliteListItems();
@@ -7892,9 +8346,19 @@ function renderSatelliteList() {
     els.restrictionList.innerHTML = `<p class="empty-text">没有匹配的空间对象。可按名称、NORAD 编号、国际编号、国家、轨道或对象类型搜索完整目录。</p>`;
     return;
   }
-  const visible = items.slice(0, 180);
-  const overflow = items.length > visible.length ? `<p class="empty-text">完整目录匹配 ${items.length} 个对象；列表显示前 ${visible.length} 个，可继续缩小搜索范围。</p>` : "";
-  els.restrictionList.innerHTML = overflow + visible.map(satelliteCardHtml).join("");
+  const signature = state.notamIdSearch + "|" + items.map(item => item.id).join(",");
+  if (signature !== satelliteListSignature) { satelliteListPage = 0; satelliteListSignature = signature; }
+  const pageSize = 60, pageCount = Math.ceil(items.length / pageSize);
+  satelliteListPage = Math.min(satelliteListPage, pageCount - 1);
+  const visible = items.slice(satelliteListPage * pageSize, (satelliteListPage + 1) * pageSize);
+  const overflow = pageCount > 1 ? `<div class="satellite-list-pagination"><span>共 ${items.length} 个对象 · 第 ${satelliteListPage + 1} / ${pageCount} 页</span><button type="button" data-satellite-page="-1" ${satelliteListPage === 0 ? "disabled" : ""}>上一页</button><button type="button" data-satellite-page="1" ${satelliteListPage === pageCount - 1 ? "disabled" : ""}>下一页</button></div>` : "";
+  const focusedId = document.activeElement?.dataset.satelliteId;
+  els.restrictionList.innerHTML = overflow + visible.map(satelliteCardHtml).join("") + overflow;
+  els.restrictionList.querySelectorAll("[data-satellite-archive]").forEach(details => details.addEventListener("toggle", () => { if (details.open) satelliteExpandedCards.add(details.dataset.satelliteArchive); else satelliteExpandedCards.delete(details.dataset.satelliteArchive); }));
+  if (focusedId) [...els.restrictionList.querySelectorAll("[data-satellite-id]")].find(b => b.dataset.satelliteId === focusedId)?.focus({ preventScroll: true });
+  els.restrictionList.querySelectorAll("[data-satellite-page]").forEach(button => {
+    button.addEventListener("click", () => { satelliteListPage += Number(button.dataset.satellitePage); renderSatelliteList(); els.restrictionList.scrollTop = 0; if(satelliteWorkspace?.active) document.getElementById('swPanel-members').scrollTop=0; });
+  });
   els.restrictionList.querySelectorAll("[data-satellite-id]").forEach((button) => {
     button.addEventListener("click", () => toggleSatelliteSelection(button.dataset.satelliteId, { fit: true }));
   });
@@ -7905,25 +8369,27 @@ function satelliteCardHtml(item) {
   const activeElement = satelliteActiveElement(item);
   const color = satelliteDisplayColor(item);
   const profile = state.satellitePayloadById.get(String(item?.id)) || null;
-  const payloadLine = satellitePayloadCardLine(item);
-  const launchDateLine = satelliteLaunchDateLine(item, profile);
+  const classification = state.satelliteSeriesById.get(String(item.id));
+  const identifiedName = classification?.matchedName && classification.matchedName !== String(item.name).toUpperCase() ? ` · 识别名 ${classification.matchedName}` : "";
+  const evidenceLine = classification ? [classification.evidenceLabel, classification.reviewNote, classification.relatedGroups?.length ? '同时列入：' + classification.relatedGroups.map(g => g.country + ' — ' + g.label).join('；') : ''].filter(Boolean).join(' · ') : '';
+  const candidateNames = classification?.candidate?.names?.filter(name => name && name !== '-' && !classification.aliases.includes(name)) || [];
+  const candidateLine = candidateNames.length ? '候选信息（未采用为确定身份）：' + candidateNames.join(' / ') + '；' + classification.candidate.reason : '';
+  const categoryLine = classification ? `${classification.country} — ${classification.label}${identifiedName}` : "";
+  const payloadLine = [categoryLine, satellitePayloadCardLine(item)].filter(Boolean).join(" · ");
   const resolutionLine = satelliteImagingResolutionLine(profile);
   const category = `${satelliteObjectClassLabel(item)} · ${item.orbitClass}`;
   const elementLabel = item.customOrbit
     ? `用户输入 ${item.elementSets?.length || 1} 组`
     : state.satelliteElementMode === "historical" ? "Space-Track 历史" : "当前";
-  return `
-    <button class="satellite-card ${selected ? "selected" : ""}" style="--satellite-accent:${color}" type="button" data-satellite-id="${escapeHtml(item.id)}">
-      <strong>${escapeHtml(item.name)}</strong>
-      <span>${escapeHtml(category)} · NORAD ${escapeHtml(item.noradId)}${item.internationalDesignator ? ` · ${escapeHtml(item.internationalDesignator)}` : ""}</span>
-      <small>近地点 ${Math.round(activeElement.perigeeKm ?? item.perigeeKm)} km · 远地点 ${Math.round(activeElement.apogeeKm ?? item.apogeeKm)} km · 倾角 ${Number(activeElement.inclinationDeg ?? item.inclinationDeg).toFixed(2)}°</small>
-      <small>周期 ${formatSatellitePeriod(activeElement.periodMinutes || item.periodMinutes)} · ${escapeHtml(elementLabel)}根数历元 ${escapeHtml(formatTimeZoneDate(activeElement.epoch, "Asia/Shanghai"))}</small>
-      <small>对象分类：${escapeHtml(item.objectTypeLabel || satelliteObjectClassLabel(item))} · 运行状态：${escapeHtml(item.operationalStatusLabel || "不适用")}${item.owner ? ` · 所属 ${escapeHtml(item.owner)}` : ""}</small>
-      <small>${escapeHtml(launchDateLine)}</small>
-      ${resolutionLine ? `<small class="satellite-resolution-line">${escapeHtml(resolutionLine)}</small>` : ""}
-      ${payloadLine ? `<small class="satellite-payload-line">${escapeHtml(payloadLine)}</small>` : ""}
-      <small>${selected ? "已加入地球轨道层" : "点击加入轨道层"}</small>
-    </button>`;
+  return `<article class="sw-satellite-card ${selected ? "selected" : ""}" style="--satellite-accent:${color}">
+    <header><div><strong>${escapeHtml(item.name)}</strong><small>NORAD ${escapeHtml(item.noradId)} · ${escapeHtml(item.internationalDesignator || '国际编号未提供')}</small><small>${escapeHtml(categoryLine || category)}</small></div><button type="button" data-satellite-id="${escapeHtml(item.id)}" aria-pressed="${selected}">${selected ? '移除' : '加入'}</button></header>
+    <details data-satellite-archive="${escapeHtml(item.id)}" ${satelliteExpandedCards.has(String(item.id)) ? 'open' : ''}><summary>发射与轨道档案</summary><dl>${satelliteLaunchFieldsHtml(item, profile)}
+      <dt>对象类型</dt><dd>${escapeHtml(classification?.physicalType === 'COMPONENT' ? '分离部件 / 适配器' : satelliteObjectClassLabel(item))} · ${escapeHtml(item.orbitClass || '轨道类型未知')}${item.owner?' · 目录归属 '+escapeHtml(item.owner):''}</dd>
+      <dt>近地 / 远地</dt><dd>${Math.round(activeElement.perigeeKm ?? item.perigeeKm)} / ${Math.round(activeElement.apogeeKm ?? item.apogeeKm)} km</dd><dt>倾角 / 周期</dt><dd>${Number(activeElement.inclinationDeg ?? item.inclinationDeg).toFixed(2)}° · ${formatSatellitePeriod(activeElement.periodMinutes || item.periodMinutes)}</dd><dt>轨道历元</dt><dd>${escapeHtml(formatTimeZoneDate(activeElement.epoch, "Asia/Shanghai"))} 北京时间 · ${escapeHtml(elementLabel)}根数</dd><dt>运行状态</dt><dd>${escapeHtml(item.operationalStatusLabel || '未提供')}</dd></dl>
+      ${[resolutionLine,payloadLine,evidenceLine,candidateLine].filter(Boolean).map(line => '<p class="sw-card-meta">'+escapeHtml(line)+'</p>').join('')}
+      <p class="sw-card-meta">发射时间与轨道历元是不同信息。上面级来自该火箭的对应构型资料。</p>
+    </details></article>`;
+
 }
 
 function satelliteLaunchDateLine(item, profile = null) {
@@ -7973,11 +8439,12 @@ function satellitePayloadCardLine(item) {
   }
   if (profile.kind === "navigation") return `${profile.constellation} · ${profile.service || "卫星导航定位授时"} · 逐星轨道显示`;
   const altitudeKm = (Number(item.perigeeKm) + Number(item.apogeeKm)) / 2;
-  const envelope = SATELLITE_PAYLOADS.communicationEnvelope(profile, altitudeKm);
+  const envelope = satelliteCommunicationEnvelope(profile, altitudeKm);
   if (!envelope) return profile.constellation;
-  const angle = envelope.offNadirDeg
+  const angle = envelope.offNadirDeg !== null
     ? `离轴扫描 ${envelope.offNadirDeg.toFixed(0)}°（折算地面仰角 ${envelope.minElevationDeg.toFixed(0)}°）`
     : `最低仰角 ${envelope.minElevationDeg.toFixed(0)}°`;
+  if (envelope.custom) return `${profile.constellation} · 自定义${angle} · 几何包络半径 ${formatCoverageKm(envelope.radiusKm)}（模拟设置）`;
   const range = profile.estimated
     ? ` · 合理半径 ${formatCoverageKm(envelope.radiusMinKm)}-${formatCoverageKm(envelope.radiusMaxKm)}`
     : "";
@@ -8062,6 +8529,7 @@ function drawSatelliteOverlay() {
   ctx.clearRect(0, 0, width, height);
   state.satelliteScreenPoints = [];
   if (!state.satelliteLayerEnabled || !isGlobeLayer() || !state.selectedSatelliteIds.size) {
+    satelliteLabelLayout.reset();
     state.satelliteSwathHandle = null;
     els.canvas?.classList.remove("satellite-swath-edit-mode");
     clearSatelliteStaticCanvases();
@@ -8072,12 +8540,13 @@ function drawSatelliteOverlay() {
   const projectionParams = globeParams(width, height);
   const gpuActive = Boolean(globeRendererState?.satelliteGpuLayer);
   if (isInteractiveRender()) satelliteInteractionFrameCount += 1;
-  drawSatelliteOrbitLayer(ids, width, height, projectionParams);
+  drawSatelliteOrbitLayer(satelliteDisplayIds("orbits", ids), width, height, projectionParams);
   drawSatelliteCoverageLayer(ids, width, height, projectionParams);
 
   const labelCandidates = [];
   const dense = ids.length > 180;
-  const candidateIds = satelliteCanvasCandidateIds(ids, projectionParams, width, height);
+  const canvasIds = ids.filter(id => satelliteComponentVisible(id, "points") || satelliteComponentVisible(id, "labels"));
+  const candidateIds = satelliteCanvasCandidateIds(canvasIds, projectionParams, width, height);
   const visualScale = satelliteVisualScaleForZoom();
   ctx.save();
   for (const id of candidateIds) {
@@ -8088,8 +8557,10 @@ function drawSatelliteOverlay() {
     const point = projectSatellitePoint(displayPosition.lon, displayPosition.lat, displayPosition.altitudeKm, projectionParams);
     if (!point.visible || point.x < -20 || point.x > width + 20 || point.y < -20 || point.y > height + 20) continue;
     const color = satelliteDisplayColor(item);
-    const focused = id === state.satelliteFocusedId || id === state.satelliteHoverId;
-    if (!gpuActive || focused) {
+    const picked = state.satellitePickedIds.has(id);
+    const focused = picked || id === state.satelliteFocusedId || id === state.satelliteHoverId;
+    const pointVisible = satelliteComponentVisible(id, "points");
+    if (pointVisible && (!gpuActive || focused)) {
       ctx.beginPath();
       const baseRadius = state.satellitePointSize * visualScale * 0.5;
       ctx.arc(point.x, point.y, focused ? baseRadius + 2 : dense ? baseRadius * 0.72 : baseRadius, 0, Math.PI * 2);
@@ -8101,8 +8572,12 @@ function drawSatelliteOverlay() {
       ctx.fill();
       ctx.stroke();
     }
-    state.satelliteScreenPoints.push({ id, x: point.x, y: point.y, altitudeKm: displayPosition.altitudeKm });
-    labelCandidates.push({ id, item, point, color, focused });
+    if (picked && pointVisible) {
+      ctx.save(); ctx.beginPath(); ctx.arc(point.x, point.y, state.satellitePointSize * visualScale * 0.5 + 6, 0, Math.PI * 2);
+      ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.5; ctx.shadowBlur = 0; ctx.stroke(); ctx.restore();
+    }
+    if (pointVisible) state.satelliteScreenPoints.push({ id, x: point.x, y: point.y, altitudeKm: displayPosition.altitudeKm });
+    if (satelliteComponentVisible(id, "labels")) labelCandidates.push({ id, item, point, color, focused });
   }
   ctx.restore();
   const labelStats = state.satelliteLabelsEnabled
@@ -8158,7 +8633,7 @@ function drawSatelliteSwathPlannerOverlay(ctx, width, height, projectionParams) 
     delete els.satelliteCanvas.dataset.swathRollDeg;
   }
   els.canvas?.classList.toggle("satellite-swath-edit-mode", Boolean(state.satelliteSwathEditEnabled && focusedSatelliteImagingContext()));
-  if (!state.satelliteSwathEditEnabled) return;
+  if (!state.satelliteSwathEditEnabled || !satelliteComponentVisible(state.satelliteFocusedId, "imaging") || state.satelliteImagingOpacity === 0) return;
   const context = focusedSatelliteImagingContext();
   if (!context) return;
   const centerPoint = projectSatellitePoint(context.target.lon, context.target.lat, 0, projectionParams);
@@ -8252,7 +8727,10 @@ function satelliteCanvasCandidateIds(ids, projectionParams, width, height) {
   const candidates = [];
   const candidateSet = new Set();
   const idSet = new Set(ids);
-  const priority = [state.satelliteFocusedId, state.satelliteHoverId].map(String).filter(Boolean);
+  // Keep established labels in the candidate pool across ranking refreshes and
+  // reduced interaction budgets; visibility is still checked before drawing.
+  const priority = [...state.satellitePickedIds, state.satelliteFocusedId, state.satelliteHoverId, ...satelliteLabelLayout.activeIds()]
+    .filter(id => id != null).map(String).filter(Boolean);
   for (const id of priority) {
     if (idSet.has(id) && !candidateSet.has(id)) {
       candidates.push(id);
@@ -8516,13 +8994,13 @@ function drawSatelliteCoverageLayer(ids, width, height, projectionParams) {
     }
     canvas.dataset.viewSignature = `${Math.round(width)}:${Math.round(height)}:gpu`;
     canvas.dataset.coverageCount = String(layer.coverageCount || 0);
-    canvas.dataset.coverageUnavailable = String(Math.max(0, state.satelliteCommunicationIds.length - (layer.coverageCount || 0)));
+    canvas.dataset.coverageUnavailable = String(Math.max(0, satelliteDisplayIds("communications", state.satelliteCommunicationIds).length - (layer.coverageCount || 0)));
     canvas.dataset.renderer = "webgl-instanced";
     return;
   }
   const coverageIds = [
-    ...(state.satelliteImagingEnabled ? state.satelliteImagingIds : []),
-    ...(state.satelliteCommunicationEnabled ? state.satelliteCommunicationIds : []),
+    ...(state.satelliteImagingEnabled && state.satelliteImagingOpacity > 0 ? satelliteDisplayIds("imaging", state.satelliteImagingIds) : []),
+    ...(state.satelliteCommunicationEnabled && state.satelliteCommunicationOpacity > 0 ? satelliteDisplayIds("communications", state.satelliteCommunicationIds) : []),
   ];
   const viewSignature = satelliteViewSignature(width, height);
   const signature = `${viewSignature}:${state.satelliteCoverageEnabled}:${state.satelliteImagingEnabled}:${state.satelliteCommunicationEnabled}:${state.satelliteImagingOpacity}:${state.satelliteCommunicationOpacity}:${satelliteSelectionRevision}:${Math.round(state.satelliteTimeMs / 250)}`;
@@ -8558,7 +9036,7 @@ function drawSatelliteCoverageLayer(ids, width, height, projectionParams) {
       : displayPosition;
     const fillAlpha = profile.kind === "communications"
       ? satelliteCommunicationSingleCoverageAlpha(communicationCount, state.satelliteCommunicationOpacity)
-      : state.satelliteImagingOpacity * 0.58;
+      : satelliteExtendedAlpha(state.satelliteImagingOpacity, amount => clamp(amount * 0.58, 0.008, 0.32));
     drawSatelliteSurfaceRing(
       ctx,
       ring,
@@ -8579,6 +9057,8 @@ function cachedSatelliteCoverageRing(id, profile, position, circleSegments) {
   const imagingOverride = profile.kind === "imaging" ? state.satelliteSwathTargets.get(String(id)) : null;
   const key = [
     profile.kind,
+    state.satelliteCommunicationAngleMode,
+    state.satelliteCommunicationAngle,
     Number(position.lon).toFixed(6),
     Number(position.lat).toFixed(6),
     Number(position.altitudeKm).toFixed(3),
@@ -8618,7 +9098,7 @@ function satelliteImagingRing(profile, position, target = null) {
 }
 
 function satelliteCommunicationRing(profile, position, segments) {
-  const radiusKm = SATELLITE_PAYLOADS?.communicationCoverageRadiusKm(profile, position.altitudeKm) || 0;
+  const radiusKm = satelliteCommunicationEnvelope(profile, position.altitudeKm)?.radiusKm || 0;
   if (!(radiusKm > 0)) return null;
   const ring = [];
   for (let index = 0; index < segments; index += 1) {
@@ -8661,7 +9141,7 @@ function drawSatelliteSurfaceRing(ctx, ring, center, width, height, color, fillA
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
   if (scanLines) drawSatelliteImagingScanLines(ctx, projected, satellitePosition, color, projectionParams);
-  ctx.fillStyle = hexToRgba(color, clamp(fillAlpha, 0.008, 0.32));
+  ctx.fillStyle = hexToRgba(color, clamp(fillAlpha, 0, 0.98));
   const allVisible = projected.every((point) => point.visible);
   if (allVisible) {
     ctx.beginPath();
@@ -8694,7 +9174,7 @@ function drawSatelliteSurfaceRing(ctx, ring, center, width, height, color, fillA
   }
   ctx.strokeStyle = color;
   const coverageStrength = scanLines ? state.satelliteImagingOpacity : state.satelliteCommunicationOpacity;
-  ctx.globalAlpha = clamp(0.2 + coverageStrength * 0.78, 0.24, 0.96);
+  ctx.globalAlpha = satelliteExtendedAlpha(coverageStrength, amount => clamp(0.2 + amount * 0.78, 0.24, 0.96));
   ctx.lineWidth = 1;
   ctx.stroke();
   ctx.restore();
@@ -8718,7 +9198,7 @@ function drawSatelliteImagingScanLines(ctx, projectedRing, satellitePosition, co
     ctx.lineTo(point.x, point.y);
   }
   ctx.strokeStyle = color;
-  ctx.globalAlpha = clamp(0.28 + state.satelliteImagingOpacity * 0.62, 0.32, 0.92);
+  ctx.globalAlpha = satelliteExtendedAlpha(state.satelliteImagingOpacity, amount => clamp(0.28 + amount * 0.62, 0.32, 0.92));
   ctx.lineWidth = 0.55 + state.satelliteImagingOpacity * 0.55;
   ctx.setLineDash([1.5, 1.35]);
   ctx.lineDashOffset = -0.5;
@@ -8735,83 +9215,83 @@ function projectSatellitePoint(lon, lat, altitudeKm, projectionParams) {
 }
 
 function drawSatelliteLabels(ctx, candidates, width, height, projectionParams) {
-  const placed = [];
   const forceAll = state.satelliteAllLabelsEnabled;
   const globeRadiusPx = Math.max(1, Number(projectionParams?.radius) || Math.min(width, height) * 0.42);
-  const labelPriority = (candidate) => SATELLITE_ORBIT_POLICY?.labelScreenPriority?.(
-    Math.hypot(candidate.point.x - width / 2, candidate.point.y - height / 2),
-    globeRadiusPx,
-    state.view.zoom,
-  ) ?? Math.hypot(candidate.point.x - width / 2, candidate.point.y - height / 2);
-  const ordered = [...candidates].sort((a, b) => Number(b.focused) - Number(a.focused)
-    || labelPriority(a) - labelPriority(b)
-    || b.point.depth - a.point.depth);
-  ctx.save();
   const visualScale = satelliteVisualScaleForZoom();
   const fontSize = Math.max(4, Math.round(state.satelliteLabelSize * visualScale));
-  ctx.font = `600 ${fontSize}px Segoe UI, Arial`;
+  const font = `600 ${fontSize}px Segoe UI, Arial`;
+  ctx.save();
+  ctx.font = font;
   ctx.textBaseline = "middle";
   ctx.lineJoin = "round";
-  let drawn = 0;
-  const labelLimit = forceAll
-    ? candidates.length
-    : SATELLITE_ORBIT_POLICY?.labelLimit
+  const labelLimit = forceAll ? candidates.length : SATELLITE_ORBIT_POLICY?.labelLimit
     ? SATELLITE_ORBIT_POLICY.labelLimit(state.satelliteVisibleIds.length, state.view.zoom, width, height)
     : state.satelliteVisibleIds.length > 2000 ? 18 : state.satelliteVisibleIds.length > 600 ? 32 : 54;
-  for (const candidate of ordered) {
-    if (drawn >= labelLimit && !candidate.focused) break;
+  const prepared = candidates.map(candidate => {
     const text = candidate.item.name;
-    const textWidth = Math.ceil(ctx.measureText(text).width);
+    const metricKey = font + ":" + text;
+    let textWidth = satelliteLabelMetrics.get(metricKey);
+    if (textWidth === undefined) {
+      textWidth = Math.ceil(ctx.measureText(text).width);
+      satelliteLabelMetrics.set(metricKey, textWidth);
+      if (satelliteLabelMetrics.size > 12000) satelliteLabelMetrics.delete(satelliteLabelMetrics.keys().next().value);
+    }
     const labelHeight = fontSize + 7;
     const pointOffset = state.satellitePointSize * visualScale * 0.5 + Math.max(3, 7 * visualScale);
     const offsets = candidate.focused
       ? [[pointOffset + 5, -labelHeight], [pointOffset + 5, labelHeight * 0.6], [-textWidth - pointOffset - 9, -labelHeight]]
       : [[pointOffset, -labelHeight * 0.65], [pointOffset, labelHeight * 0.5], [-textWidth - pointOffset - 8, -labelHeight * 0.65]];
-    let box = null;
-    let anchor = null;
-    for (const [dx, dy] of offsets) {
-      const left = candidate.point.x + dx;
-      const top = candidate.point.y + dy - labelHeight * 0.5;
-      const next = { left, right: left + textWidth + 8, top, bottom: top + labelHeight };
-      if (next.left < 2 || next.right > width - 2 || next.top < 2 || next.bottom > height - 2) continue;
-      if (!forceAll && !candidate.focused && placed.some((other) => placeLabelBoxesOverlap(next, other))) continue;
-      box = next;
-      anchor = { x: left + 4, y: top + labelHeight * 0.5 };
-      break;
-    }
-    if (!box || !anchor) continue;
-    placed.push(box);
+    const distance = Math.hypot(candidate.point.x - width / 2, candidate.point.y - height / 2);
+    return { ...candidate, text, priority: SATELLITE_ORBIT_POLICY?.labelScreenPriority?.(distance, globeRadiusPx, state.view.zoom) ?? distance,
+      boxes: offsets.map(([dx, dy]) => {
+        const left = candidate.point.x + dx, top = candidate.point.y + dy - labelHeight * 0.5;
+        return { left, right: left + textWidth + 8, top, bottom: top + labelHeight };
+      }) };
+  });
+  const result = satelliteLabelLayout.layout(prepared, { width, height, limit: labelLimit, forceAll, now: performance.now() });
+  for (const { candidate, box, opacity } of result.labels) {
+    const anchor = { x: box.left + 4, y: (box.top + box.bottom) / 2 };
     if (candidate.focused) {
-      ctx.beginPath();
-      ctx.moveTo(candidate.point.x, candidate.point.y);
-      ctx.lineTo(anchor.x - 3, anchor.y);
-      ctx.strokeStyle = candidate.color;
-      ctx.globalAlpha = 0.75;
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(candidate.point.x, candidate.point.y); ctx.lineTo(anchor.x - 3, anchor.y);
+      ctx.strokeStyle = candidate.color; ctx.globalAlpha = 0.75 * opacity; ctx.lineWidth = 1; ctx.stroke();
     }
-    ctx.globalAlpha = candidate.focused ? 1 : 0.82;
+    ctx.globalAlpha = (candidate.focused ? 1 : 0.82) * opacity;
     ctx.lineWidth = 3.5;
     ctx.strokeStyle = "rgba(2, 7, 10, 0.92)";
     ctx.fillStyle = candidate.focused ? "#ffffff" : candidate.color;
-    ctx.strokeText(text, anchor.x, anchor.y);
-    ctx.fillText(text, anchor.x, anchor.y);
-    drawn += 1;
+    ctx.strokeText(candidate.text, anchor.x, anchor.y);
+    ctx.fillText(candidate.text, anchor.x, anchor.y);
   }
   ctx.restore();
-  if (els.satelliteCanvas) {
-    els.satelliteCanvas.dataset.labelPriorityMode = forceAll
-      ? "all-visible"
-      : SATELLITE_ORBIT_POLICY?.labelPriorityMode?.(state.view.zoom) || "local";
+  if (result.needsAnimation && satelliteLabelFadeFrame === null && !state.satellitePlaybackRate) {
+    satelliteLabelFadeFrame = requestAnimationFrame(() => {
+      satelliteLabelFadeFrame = null;
+      if (state.satelliteLayerEnabled && state.satelliteLabelsEnabled && isGlobeLayer()) drawSatelliteOverlay();
+    });
   }
-  return { drawn, limit: labelLimit };
+  if (els.satelliteCanvas) els.satelliteCanvas.dataset.labelPriorityMode = forceAll
+    ? "all-visible" : SATELLITE_ORBIT_POLICY?.labelPriorityMode?.(state.view.zoom) || "local";
+  return { drawn: result.labels.length, limit: labelLimit };
 }
 
-function hitTestSatellite(x, y) {
+function hitTestSatellite(x, y, exhaustive = false) {
   if (!state.satelliteLayerEnabled || !isGlobeLayer()) return null;
   let best = null;
   const visualScale = satelliteVisualScaleForZoom();
-  for (const point of state.satelliteScreenPoints || []) {
+  let points = state.satelliteScreenPoints || [];
+  if (exhaustive && globeRendererState?.satelliteGpuLayer) {
+    const rect = els.satelliteCanvas.getBoundingClientRect();
+    const params = globeParams(rect.width, rect.height);
+    points = [];
+    for (const id of satelliteDisplayIds("points")) {
+      const position = state.satellitePositions.get(id);
+      if (!position) continue;
+      const display = satellitePredictedPosition(position);
+      const point = projectSatellitePoint(display.lon, display.lat, display.altitudeKm, params);
+      if (point.visible) points.push({ id, x: point.x, y: point.y, altitudeKm: display.altitudeKm });
+    }
+  }
+  for (const point of points) {
     const distance = Math.hypot(point.x - x, point.y - y);
     if (distance > Math.max(8, state.satellitePointSize * visualScale * 0.5 + 6) || (best && distance >= best.distance)) continue;
     best = { ...point, distance };
@@ -8873,21 +9353,21 @@ function satellitePayloadTooltipHtml(item, position) {
       <span>${escapeHtml(profile.note || "按逐星轨道根数传播，不绘制未经证实的实时服务波束。")}</span>
       ${profile.source?.label ? `<span>参数依据：${escapeHtml(profile.source.label)}</span>` : ""}`;
   }
-  const envelope = SATELLITE_PAYLOADS.communicationEnvelope(profile, position.altitudeKm);
+  const envelope = satelliteCommunicationEnvelope(profile, position.altitudeKm);
   if (!envelope) return "";
-  const angleLine = envelope.offNadirDeg
+  const angleLine = envelope.offNadirDeg !== null
     ? `中心模型：星载离轴扫描 ${envelope.offNadirDeg.toFixed(0)}°，在当前高度折算最低地面仰角 ${envelope.minElevationDeg.toFixed(1)}°`
     : `中心模型：最低用户仰角 ${envelope.minElevationDeg.toFixed(0)}°`;
-  const rangeLine = profile.estimated
+  const rangeLine = profile.estimated && !envelope.custom
     ? envelope.offNadirDeg
       ? `合理区间：离轴 ${envelope.offNadirMinDeg.toFixed(0)}°-${envelope.offNadirMaxDeg.toFixed(0)}°；地面仰角 ${envelope.minElevationMinDeg.toFixed(1)}°-${envelope.minElevationMaxDeg.toFixed(1)}°；半径 ${formatCoverageKm(envelope.radiusMinKm)}-${formatCoverageKm(envelope.radiusMaxKm)}`
       : `合理区间：最低仰角 ${envelope.minElevationMinDeg.toFixed(0)}°-${envelope.minElevationMaxDeg.toFixed(0)}°；半径 ${formatCoverageKm(envelope.radiusMinKm)}-${formatCoverageKm(envelope.radiusMaxKm)}`
     : "";
   return `
-    <span>通信星座：${escapeHtml(profile.constellation)} · ${escapeHtml(angleLine)}</span>
+    <span>通信星座：${escapeHtml(profile.constellation)} · ${envelope.custom ? "自定义角度（模拟设置） · " : ""}${escapeHtml(angleLine)}</span>
     <span>中心几何包络：半径 ${escapeHtml(formatCoverageKm(envelope.radiusKm))} · 直径 ${escapeHtml(formatCoverageKm(envelope.radiusKm * 2))}</span>
     ${rangeLine ? `<span>${escapeHtml(rangeLine)}</span>` : ""}
-    <span>参数证据：${escapeHtml(profile.evidenceLabel || "来源待核")}；该圆不是实时点波束、容量边界或服务承诺。</span>
+    <span>${envelope.custom ? "当前角度由用户设置；下列来源仅说明原始星座参数。" : "参数证据：" + escapeHtml(profile.evidenceLabel || "来源待核") + "；"}该圆不是实时点波束、容量边界或服务承诺。</span>
     <span>${escapeHtml(profile.note || "按 WGS-84 邻近球面视线几何计算，不代表单个实时点波束。")}</span>
     ${profile.source?.label ? `<span>参数依据：${escapeHtml(profile.source.label)}</span>` : ""}`;
 }
@@ -9800,7 +10280,7 @@ function scheduleDraw() {
 }
 
 function isInteractiveRender() {
-  return Boolean(state.view.drag || state.trajectoryDrag || globeInertiaFrame);
+  return Boolean(state.view.drag || state.trajectoryDrag || globeInertiaFrame || performance.now() < wheelInteractionUntil);
 }
 
 function trimImageCache(cache, maxItems) {
@@ -9833,8 +10313,11 @@ function initialBaseLayer() {
 }
 
 function syncLayerButtons() {
+  const workspaceButton = document.querySelector('[data-workspace="satellite"]');
+  workspaceButton?.classList.toggle("active", Boolean(satelliteWorkspace?.active));
+  workspaceButton?.setAttribute("aria-pressed", String(Boolean(satelliteWorkspace?.active)));
   document.querySelectorAll("[data-layer]").forEach((button) => {
-    const active = button.dataset.layer === state.baseLayer;
+    const active = !satelliteWorkspace?.active && button.dataset.layer === state.baseLayer;
     button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", String(active));
   });
@@ -11422,7 +11905,7 @@ function satelliteGpuAdvanceShaderSource() {
 function updateThreeTrajectoryGpu(globe) {
   const layer = globe?.trajectoryGpuLayer;
   if (!layer) return;
-  layer.group.visible = isGlobeLayer();
+  layer.group.visible = isGlobeLayer() && !satelliteWorkspace?.active;
   if (!layer.group.visible) return;
   const viewportWidth = Math.max(1, Number(globe.renderWidth) || 1);
   const viewportHeight = Math.max(1, Number(globe.renderHeight) || 1);
@@ -11591,7 +12074,7 @@ function updateThreeSatelliteGpu(globe) {
   if (!enabled) return;
 
   const interacting = isInteractiveRender();
-  const communicationCount = state.satelliteCommunicationIds.length;
+  const communicationCount = satelliteDisplayIds("communications", state.satelliteCommunicationIds).length;
   const bulkAnimating = Boolean(state.satellitePlaybackRate && communicationCount > 1500);
   const coverageSegments = communicationCount > 8000
     ? interacting || bulkAnimating ? 12 : 16
@@ -11634,16 +12117,17 @@ function updateThreeSatelliteGpu(globe) {
   layer.orbitMaterial.uniforms.cameraNear.value = Math.max(0.000001, Number(globe.camera?.near) || 0.02);
   const satelliteDisplayTimeMs = satelliteInterpolatedDisplayTimeMs();
   const orbitRotationRad = satelliteOrbitRotationRad(layer.orbitReferenceTimeMs, satelliteDisplayTimeMs);
-  const orbitOpacity = state.satelliteVisibleIds.length > 8000
+  const orbitDisplayCount = satelliteDisplayIds("orbits").length;
+  const orbitOpacity = orbitDisplayCount > 8000
     ? 0.2
-    : state.satelliteVisibleIds.length > 4000
+    : orbitDisplayCount > 4000
       ? 0.22
-      : state.satelliteVisibleIds.length > 1200
+      : orbitDisplayCount > 1200
         ? 0.25
-        : state.satelliteVisibleIds.length > 240 ? 0.3 : 0.76;
+        : orbitDisplayCount > 240 ? 0.3 : 0.76;
   layer.orbitMaterial.uniforms.earthRotationRad.value = orbitRotationRad;
   layer.orbitMaterial.uniforms.orbitOpacity.value = orbitOpacity;
-  const denseOrbitOpacity = satelliteDenseOrbitOpacity(state.satelliteVisibleIds.length);
+  const denseOrbitOpacity = satelliteDenseOrbitOpacity(orbitDisplayCount);
   layer.denseOrbitMaterial.uniforms.orbitOpacity.value = denseOrbitOpacity;
   layer.denseOrbits.quaternion.identity();
   layer.denseOrbits.rotation.y = -orbitRotationRad;
@@ -11664,30 +12148,33 @@ function updateThreeSatelliteGpu(globe) {
   layer.points.visible = state.satelliteLayerEnabled;
   layer.orbits.visible = state.satelliteOrbitLinesEnabled && !layer.denseOrbitMode && layer.orbitCount > 0;
   layer.denseOrbits.visible = state.satelliteOrbitLinesEnabled && layer.denseOrbitMode && layer.orbitCount > 0;
-  layer.coverageOutline.visible = state.satelliteCoverageEnabled && state.satelliteCommunicationEnabled && layer.coverageCount > 0;
+  layer.coverageOutline.visible = state.satelliteCoverageEnabled && state.satelliteCommunicationEnabled && state.satelliteCommunicationOpacity > 0 && layer.coverageCount > 0;
   layer.coverageFill.visible = layer.coverageOutline.visible;
-  layer.imagingFill.visible = state.satelliteCoverageEnabled && state.satelliteImagingEnabled && layer.imagingCount > 0;
+  layer.imagingFill.visible = state.satelliteCoverageEnabled && state.satelliteImagingEnabled && state.satelliteImagingOpacity > 0 && layer.imagingCount > 0;
   layer.imagingOutline.visible = layer.imagingFill.visible;
   layer.imagingScan.visible = layer.imagingFill.visible;
   layer.coverageOutlineMaterial.uniforms.coverageOpacity.value = layer.coverageCount > 2200
-    ? clamp(0.12 + state.satelliteCommunicationOpacity * 0.48, 0.14, 0.72)
-    : clamp(0.18 + state.satelliteCommunicationOpacity * 0.68, 0.22, 0.92);
+    ? satelliteExtendedAlpha(state.satelliteCommunicationOpacity, amount => clamp(0.12 + amount * 0.48, 0.14, 0.72))
+    : satelliteExtendedAlpha(state.satelliteCommunicationOpacity, amount => clamp(0.18 + amount * 0.68, 0.22, 0.92));
   layer.coverageFillMaterial.uniforms.coverageOpacity.value = satelliteCommunicationSingleCoverageAlpha(
     layer.coverageCount,
     state.satelliteCommunicationOpacity,
   );
-  layer.imagingFillMaterial.uniforms.coverageOpacity.value = clamp(0.1 + state.satelliteImagingOpacity * 0.42, 0.14, 0.54);
-  layer.imagingOutlineMaterial.uniforms.coverageOpacity.value = clamp(0.48 + state.satelliteImagingOpacity * 0.5, 0.54, 0.98);
-  layer.imagingScanMaterial.uniforms.coverageOpacity.value = clamp(0.42 + state.satelliteImagingOpacity * 0.52, 0.48, 0.96);
+  layer.imagingFillMaterial.uniforms.coverageOpacity.value = satelliteExtendedAlpha(state.satelliteImagingOpacity, amount => clamp(0.1 + amount * 0.42, 0.14, 0.54));
+  layer.imagingOutlineMaterial.uniforms.coverageOpacity.value = satelliteExtendedAlpha(state.satelliteImagingOpacity, amount => clamp(0.48 + amount * 0.5, 0.54, 0.98));
+  layer.imagingScanMaterial.uniforms.coverageOpacity.value = satelliteExtendedAlpha(state.satelliteImagingOpacity, amount => clamp(0.42 + amount * 0.52, 0.48, 0.96));
   if (els.globeCanvas) {
-    const unavailableCoverage = Math.max(0, state.satelliteCommunicationIds.length - layer.coverageCount);
+    const unavailableCoverage = Math.max(0, satelliteDisplayIds("communications", state.satelliteCommunicationIds).length - layer.coverageCount);
     els.globeCanvas.dataset.satelliteGpu = "true";
+    els.globeCanvas.dataset.satellitePickedCount = String(state.satellitePickedIds.size);
+    els.globeCanvas.dataset.satelliteCommunicationAngleMode = state.satelliteCommunicationAngleMode;
+    els.globeCanvas.dataset.satelliteCommunicationAngle = String(state.satelliteCommunicationAngle);
     els.globeCanvas.dataset.satelliteGpuPoints = String(layer.pointCount);
     els.globeCanvas.dataset.satelliteGpuZoomScale = visualScale.toFixed(4);
     els.globeCanvas.dataset.satelliteGpuPointSize = renderedPointSize.toFixed(2);
     els.globeCanvas.dataset.satelliteGpuPointOutlinePx = layer.pointMaterial.uniforms.pointOutlinePx.value.toFixed(2);
     els.globeCanvas.dataset.satelliteGpuCoverage = String(layer.coverageCount);
-    els.globeCanvas.dataset.satelliteGpuCoverageExpected = String(state.satelliteCommunicationIds.length);
+    els.globeCanvas.dataset.satelliteGpuCoverageExpected = String(satelliteDisplayIds("communications", state.satelliteCommunicationIds).length);
     els.globeCanvas.dataset.satelliteGpuCoverageUnavailable = String(unavailableCoverage);
     els.globeCanvas.dataset.satelliteGpuCoverageSegments = String(layer.coverageSegments);
     els.globeCanvas.dataset.satelliteGpuCoverageFill = layer.coverageFill.visible ? "visible" : "hidden";
@@ -11697,15 +12184,15 @@ function updateThreeSatelliteGpu(globe) {
     els.globeCanvas.dataset.satelliteGpuCoverageOverlap = "cumulative";
     els.globeCanvas.dataset.satelliteGpuCoverageOutlineMode = "front-facing-solid";
     els.globeCanvas.dataset.satelliteGpuImaging = String(layer.imagingCount);
-    els.globeCanvas.dataset.satelliteGpuImagingExpected = String(state.satelliteImagingIds.length);
-    els.globeCanvas.dataset.satelliteGpuImagingUnavailable = String(Math.max(0, state.satelliteImagingIds.length - layer.imagingCount));
-    els.globeCanvas.dataset.satelliteGpuImagingComplete = layer.imagingCount === state.satelliteImagingIds.length ? "true" : "false";
+    els.globeCanvas.dataset.satelliteGpuImagingExpected = String(satelliteDisplayIds("imaging", state.satelliteImagingIds).length);
+    els.globeCanvas.dataset.satelliteGpuImagingUnavailable = String(Math.max(0, satelliteDisplayIds("imaging", state.satelliteImagingIds).length - layer.imagingCount));
+    els.globeCanvas.dataset.satelliteGpuImagingComplete = layer.imagingCount === satelliteDisplayIds("imaging", state.satelliteImagingIds).length ? "true" : "false";
     els.globeCanvas.dataset.satelliteGpuImagingRenderer = "instanced-interpolated";
     els.globeCanvas.dataset.satelliteGpuImagingScanLines = String(layer.imagingCount * 4);
     els.globeCanvas.dataset.satelliteGpuImagingFill = layer.imagingFill.visible ? "visible" : "hidden";
     els.globeCanvas.dataset.satelliteGpuImagingFillOpacity = layer.imagingFillMaterial.uniforms.coverageOpacity.value.toFixed(4);
     els.globeCanvas.dataset.satelliteGpuImagingBeamMode = "high-density-dashed";
-    const expectedOrbitIds = satelliteOrbitPathIds(visibleSelectedSatelliteIds());
+    const expectedOrbitIds = satelliteOrbitPathIds(satelliteDisplayIds("orbits"));
     const propagationUnavailableIds = expectedOrbitIds.filter((id) => state.satellitePropagationErrorIds.has(String(id)));
     const transportMissingCount = [...satelliteOrbitMissingIds]
       .filter((id) => !state.satellitePropagationErrorIds.has(String(id))).length;
@@ -11753,10 +12240,8 @@ function updateThreeSatelliteGpu(globe) {
 }
 
 function satelliteCommunicationSingleCoverageAlpha(count, strength) {
-  const amount = clamp(Number(strength) || 0.45, 0.05, 1);
-  // Alpha blending is intentionally count-independent: each footprint contributes
-  // the same visible density, so 2x/3x overlaps genuinely accumulate on the globe.
-  return clamp(0.03 + amount * 0.14, 0.035, 0.18);
+  // Count independent, so each additional ring still accumulates density.
+  return satelliteExtendedAlpha(strength, amount => clamp(0.03 + amount * 0.14, 0.035, 0.18), 0.75);
 }
 
 function replaceThreeSatelliteCoverageGeometry(globe, layer, segments) {
@@ -11773,14 +12258,15 @@ function replaceThreeSatelliteCoverageGeometry(globe, layer, segments) {
 }
 
 function updateThreeSatellitePoints(globe, layer) {
-  const positions = new Float32Array(state.satelliteVisibleIds.length * 3);
-  const velocities = new Float32Array(state.satelliteVisibleIds.length * 3);
-  const nextPositions = new Float32Array(state.satelliteVisibleIds.length * 3);
-  const nextVelocities = new Float32Array(state.satelliteVisibleIds.length * 3);
-  const colors = new Float32Array(state.satelliteVisibleIds.length * 3);
+  const ids = satelliteDisplayIds("points");
+  const positions = new Float32Array(ids.length * 3);
+  const velocities = new Float32Array(ids.length * 3);
+  const nextPositions = new Float32Array(ids.length * 3);
+  const nextVelocities = new Float32Array(ids.length * 3);
+  const colors = new Float32Array(ids.length * 3);
   const colorCache = new Map();
   let count = 0;
-  for (const id of state.satelliteVisibleIds) {
+  for (const id of ids) {
     const position = state.satellitePositions.get(id);
     const item = state.satelliteById.get(id);
     if (!position || !item) continue;
@@ -11822,7 +12308,8 @@ function updateThreeSatellitePoints(globe, layer) {
 }
 
 function updateThreeSatelliteCommunicationCoverage(globe, layer) {
-  const maxCount = state.satelliteCommunicationIds.length;
+  const ids = satelliteDisplayIds("communications", state.satelliteCommunicationIds);
+  const maxCount = ids.length;
   const centers = new Float32Array(maxCount * 3);
   const velocities = new Float32Array(maxCount * 3);
   const nextCenters = new Float32Array(maxCount * 3);
@@ -11831,11 +12318,11 @@ function updateThreeSatelliteCommunicationCoverage(globe, layer) {
   const colors = new Float32Array(maxCount * 3);
   const colorCache = new Map();
   let count = 0;
-  for (const id of state.satelliteCommunicationIds) {
+  for (const id of ids) {
     const position = state.satellitePositions.get(id);
     const profile = state.satellitePayloadById.get(id);
     if (!position || !profile) continue;
-    const radiusKm = SATELLITE_PAYLOADS?.communicationCoverageRadiusKm(profile, position.altitudeKm) || 0;
+    const radiusKm = satelliteCommunicationEnvelope(profile, position.altitudeKm)?.radiusKm || 0;
     if (!(radiusKm > 0)) continue;
     const satellitePoint = satelliteReferenceScenePosition(position);
     const satelliteVelocity = satelliteReferenceSceneVelocity(position);
@@ -11907,7 +12394,8 @@ function updateThreeSatelliteCommunicationCoverage(globe, layer) {
 }
 
 function updateThreeSatelliteImagingCoverage(globe, layer) {
-  const maxCount = state.satelliteImagingIds.length;
+  const ids = satelliteDisplayIds("imaging", state.satelliteImagingIds);
+  const maxCount = ids.length;
   const centers = new Float32Array(maxCount * 3);
   const velocities = new Float32Array(maxCount * 3);
   const nextCenters = new Float32Array(maxCount * 3);
@@ -11923,7 +12411,7 @@ function updateThreeSatelliteImagingCoverage(globe, layer) {
   const colors = new Float32Array(maxCount * 3);
   const colorCache = new Map();
   let count = 0;
-  for (const id of state.satelliteImagingIds) {
+  for (const id of ids) {
     const position = state.satellitePositions.get(id);
     const profile = state.satellitePayloadById.get(id);
     if (!position || !profile) continue;
@@ -12102,7 +12590,7 @@ function satelliteFixedTargetReferenceMotion(target, position) {
 }
 
 function updateThreeSatelliteOrbits(globe, layer) {
-  const ids = satelliteOrbitPathIds(visibleSelectedSatelliteIds());
+  const ids = satelliteOrbitPathIds(satelliteDisplayIds("orbits"));
   if (satelliteGeometryFailed || typeof Worker !== "function" || ids.some(id => { const path = state.satelliteOrbitPaths.get(id); return path && !ArrayBuffer.isView(path); })) {
     updateThreeSatelliteOrbitsSynchronously(globe, layer); return;
   }
@@ -12144,7 +12632,7 @@ function updateThreeSatelliteOrbits(globe, layer) {
     requestSatelliteThreeDraw();
   };
   worker.postMessage({ ids, entries, updates, removeIds, referenceFrame, referenceEpochMs,
-    referenceTimeMs: satelliteLastPropagatedTimeMs || state.satelliteTimeMs, denseThreshold: SATELLITE_DENSE_ORBIT_LINE_THRESHOLD });
+    referenceTimeMs: satelliteLastPropagatedTimeMs || state.satelliteTimeMs, denseThreshold: satelliteDenseLineThreshold() });
 }
 
 function applySatelliteOrbitGeometry(globe, layer, data) {
@@ -12191,8 +12679,8 @@ function applySatelliteOrbitGeometry(globe, layer, data) {
 }
 
 function updateThreeSatelliteOrbitsSynchronously(globe, layer) {
-  const expectedOrbitIds = satelliteOrbitPathIds(visibleSelectedSatelliteIds());
-  const denseOrbitMode = expectedOrbitIds.length >= SATELLITE_DENSE_ORBIT_LINE_THRESHOLD;
+  const expectedOrbitIds = satelliteOrbitPathIds(satelliteDisplayIds("orbits"));
+  const denseOrbitMode = expectedOrbitIds.length >= satelliteDenseLineThreshold();
   const denseColorScale = expectedOrbitIds.length > 8000
     ? 0.74
     : expectedOrbitIds.length > 4000
@@ -14104,17 +14592,19 @@ function updateFlatBallisticAnimationGpu(session, frameItems, timestamp, width, 
 
 function buildRestrictionSurfaceCache(drawable, width, height, signature, reusableCache = null) {
   const dpr = Math.min(window.devicePixelRatio || 1, currentRenderDprCap());
-  // Keep the previous cached surface immutable while the GPU may still read it.
-  // Reusing its backing canvas can show an older area's pixels after filtering.
-  // Panning still reuses the completed cache in the translation fast path.
-  const canvas = document.createElement("canvas");
+  // Double buffer: never mutate the current cached/presented surface. Reuse only
+  // the older spare, avoiding a new GPU canvas allocation on every wheel frame.
+  const canvas = restrictionSurfaceSpareCanvas || document.createElement("canvas");
+  restrictionSurfaceSpareCanvas = null;
   const targetWidth = Math.max(1, Math.round(width * dpr));
   const targetHeight = Math.max(1, Math.round(height * dpr));
   if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
     canvas.width = targetWidth;
     canvas.height = targetHeight;
   }
-  const ctx = canvas.getContext("2d", { alpha: true });
+  // Explicit false keeps Chromium from migrating a reused surface to software
+  // rasterization after readback/compositing (which changes AA and causes stalls).
+  const ctx = canvas.getContext("2d", { alpha: true, willReadFrequently: false });
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -14136,7 +14626,8 @@ function buildRestrictionSurfaceCache(drawable, width, height, signature, reusab
       ctx.restore();
       continue;
     }
-    const geometryPaths = drawGeometry(ctx, displayGeometry, width, height, { paint: shouldPaint });
+    const geometryPaths = shouldPaint || retainHitPaths
+      ? drawGeometry(ctx, displayGeometry, width, height, { paint: shouldPaint, retainPaths: retainHitPaths }) : [];
     ctx.restore();
     if (retainHitPaths) {
       const hitArea = item.hitArea ?? geometryHitArea(displayGeometry);
@@ -14149,6 +14640,7 @@ function buildRestrictionSurfaceCache(drawable, width, height, signature, reusab
     if (!pathsById.has(path.id)) pathsById.set(path.id, []);
     pathsById.get(path.id).push(path);
   }
+  if (reusableCache?.canvas && reusableCache.canvas !== canvas) restrictionSurfaceSpareCanvas = reusableCache.canvas;
   return {
     signature,
     identity: restrictionItemsIdentity(drawnFilteredItems()),
@@ -14503,6 +14995,7 @@ function planarRingArea(points) {
 }
 
 function drawTrajectories(ctx, width, height) {
+  if (satelliteWorkspace?.active) return;
   const startedAt = performance.now();
   const ballisticLabels = [];
   const ballisticObstaclePaths = [];
@@ -17775,9 +18268,9 @@ function drawNoShapeMarkers(ctx, width, height) {
 
 function drawGeometry(ctx, geometry, width, height, options = {}) {
   const paint = options.paint !== false;
-  if (geometry.type === "Polygon") return drawGeoRings(ctx, geometry.coordinates, width, height, paint);
+  if (geometry.type === "Polygon") return drawGeoRings(ctx, geometry.coordinates, width, height, paint, options.retainPaths !== false);
   if (geometry.type === "MultiPolygon") {
-    return geometry.coordinates.flatMap((rings) => drawGeoRings(ctx, rings, width, height, paint));
+    return geometry.coordinates.flatMap((rings) => drawGeoRings(ctx, rings, width, height, paint, options.retainPaths !== false));
   }
   if (geometry.type === "Point") {
     const [lon, lat] = geometry.coordinates;
@@ -17953,7 +18446,67 @@ function normalizeLineForDrawing(coordinates) {
   return unwrapped.map(([lon, lat]) => [lon + shift, lat]);
 }
 
-function drawGeoRings(ctx, rings, width, height, paint = true) {
+function drawGeoRings(ctx, rings, width, height, paint = true, retainPaths = true) {
+  if (isGlobeLayer()) return drawGlobeGeoRings(ctx, rings, width, height, paint);
+  // At street-level magnification project in doubles before building the path.
+  // This avoids amplifying the browser's internal float path precision.
+  if (state.view.zoom >= 11) return drawGeoRingsProjected(ctx, rings, width, height, paint);
+  let source = flatPolygonPathCache.get(rings);
+  if (!source) {
+    const normalized = [];
+    let reference = 0;
+    for (const ring of rings) {
+      const coordinates = normalizeRingForDrawing(ring, reference);
+      if (!coordinates) continue;
+      if (!normalized.length) reference = averageRingLongitude(coordinates);
+      normalized.push(coordinates);
+    }
+    if (!normalized.length) return [];
+    const originX = (normalized[0][0][0] + 180) / 360;
+    const originY = mercatorYUnit(normalized[0][0][1]);
+    const path = new Path2D();
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const ring of normalized) {
+      ring.forEach(([lon, lat], index) => {
+        const x = (lon + 180) / 360 - originX, y = mercatorYUnit(lat) - originY;
+        if (index) path.lineTo(x, y); else path.moveTo(x, y);
+        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      });
+      path.closePath();
+    }
+    source = { path, originX, originY, minX, maxX, minY, maxY };
+    flatPolygonPathCache.set(rings, source);
+  }
+  const frame = flatProjectionFrameFor(width, height), scale = frame.worldSize;
+  const x = width / 2 + source.originX * scale - frame.centerX;
+  const y = height / 2 + source.originY * scale - frame.centerY;
+  const pad = ctx.lineWidth + 2;
+  if (y + source.maxY * scale < -pad || y + source.minY * scale > height + pad) return [];
+  const paths = [];
+  for (let copy = Math.ceil((-pad - x - source.maxX * scale) / scale);
+    copy <= Math.floor((width + pad - x - source.minX * scale) / scale); copy++) {
+    const tx = x + copy * scale;
+    if (paint) {
+      ctx.save();
+      ctx.translate(tx, y); ctx.scale(scale, scale);
+      ctx.lineWidth /= scale;
+      ctx.lineDashOffset /= scale;
+      const dash = ctx.getLineDash();
+      if (dash.length) ctx.setLineDash(dash.map(value => value / scale));
+      ctx.fill(source.path, "evenodd"); ctx.stroke(source.path);
+      ctx.restore();
+    }
+    if (retainPaths) {
+      const path = new Path2D();
+      path.addPath(source.path, { a: scale, b: 0, c: 0, d: scale, e: tx, f: y });
+      paths.push(path);
+    }
+  }
+  return paths;
+}
+
+function drawGeoRingsProjected(ctx, rings, width, height, paint = true) {
   if (isGlobeLayer()) return drawGlobeGeoRings(ctx, rings, width, height, paint);
   const path = new Path2D();
   let added = false;
@@ -18168,7 +18721,7 @@ function projectedIntersectsViewport(points, width, height) {
 
 function setupCanvas(canvas) {
   const rect = canvas.getBoundingClientRect();
-  const dpr = Math.min(currentRenderDprCap(), window.devicePixelRatio || 1);
+  const dpr = Math.min(canvas === els.satelliteCanvas ? RENDER_DPR_MAX : currentRenderDprCap(), window.devicePixelRatio || 1);
   const targetW = Math.max(1, Math.round(rect.width * dpr));
   const targetH = Math.max(1, Math.round(rect.height * dpr));
   if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -18743,6 +19296,14 @@ function dragTrajectoryCurve(event) {
 
 function zoomMap(event) {
   event.preventDefault();
+  wheelInteractionUntil = performance.now() + 160;
+  clearTimeout(wheelSettleTimer);
+  wheelSettleTimer = setTimeout(() => {
+    wheelInteractionUntil = 0;
+    // Restore full-resolution rendering and complete click paths after input stops.
+    restrictionSurfaceCache = null;
+    scheduleDraw();
+  }, 180);
   const wheelScale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 120 : 1;
   const zoomDelta = isGlobeLayer()
     ? clamp(-event.deltaY * wheelScale * 0.0025, -1.25, 1.25)
@@ -19349,17 +19910,21 @@ function handleCanvasClick(event) {
   const rect = els.canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
-  const satelliteHit = hitTestSatellite(x, y);
+  const satelliteHit = hitTestSatellite(x, y, true);
+  if (event.shiftKey && satelliteHit?.id) {
+    toggleSatellitePicked(satelliteHit.id);
+    return;
+  }
   const launchHit = hitTestLaunchSite(x, y);
   const customHit = hitTestCustomCoordinate(x, y);
   const hits = hitTestStack(x, y, rect.width, rect.height);
   const hit = hits[0] || null;
   const lonLat = unproject(x, y, rect.width, rect.height);
-  if (event?.ctrlKey && hit?.id) {
+  if (!satelliteWorkspace?.active && event?.ctrlKey && hit?.id) {
     toggleTimeWindowHint(hit.id);
     return;
   }
-  if (event?.ctrlKey && !hit?.id) {
+  if (!satelliteWorkspace?.active && event?.ctrlKey && !hit?.id) {
     clearTimeWindowHint();
     return;
   }
@@ -19473,6 +20038,7 @@ function handleCanvasClick(event) {
     renderList();
     syncSatelliteControls();
     showSatelliteTooltip(satelliteHit.id, event.clientX, event.clientY);
+    revealSatelliteWorkspaceMember(satelliteHit.id);
     drawSatelliteOverlay();
     return;
   }
@@ -21924,4 +22490,46 @@ function toDeg(value) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function marineCloudConfig(source) {
+  return {hydropac:{endpoint:'hydropac',label:'HYDROPAC',progress:updateHydropacProgress,load:loadHydropac,button:els.hydropacFetchButton},
+    navarea:{endpoint:'navarea-warnings',label:'NAVAREA',progress:updateNavareaProgress,load:loadNavareaWarnings,button:els.navareaFetchButton},
+    msa:{endpoint:'msa-warnings',label:'中国航警',progress:updateMsaProgress,load:loadMsaWarnings,button:els.msaFetchButton}}[source];
+}
+async function startMarineCloudRefresh(source) {
+  if (marineCloudJobs.has(source)) return;
+  const c=marineCloudConfig(source); marineCloudJobs.set(source,{failures:0});
+  if(c.button)c.button.disabled=true;
+  c.progress('busy',c.label+' 全量刷新请求中','当前区域继续显示');
+  try {
+    const response=await fetch('/api/'+c.endpoint+'?refresh=1',{cache:'no-store'});
+    const payload=await response.json();
+    if(!response.ok || !payload.refreshAccepted)throw Error(payload.message||'HTTP '+response.status);
+    c.progress('busy',c.label+' 云端全量刷新中',payload.source.backgroundRefresh.message);
+    monitorMarineCloudRefresh(source);
+  } catch(error) {
+    marineCloudJobs.delete(source); if(c.button)c.button.disabled=false;
+    c.progress('error',c.label+' 刷新未启动',error.message+'；已显示的区域保持不变');
+  }
+}
+function monitorMarineCloudRefresh(source) {
+  let job=marineCloudJobs.get(source);
+  if(!job){job={failures:0};marineCloudJobs.set(source,job);}
+  if(job.timer)return;
+  job.timer=setTimeout(async()=>{
+    job.timer=null;const c=marineCloudConfig(source);
+    try {
+      const response=await fetch('/api/'+c.endpoint+'?status=1',{cache:'no-store'});
+      if(!response.ok)throw Error('HTTP '+response.status);
+      const status=await response.json();job.failures=0;
+      if(status.active){if(c.button)c.button.disabled=true;c.progress('busy',c.label+' 云端全量刷新中',status.message);monitorMarineCloudRefresh(source);return;}
+      marineCloudJobs.delete(source);if(c.button)c.button.disabled=false;
+      if(status.lastRefresh?.status==='success'){await c.load(false);await loadRefreshHistory({source});}
+      else c.progress('error',c.label+' 本轮刷新未完成',status.lastRefresh?.message||'未取得完成结果，保留已有数据');
+    } catch(error) {
+      if(++job.failures<24){c.progress('busy',c.label+' 状态连接暂时中断','正在重连；已显示的区域保持不变');monitorMarineCloudRefresh(source);}
+      else {marineCloudJobs.delete(source);if(c.button)c.button.disabled=false;c.progress('error',c.label+' 状态暂不可用',error.message);}
+    }
+  },10000);
 }

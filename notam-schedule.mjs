@@ -58,10 +58,20 @@ function selector(text, context, begin, end) {
 // Deliberately all-or-nothing: a partly understood D field must not claim
 // precise times. Solar times, holidays and unrecognized syntax retain the raw
 // text and broad B/C validity with an explicit uncertainty label.
-export function parseNotamSchedule(raw, beginsAt, endsAt) {
-  if (!raw) return {timeIntervals: [], scheduleParsed: false, scheduleStatus: 'none'};
+export function parseNotamSchedule(raw, beginsAt, endsAt, activityText = '') {
   const unknown = reason => ({timeIntervals: [], scheduleParsed: false, scheduleStatus: 'unresolved', scheduleRawText: raw,
     scheduleReason: reason, scheduleLabel: `活动时段尚未完整解析（UTC 原文）：${raw}；${reason}`});
+  // D) may only give an outer daily window. A conditional activation notice in
+  // E) must not be silently presented as a confirmed daily active interval.
+  const conditional = String(activityText || '').replace(/\s+/g, ' ').match(/\b(?:CAN|MAY)\s+BE\s+ACT(?:IVATED)?\s+WITH\s+\d+\s*(?:MIN(?:UTES)?|HR|HOURS?)\s+NOTICE[^.\n]*/i);
+  if (conditional) {
+    const result = unknown(`正文包含有条件启用要求，需核对原通告：${conditional[0].slice(0, 240)}`);
+    result.scheduleRawText = [raw, conditional[0]].filter(Boolean).join('；');
+    return result;
+  }
+  const bodyException = String(activityText || '').match(/\bEXC\s+ON\s+20\d{2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2}\b/i);
+  if (bodyException) return unknown(`正文另有排除日期，不能仅按 D 栏认定活动时段：${bodyException[0].replace(/\s+/g, ' ')}`);
+  if (!raw) return {timeIntervals: [], scheduleParsed: false, scheduleStatus: 'none'};
   const begin = Date.parse(beginsAt), end = Date.parse(endsAt);
   if (!Number.isFinite(begin) || !Number.isFinite(end) || end <= begin || end - begin > 2 * 366 * DAY) return unknown('起止日期不完整或跨度超过支持范围');
   let text = raw.toUpperCase().replace(/[\u2013\u2014]/g, '-').replace(/\b(\d{4})\/(\d{4})\b/g,'$1-$2').replace(/\b(?:TO|THRU)\b/g, '-').replace(/\s*-\s*/g, '-').replace(/\bUTC\b/g, '').replace(/\s+/g, ' ').trim();
