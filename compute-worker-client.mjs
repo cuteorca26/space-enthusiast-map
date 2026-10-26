@@ -15,9 +15,14 @@ export class ComputeWorkerClient {
     if (this.current || !this.queue.length) return;
     if (!this.worker) {
       let worker;
+      const task = this.queue[0];
+      const streamedNotam = task.type === 'notam-cache' ||
+        (['history-summary', 'history-item'].includes(task.type) && task.payload.source === 'notam');
       try { worker = new Worker(new URL("./server-compute-worker.mjs", import.meta.url), {
         name: this.name,
-        ...(process.env.MEMORY_BUDGET_MODE === '1' ? { execArgv: [], resourceLimits: { maxOldGenerationSizeMb: 256 } } : {}),
+        // Streaming NOTAM processing holds one notice at a time. Collect its
+        // temporary strings sooner, leaving room for the server and backups.
+        ...(process.env.MEMORY_BUDGET_MODE === '1' ? { execArgv: [], resourceLimits: { maxOldGenerationSizeMb: streamedNotam ? 96 : 256 } } : {}),
       }); }
       catch (error) {
         this.queue.shift().reject(error);

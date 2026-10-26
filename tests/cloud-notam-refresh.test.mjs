@@ -67,3 +67,14 @@ for(const source of ['hydropac','navarea','msa'])test(`${source} manual collecti
  assert.equal(f.client.status().active,false);assert.equal(f.client.status().lastRefresh.status,'success');
  assert.match(f.client.status().message,/全量刷新完成/);
 });
+test('manual outcome restores its source status when a crash preceded receipt backup',async t=>{
+ const f=await fixture(t,{source:'msa'});
+ await writeFile(join(f.directory,'scheduled_refresh_state.json'),JSON.stringify({manualResults:[
+  {requestId:'other',cycleStartedAt:'2026-10-25T09:00:00Z',result:{source:'navarea',status:'success'}},
+  {requestId:'recovered',cycleStartedAt:'2026-10-25T08:59:00Z',result:{source:'msa',status:'failed',attempt:1,nextRetryAt:'2026-10-25T10:00:00Z'}}
+ ]}));
+ assert.equal(f.client.status().requestId,'recovered');assert.equal(f.client.status().active,true);
+ assert.equal((await f.client.start()).started,false);assert.equal(f.requests.length,0);
+ await writeFile(join(f.directory,'manual_msa_refresh.json'),JSON.stringify({requestId:'newer',startedAt:'2026-10-25T09:00:00Z'}));
+ assert.equal(f.client.status().requestId,'newer');assert.equal(f.client.status().lastRefresh,null);
+});

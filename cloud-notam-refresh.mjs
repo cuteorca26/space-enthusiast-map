@@ -11,8 +11,17 @@ export function createCloudNotamRefresh({directory,repository,token='',enabled=f
  const path=join(directory,`manual_${source}_refresh.json`);let starting;
  function save(state){mkdirSync(directory,{recursive:true});const tmp=path+'.tmp';writeFileSync(tmp,JSON.stringify(state));renameSync(tmp,path);persist();}
  function status(){
-  const state=read(path);if(!state.requestId)return{active:false,lastRefresh:null};
-  const report=read(join(directory,'scheduled_refresh_state.json')).manualResults?.find(r=>r.requestId===state.requestId);
+  const reports=read(join(directory,'scheduled_refresh_state.json')).manualResults||[];
+  let state=read(path);
+  // A crash can precede the next full backup of the dispatch receipt. The
+  // immutable collector outcome still identifies that source's latest request.
+  if(!state.requestId){
+   const recovered=reports.filter(r=>r.result?.source===source&&Number.isFinite(Date.parse(r.cycleStartedAt)))
+    .sort((a,b)=>b.cycleStartedAt.localeCompare(a.cycleStartedAt))[0];
+   if(recovered)state={requestId:recovered.requestId,startedAt:recovered.cycleStartedAt};
+  }
+  if(!state.requestId)return{active:false,lastRefresh:null};
+  const report=reports.find(r=>r.requestId===state.requestId);
   const result=report?.result;
   const finished=result&&(result.status==='success'||result.retryExhausted);
   const timedOut=now()-Date.parse(state.startedAt)>6*3600000;
