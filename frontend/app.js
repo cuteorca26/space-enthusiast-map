@@ -1650,10 +1650,11 @@ function initializeSavedRegions() {
   savedRegionsController.load();
 }
 
-init().catch((error) => {
+// Finish initializing every module-level control before startup can read it.
+queueMicrotask(() => init().catch((error) => {
   console.error("NOTAM MAP initialization failed", error);
   if (document.body) document.body.dataset.initError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-});
+}));
 
 window.addEventListener("app-language-change", () => {
   placeLabelSpriteCache.clear();
@@ -5926,7 +5927,7 @@ function renderSourceStatus() {
     ? `${notam.backgroundRefresh?.active ? "FAA NOTAM 刷新中" : "FAA NOTAM 已加载"}（获取：${notamFetchedLabel}）；HYDROPAC ${state.hydropacWarnings.length ? "已加载" : "未获取"}；发射预告 ${
         state.launchForecasts.length ? "已加载" : "未获取"
       }`
-    : "FAA NOTAM 数据状态异常";
+    : activeLoadController ? "FAA NOTAM 正在载入缓存" : "FAA NOTAM 数据状态异常";
   if (notamUsable) {
     els.sourceLine.textContent += `；中国航警 ${msa?.backgroundRefresh?.active ? "刷新中" : state.msaWarnings.length ? "已加载" : "未获取"}`;
     els.sourceLine.textContent += `；NAVAREA ${navareaCoverageSummary(navarea)?.short || (state.navareaWarnings.length ? navarea?.status === "warn" ? "缓存（刷新失败）" : "已加载" : "未获取")}`;
