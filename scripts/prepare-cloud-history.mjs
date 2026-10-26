@@ -1,11 +1,12 @@
 // Build-time work only: prepare exact responses for the existing public NOTAM
 // cache/history. Raw snapshots and the shared index remain untouched on Render.
-import { mkdir, mkdtemp, rm, readdir, copyFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readdir, copyFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { unpackPublicData } from '../public-data-persistence.mjs';
+import { readNotamMetadata } from '../streamed-notam-history.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const repository = process.env.BUILD_PUBLIC_DATA_REPOSITORY || 'cuteorca26/space-enthusiast-map';
@@ -35,8 +36,19 @@ try {
       console.log(`Prepared NOTAM ${options.id || 'current cache'}: ${result.summary.total} notices, ${result.summary.drawable} drawable`);
       count++;
     }
-    if ((await readdir(directory)).includes('faa_notam_cache.json'))
+    if ((await readdir(directory)).includes('faa_notam_cache.json')) {
       await prepare({ current: true, cacheKey: restrictionsCacheKey({ includeDetails: false, includeGlobalNotams: true, includeTfr: false }) });
+      // Daily bodies are intentionally external to the backup. Their latest
+      // snapshot is the same immutable bytes as the current cache, so prepare
+      // its replay too. The content-addressed reader only uses an exact match.
+      const cachePath = join(directory, 'faa_notam_cache.json');
+      const cache = await readNotamMetadata(cachePath);
+      const index = JSON.parse(await readFile(join(directory, 'refresh_history_index.json'), 'utf8'));
+      for (const record of index.sources?.notam || []) {
+        if (record.dailyAsset && record.savedAt === cache.savedAt && /^[\w.-]+\.json$/.test(record.id))
+          await prepare({ path: cachePath, id: record.id });
+      }
+    }
     let snapshots = [];
     try { snapshots = await readdir(join(directory, 'faa_notam_snapshots')); } catch {}
     for (const id of snapshots.filter(id => /^[\w.-]+\.json$/.test(id))) await prepare({ path: join(directory, 'faa_notam_snapshots', id), id });
